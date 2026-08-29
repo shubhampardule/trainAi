@@ -1,0 +1,175 @@
+# ---------------------------------------------------------------------------
+# TrainAI — build configuration
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trainai"
+version = "0.1.0"
+description = "Train small language models from scratch on your own hardware, without writing the training code."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Shubham Pardule", email = "shubhamp2504@gmail.com" }]
+keywords = [
+    "machine-learning",
+    "language-model",
+    "llm",
+    "training",
+    "transformer",
+    "pytorch",
+    "from-scratch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# Deliberately small. Every entry here is something the core training path
+# actually imports. See docs/design/dependencies.md for why `datasets` and
+# `transformers` are NOT here.
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "tokenizers>=0.15",
+    "safetensors>=0.4",
+    "pydantic>=2.5",
+    "typer>=0.12",
+    "rich>=13.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+# No `web` extra. The web interface (M5) is postponed, and an extra that installs
+# fastapi and uvicorn[standard] to deliver nothing is a promise the code does not
+# keep. It goes back in the commit that adds the server, not before. The reasoning
+# for the eventual shape is kept in docs/design/dependencies.md.
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    # `ruff format` output shifts between minor versions. CI pins an exact
+    # version (see .github/workflows/ci.yml); this floor keeps a contributor's
+    # local ruff close enough to it to avoid surprise formatting diffs.
+    "ruff>=0.16",
+]
+
+# Points at `main`, not at the Typer app, because `main` owns the exit-code
+# contract in trainai.errors.ExitCode. Console scripts do `sys.exit(main())`.
+[project.scripts]
+trainai = "trainai.cli.main:main"
+
+# The repository's real location. Nothing is on PyPI, so these are read by whoever
+# clones rather than rendered by an index -- but they are the addresses the code, the
+# README and the error hints all point at, and they must agree with each other. If the
+# repository moves, this block is the one to change first: `Issues` is what
+# `tokenizer.py` tells a user to file a round-trip bug at.
+[project.urls]
+Homepage = "https://github.com/shubhampardule/trainAi"
+Repository = "https://github.com/shubhampardule/trainAi"
+Issues = "https://github.com/shubhampardule/trainAi/issues"
+Changelog = "https://github.com/shubhampardule/trainAi/blob/main/CHANGELOG.md"
+
+# ---------------------------------------------------------------------------
+# Packaging
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/trainai"]
+
+[tool.hatch.build.targets.sdist]
+# `tests` is here so a downstream packager can run the suite from the sdist, which
+# means everything the suite reads has to be here too: `test_conventions.py` checks
+# the documents in `docs/` against the code, and lints the scripts in `examples/`;
+# `test_coverage_floor.py` imports `tools/coverage_floor.py` and checks the floors it
+# enforces against the numbers `CONTRIBUTING.md` promises. Without those the sdist
+# ships a test suite that cannot pass. The corpora in `examples/` are gitignored and
+# hatchling honours that, so this stays small.
+#
+# Verified rather than assumed: the sdist was unpacked into a clean virtualenv with
+# the wheel installed and `pytest -m "not gpu"` run from it -- 1900 passed, 55
+# skipped, and every skip names its own reason (no git checkout, or `transformers`
+# absent). Re-check this after adding a test that reads a file from the repo root.
+include = [
+    "src/trainai",
+    "tests",
+    "docs",
+    "examples",
+    "tools",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+]
+
+# ---------------------------------------------------------------------------
+# Lint / format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # typer uses function calls in argument defaults by design
+    "RUF012",  # ClassVar annotations not required for our simple constants
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "gpu: requires a working CUDA device (deselect with: -m 'not gpu')",
+    "slow: takes more than ~10 seconds",
+    "network: needs internet access",
+]
+filterwarnings = [
+    "error::DeprecationWarning:trainai.*",
+]
+
+[tool.coverage.run]
+source = ["trainai"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

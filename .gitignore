@@ -1,0 +1,143 @@
+# --- TrainAI artifacts -----------------------------------------------------
+# Training runs, prepared datasets and exported models are large and
+# machine-specific. They should never be committed.
+#
+# Every one of these is anchored with a leading slash, and that matters: an
+# unanchored `data/` matches a directory of that name at *any* depth, which
+# silently excluded the whole of src/trainai/data/ -- the entire data pipeline --
+# from the repository. A clone would have installed a package that cannot import.
+/runs/
+/data/
+/exported/
+# `trainai plan` writes here by default, and it describes one machine's measured
+# limits -- committing it would hand the next person a plan for hardware they do
+# not have.
+/plan.json
+# Token shards, wherever someone points --out. Named specifically rather than
+# *.bin, so the pattern cannot swallow a legitimate file the way `data/` did.
+train_*.bin
+val_*.bin
+*.safetensors
+!tests/**/*.safetensors
+# Checkpoints, for the same reason and with the same care. `trainai train` writes
+# `step-NNNNNN.pt` (see src/trainai/train/checkpoint.py), and a run started with
+# `--out mymodel` rather than under runs/ lands them somewhere nothing else here
+# covers -- which is how a repository acquires a 500 MB accident. `*.pt` would be
+# the broad version of this pattern, and it is not used: it would also match a
+# fixture or a file someone genuinely wants tracked.
+step-*.pt
+wandb/
+
+# The product owner's original brief (kept locally, not part of the repo).
+plan.md.txt
+
+# Working copies of documents kept for reference while rewriting them -- notably
+# the 887-line README this one replaced, which is preserved locally as
+# reference/README-original.md. Anchored, and a directory rather than a name
+# pattern, so it cannot start matching a `reference/` package inside src/. The
+# content worth keeping went to docs/walkthrough.md, which is tracked: anything
+# only in here is one `git clean -fdx` from being gone.
+/reference/
+
+# Datasets dropped next to the example scripts. `examples/weather_to_text.py`
+# documents where its input comes from and how to fetch it; the file itself is
+# 16 MB of third-party data, and a repository that carries one sample corpus
+# ends up carrying five. Test fixtures live in tests/ and are unaffected.
+/examples/*.csv
+/examples/*.tsv
+/examples/*.jsonl
+
+# --- Python ----------------------------------------------------------------
+# Unanchored on purpose: every one of these genuinely occurs at any depth in a
+# source tree, so a leading slash would make them miss most of what they exist
+# to catch.
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Everything a build backend writes -- and all of it only ever at the project
+# root. Anchored for the reason given at the top of this file. `lib/` is the one
+# that would hurt most: it is a single `src/trainai/lib/` away from repeating the
+# incident that erased the data pipeline from the repository, and unlike `data/`
+# it would not announce itself with an import failure.
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
+/.installed.cfg
+/MANIFEST
+
+# --- Virtual environments --------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# --- Testing / coverage ----------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# --- Secrets ---------------------------------------------------------------
+# Nothing in this project reads an environment file today, and that is exactly
+# when to add this: the rule has to already be here on the day someone adds a
+# token for `trainai export --push` or a Weights & Biases key. A secret is the
+# one kind of accident `git rm --cached` does not undo, because by then it has
+# been fetched, cached and indexed by whoever was watching the repository.
+.env
+.env.*
+# An *example* file is documentation, carries no real values, and is the thing
+# that keeps the rule above from being mistaken for "this project has no config".
+!.env.example
+# Broader than this file's usual rule that a pattern must name what it catches.
+# That is deliberate here and only here: for every other artifact the cost of a
+# missed match is a large file in a commit, which is annoying and reversible. For
+# a private key it is a key that has to be rotated.
+*.pem
+*.key
+
+# --- Editors / OS / local tool state ---------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+# Per-machine agent settings: paths and tool permissions for one checkout, of no
+# use to anyone else. Listed here because it was only ever ignored by this
+# machine's *global* excludes file, which no clone and no CI runner has -- so on
+# any other machine it was one `git add .` from being committed.
+.local-agent/
+
+# --- Merge and rebase leftovers --------------------------------------------
+# `git` writes these itself during a conflict. Committing one is how a repository
+# ends up shipping a file with `<<<<<<<` in it.
+*.orig
+*.rej
+
+# --- Jupyter ---------------------------------------------------------------
+.ipynb_checkpoints/
+
+# Exported models (generated artifacts, sometimes hundreds of MB)
+/models/

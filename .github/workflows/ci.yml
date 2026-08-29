@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep pip from picking a multi-gigabyte CUDA wheel on runners that have no GPU.
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUTF8: "0"  # CI should see the same legacy Windows code page real users do.
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install ruff
+        # Pinned deliberately: `ruff format` output changes between minor
+        # versions, so an unpinned lint job can fail on a commit that was clean
+        # when it was written. Bump this pin in its own PR.
+        run: python -m pip install "ruff==0.16.4"
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Lint
+        run: ruff check --output-format=github .
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install CPU-only torch
+        # Installed separately, and first, so the editable install below finds an
+        # already-satisfied requirement instead of pulling the default wheel
+        # (which is CUDA-enabled on Linux and ~2.5 GiB).
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+
+      - name: Report the environment under test
+        run: trainai doctor
+
+      - name: Verify importing trainai does not import torch
+        # The CLI's startup time depends on this staying true. Asserted here as
+        # well as in the test suite because it is easy to break by accident and
+        # the cost of the regression is felt on every single command.
+        run: python -c "import sys, trainai; assert 'torch' not in sys.modules, sorted(m for m in sys.modules if m.startswith('torch'))"
+
+      - name: Tests
+        run: pytest -m "not gpu" -q --cov=trainai --cov-report=term-missing --cov-report=xml
+
+      - name: Coverage floor
+        # Per module, not just overall: this project once measured 92% with
+        # `cli/setup.py` at 0%, because 66 statements cannot move a 6,400-statement
+        # total. Run on every job rather than only the one that uploads the report,
+        # so a platform-specific module losing its tests fails on that platform.
+        run: python tools/coverage_floor.py coverage.xml
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  build:
+    name: build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+      - name: Check metadata
+        run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

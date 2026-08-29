@@ -1,0 +1,43 @@
+# Line endings are LF in the repository and LF in the working tree, on every
+# platform. Without this the result depends on each contributor's core.autocrlf,
+# which produces diffs where nothing changed -- and this project checksums file
+# contents, so a CRLF/LF difference is not cosmetic here: it changes the byte
+# count, the sha256, and the token count of any corpus that goes through it.
+* text=auto eol=lf
+
+# Binary, never converted, never diffed as text.
+#
+# Most of these name a file the repository does not contain yet, and that is the
+# point of declaring them: `text=auto` above decides per file by looking for a NUL
+# byte in the first 8 KiB, so a fixture whose header happens to be NUL-free is
+# converted, and the checksum it exists to pin changes with the platform that
+# checked it out. `binary` also implies `-diff`, which keeps a megabyte of
+# compressed bytes out of a diff.
+*.bin binary
+*.safetensors binary
+*.pt binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+
+# Compression codecs and archive containers, all of which `trainai data prepare`
+# reads as a corpus (see _CODEC_BY_SUFFIX and _ARCHIVE_BY_SUFFIX in
+# src/trainai/data/ingest.py). Every spelling is listed, because `*.tar.gz` is
+# covered by `*.gz` but `*.tgz` and `*.txz` are covered by nothing else.
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.lzma binary
+*.zip binary
+*.tar binary
+*.tgz binary
+*.tbz binary
+*.tbz2 binary
+*.txz binary
+
+# Typed containers whose text is extracted rather than read: a Word document is a
+# zip of XML, and a SQLite database has to stay byte-exact for sqlite3 to open it.
+*.docx binary
+*.sqlite binary
+*.sqlite3 binary
+*.db binary

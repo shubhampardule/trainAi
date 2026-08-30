@@ -52,12 +52,35 @@ suggestion, so the table is presented as a shortcut and never as a promise.
 | Intel / XPU | yes | should | no hardware to test on |
 | Apple / MPS | yes | yes, in fp32 | no |
 | CPU | yes | yes, slowly | **yes** — CI, Linux and Windows, Python 3.10–3.13 |
-| AMD on Windows | yes | no | PyTorch publishes no ROCm build for Windows |
+| AMD on Windows | yes | should | wheel comes from AMD's index, not pytorch.org |
 | Multiple GPUs | yes | first one only | multi-GPU is not implemented |
 
 "should" means the code path is generic and tested against synthetic profiles of
 that hardware, and that nobody has run it on the real thing. If you do, a report of
 what happened is genuinely valuable — including a report that it worked.
+
+### AMD, on either platform
+
+This row used to read "AMD on Windows — trains: no", because PyTorch published no
+ROCm wheel for Windows. That is no longer true, and the distinction that replaced
+it is not Linux versus Windows but *which index*:
+
+- `download.pytorch.org/whl/rocm7.2` is Linux-only — the channel contains no
+  `win_amd64` file — and covers only the cards on AMD's official support matrix.
+  That matrix lists four RDNA3/RDNA4 targets plus the PRO W6800 and V620, and **no
+  consumer RX 6000 card at all**.
+- `stable.repo.amd.com/rocm/whl-next/` publishes a wheel per gfx target for both
+  Linux and Windows, reaching down through RDNA2 and RDNA1. The GPU is chosen by a
+  pip extra rather than by the URL: `torch[device-gfx1034]`.
+
+TrainAI will not fill that gfx target in for you. Reading it needs a working
+PyTorch, which is the thing being installed, and a guessed target yields a wheel
+that imports cleanly and then raises on the first kernel launch — a worse outcome
+than being asked to look one number up at
+[SUPPORTED_GPUS.md](https://github.com/ROCm/TheRock/blob/main/SUPPORTED_GPUS.md).
+Note also what "supported" means there: that document distinguishes *build
+passing* from *sanity tested* from *release ready*, and warns that the first of the
+three "does not imply the runtime is functional on target hardware."
 
 ## How hardware nobody here owns gets tested
 

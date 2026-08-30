@@ -673,13 +673,26 @@ def test_amd_on_linux_gets_a_rocm_index_url(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert advice.command is not None
     assert "rocm" in advice.command
-    assert "ROCm" in " ".join(advice.notes)
+    notes = " ".join(advice.notes)
+    assert "ROCm" in notes
+    # The published channel covers AMD's official matrix, which lists no consumer
+    # RX 6000 card. Sending someone with one there and stopping is the failure mode:
+    # the wheel installs, and every kernel launch raises. So the fallback index has
+    # to be in the same note as the command it qualifies.
+    assert "repo.amd.com" in notes
 
 
 def test_amd_on_windows_is_told_the_truth_rather_than_given_a_broken_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PyTorch publishes no ROCm build for Windows. Saying so beats a 404."""
+    """A Windows ROCm wheel exists now, but only AMD publishes one, and per gfx target.
+
+    This assertion used to read ``"no ROCm build for Windows" in notes``, which was
+    true when it was written and is not any more: AMD ships ``win_amd64`` wheels down
+    to gfx1034. The command still has to stay ``None``, because the pip extra names
+    the card's architecture and TrainAI cannot read that without the working PyTorch
+    this advice exists to install.
+    """
     patch_environment(
         monkeypatch, vendors=["amd"], system="Windows", torch_cuda=None, accelerator=False
     )
@@ -688,7 +701,9 @@ def test_amd_on_windows_is_told_the_truth_rather_than_given_a_broken_command(
 
     assert advice.command is None
     notes = " ".join(advice.notes)
-    assert "no ROCm build for Windows" in notes
+    assert "no ROCm build for Windows" not in notes
+    assert "repo.amd.com" in notes
+    assert "gfxNNNN" in notes
     assert "WSL2" in notes
 
 
@@ -1638,3 +1653,71 @@ def test_the_readme_counts_the_amd_cards_it_offers_as_evidence() -> None:
         f"the README does not say it tests {words[rocm]} AMD cards, and there are {rocm} "
         "profiles with a rocm backend"
     )
+
+
+# --------------------------------------------------------------- asynchronous backends
+
+
+class _Recorder:
+    """Stands in for ``torch.mps`` / ``torch.xpu``, which this machine does not have."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def synchronize(self, *args: object) -> None:
+        self.calls += 1
+
+
+@pytest.mark.parametrize("backend", ["mps", "xpu"])
+def test_the_training_loop_waits_for_an_asynchronous_backend(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed step must measure work, not queue depth, on every async backend.
+
+    CUDA is not the only one. MPS and XPU also return before the kernels finish, so a
+    ``perf_counter`` pair around an unsynchronised step on an M-series Mac times the
+    dispatch -- and every tokens/second figure and ETA the loop prints comes from that
+    pair. Before this test, the loop synchronised CUDA only, so the one number a user
+    on unverified hardware would quote back was the one that had never been measured.
+    """
+    from trainai.train.loop import synchronize
+
+    recorder = _Recorder()
+    monkeypatch.setattr(torch, backend, recorder, raising=False)
+
+    synchronize(torch.device(backend))
+
+    assert recorder.calls == 1, f"the loop did not wait for {backend}"
+
+
+def test_waiting_for_a_device_never_raises() -> None:
+    """A driver-level failure in a timing call must not end a training run.
+
+    The next real operation will report it with a better message than "synchronize
+    failed at step 8,412".
+    """
+    from trainai.train.loop import synchronize
+
+    class Exploding:
+        def synchronize(self, *args: object) -> None:
+            raise RuntimeError("driver went away")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch, "mps", Exploding(), raising=False)
+        synchronize(torch.device("mps"))
+
+    synchronize(torch.device("cpu"))
+
+
+def test_the_benchmark_and_the_loop_agree_on_what_a_step_took() -> None:
+    """One helper, not two: the benchmark predicts what the loop then has to reproduce."""
+    from trainai.hardware import benchmark
+    from trainai.train.loop import synchronize
+
+    recorder = _Recorder()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(torch, "mps", recorder, raising=False)
+        benchmark._synchronize(torch.device("mps"))
+        synchronize(torch.device("mps"))
+
+    assert recorder.calls == 2, "the benchmark and the loop take different paths"

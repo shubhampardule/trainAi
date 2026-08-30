@@ -55,7 +55,7 @@ from trainai.console import fmt_bytes, fmt_count
 from trainai.model.config import ModelConfig
 from trainai.model.gpt import GPT
 from trainai.train.config import Precision
-from trainai.train.loop import resolve_precision
+from trainai.train.loop import resolve_precision, synchronize
 
 __all__ = [
     "ACTIVATION_SLOTS_PER_LAYER",
@@ -427,20 +427,13 @@ def _autocast(device: torch.device, dtype: torch.dtype) -> Any:
 
 
 def _synchronize(device: torch.device) -> None:
-    """Wait for the device, so a timer measures work rather than queue depth."""
-    if device.type == "cuda":
-        with contextlib.suppress(Exception):
-            torch.cuda.synchronize(device)
-    elif device.type == "xpu":  # pragma: no cover - no XPU here
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None:
-            with contextlib.suppress(Exception):
-                xpu.synchronize(device)
-    elif device.type == "mps":  # pragma: no cover - no Apple hardware here
-        mps = getattr(torch, "mps", None)
-        if mps is not None:
-            with contextlib.suppress(Exception):
-                mps.synchronize()
+    """Wait for the device, so a timer measures work rather than queue depth.
+
+    Delegates to the training loop's own helper rather than repeating it: this file and
+    the loop must agree about what "one step took N seconds" means, or the benchmark
+    predicts a throughput the loop cannot reproduce on the same hardware.
+    """
+    synchronize(device)
 
 
 def _peak_memory(device: torch.device) -> tuple[int, int, bool]:

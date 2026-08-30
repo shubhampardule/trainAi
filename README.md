@@ -113,8 +113,8 @@ What it tells each kind of machine, and how much of that anyone has actually run
 |---|---|---|
 | **NVIDIA**, Windows or Linux | Reads the driver's CUDA version and prints a `torch` install from the matching `cu###` index | Yes — an RTX 2050 on Windows 11 |
 | **Apple Silicon**, macOS | Normally reports there is nothing to change: Metal (MPS) ships in the default wheel, so there is no separate index to point at. It only prints a `torch` reinstall when MPS is *missing* | No — see below |
-| **AMD**, Linux | Prints a `torch` install from the ROCm index, and warns that consumer RDNA cards are supported unevenly | No |
-| **AMD**, Windows | Recommends nothing, and says why: PyTorch publishes no ROCm build for Windows, so the options are WSL2 or the CPU | n/a |
+| **AMD**, Linux | Prints a `torch` install from the ROCm index, and names the fallback index for the many consumer cards that index does not cover | No |
+| **AMD**, Windows | Points at AMD's own wheel index, which does publish a Windows ROCm build, and asks you for your card's `gfx` target rather than guessing it | No |
 | **Intel Arc** | Prints a `torch` install from the XPU index, and says throughput on it is unverified | No |
 | **No GPU** | Says CPU training works and is roughly 20–100× slower than a modern GPU — survivable for a first run on a small corpus, not for anything larger | Yes |
 

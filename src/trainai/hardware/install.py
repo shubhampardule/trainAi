@@ -54,8 +54,23 @@ _CUDA_CHANNELS: tuple[tuple[tuple[int, int], str], ...] = (
     ((11, 8), "cu118"),
 )
 
-#: ROCm wheel channel, same caveat as the CUDA table.
-_ROCM_CHANNEL = "rocm6.2"
+#: ROCm wheel channel on download.pytorch.org, same caveat as the CUDA table.
+#: These wheels are ``manylinux`` only -- there is no ``win_amd64`` file in the
+#: channel -- which is why Windows is pointed at AMD's own index instead.
+_ROCM_CHANNEL = "rocm7.2"
+
+#: AMD's multi-architecture wheel index ("TheRock"), which is where a ROCm PyTorch
+#: for Windows actually comes from, and where cards missing from AMD's official
+#: support matrix are community-enabled on both platforms. The GPU is selected by a
+#: pip extra rather than by the index, so the command needs the card's gfx target:
+#: ``torch[device-gfx1100]``. TrainAI cannot supply that target, because reading it
+#: requires the working PyTorch this advice exists to install -- so the target stays
+#: a placeholder the user fills in from the matrix below, rather than a guess that
+#: installs a wheel which imports and then fails on the first kernel launch.
+_AMD_WHEEL_INDEX = "https://stable.repo.amd.com/rocm/whl-next/"
+
+#: AMD's own list of which gfx target each card is, and how well each one is tested.
+_AMD_GPU_MATRIX = "https://github.com/ROCm/TheRock/blob/main/SUPPORTED_GPUS.md"
 
 #: Matches the CUDA version out of ``nvidia-smi``'s header, in both the spellings
 #: NVIDIA has used. Recent drivers print ``CUDA UMD Version: 13.3`` where older
@@ -304,21 +319,29 @@ def _advise_unusable_gpu(
         if system == "Linux":
             notes.append(
                 "AMD GPUs need a ROCm build of PyTorch, and ROCm itself installed at "
-                "the system level. Check that your card is on AMD's supported list "
-                "before spending time on it -- consumer RDNA cards are supported "
-                "unevenly."
+                "the system level. The command above is the channel PyTorch publishes, "
+                "which covers only the cards on AMD's official support matrix -- that "
+                "is four RDNA3 and RDNA4 targets plus the PRO W6800, and no consumer "
+                f"RX 6000 card at all. If yours is missing from it, {_AMD_WHEEL_INDEX} "
+                "carries a wheel per gfx target instead, including the RDNA2 and RDNA1 "
+                f"cards ROCm proper leaves out; check {_AMD_GPU_MATRIX} for your "
+                "target and how well tested it is."
             )
         elif system == "Windows":
             notes.append(
-                "PyTorch has no ROCm build for Windows, so an AMD GPU cannot be used "
-                "for training here directly. The options are WSL2 with ROCm, or CPU "
-                "training. TrainAI will run on the CPU without complaint; it will just "
-                "be slow, and it will tell you how slow."
+                "AMD GPUs on Windows now work, which they did not when this advice was "
+                "first written. PyTorch's own ROCm channel is still Linux-only, so the "
+                "wheel comes from AMD's index: `pip install --index-url "
+                f'{_AMD_WHEEL_INDEX} "torch[device-gfxNNNN]"`, where gfxNNNN is your '
+                f"card's architecture -- look it up at {_AMD_GPU_MATRIX}. TrainAI does "
+                "not fill it in for you, because guessing it would install a wheel that "
+                "imports fine and then fails on the first kernel launch. WSL2 with ROCm "
+                "and plain CPU training both still work if you would rather not."
             )
         else:
             notes.append(
-                "AMD GPUs are only usable through ROCm, which is Linux-only. This "
-                "machine will train on the CPU."
+                "AMD GPUs are only usable through ROCm, which runs on Linux and "
+                "Windows. This machine will train on the CPU."
             )
 
     if "intel" in found and not ("nvidia" in found or "amd" in found):

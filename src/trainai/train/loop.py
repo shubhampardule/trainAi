@@ -108,6 +108,34 @@ _BEHAVIOUR_CHANGING_SETTINGS = (
 )
 
 
+def synchronize(device: torch.device) -> None:
+    """Wait for ``device``, so a timer measures work rather than queue depth.
+
+    CUDA is not the only asynchronous backend: MPS and XPU also queue kernels and
+    return immediately, so a ``perf_counter`` pair around a step on an M-series Mac
+    times the dispatch and not the arithmetic. Every reported tokens/second and every
+    ETA is derived from that pair, so leaving the other two backends unsynchronised
+    does not merely lose precision -- it reports a number that was never measured.
+
+    Failures are suppressed on purpose. A synchronise that raises is a driver problem
+    that the next real operation will surface with a better message; turning it into a
+    crash here would end a training run over a timing call.
+    """
+    if device.type == "cuda":
+        with contextlib.suppress(Exception):
+            torch.cuda.synchronize(device)
+    elif device.type == "xpu":  # pragma: no cover - no XPU here
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None:
+            with contextlib.suppress(Exception):
+                xpu.synchronize(device)
+    elif device.type == "mps":  # pragma: no cover - no Apple hardware here
+        mps = getattr(torch, "mps", None)
+        if mps is not None:
+            with contextlib.suppress(Exception):
+                mps.synchronize()
+
+
 def resolve_device(requested: str = "auto") -> torch.device:
     """Pick a device, preferring CUDA. Never silently falls back from an explicit ask.
 
@@ -617,8 +645,7 @@ class Trainer:
                 while self.step < config.steps:
                     started = time.perf_counter()
                     loss_value, grad_norm = self._optimizer_step(train_batcher, config)
-                    if self.device.type == "cuda":
-                        torch.cuda.synchronize(self.device)
+                    synchronize(self.device)
                     elapsed = time.perf_counter() - started
 
                     self.step += 1

@@ -154,10 +154,10 @@ def test_every_source_file_is_tracked_by_git() -> None:
 #:
 #: The third column is the pattern that has to be the one deciding, and it is not
 #: decoration. Two mutations survived a version of this test that only asserted the
-#: verdict. Deleting the ``.local-agent/`` line changed nothing, because one
-#: developer's *global* excludes file still covered it -- so the test was measuring
-#: that machine rather than this repository. And anchoring ``__pycache__/`` changed
-#: nothing, because ``*.py[cod]`` caught the same file for an unrelated reason.
+#: verdict. Deleting the ``.local-agent/`` line changed nothing, because one developer's
+#: *global* excludes file still covered it -- so the test was measuring that machine
+#: rather than this repository. And anchoring ``__pycache__/`` changed nothing,
+#: because ``*.py[cod]`` caught the same file for an unrelated reason.
 IGNORE_RULES: list[tuple[str, bool, str]] = [
     # Must stay trackable: a source tree may use any of these names.
     ("src/trainai/lib/helpers.py", False, ""),

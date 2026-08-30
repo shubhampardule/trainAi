@@ -527,6 +527,38 @@ dependencies: everything here is stdlib.
 
 ### Fixed
 
+- **`trainai setup` told every Windows AMD user their GPU was unusable, which stopped
+  being true.** The advice read "PyTorch has no ROCm build for Windows, so an AMD GPU
+  cannot be used for training here directly," and offered WSL2 or the CPU. PyTorch's
+  own channel is indeed still Linux-only — `download.pytorch.org/whl/rocm7.2` contains
+  no `win_amd64` file — but AMD publishes its own multi-architecture index that does,
+  including `win_amd64` wheels for RDNA2 targets as small as gfx1034. The pinned ROCm
+  channel was also two years stale at `rocm6.2`. Both AMD notes now name the real split,
+  which is not Linux versus Windows but which index: the published channel covers only
+  AMD's official support matrix, and that matrix lists no consumer RX 6000 card at all,
+  so a Linux user with one was being sent to a wheel that installs and then raises on
+  the first kernel launch. `setup` still refuses to print a runnable command on Windows.
+  The GPU is chosen there by a pip extra naming the card's architecture
+  (`torch[device-gfx1034]`), reading that architecture needs the working PyTorch being
+  installed, and a guessed target produces a wheel that imports cleanly and fails later —
+  so it asks for the one number instead and links the matrix to look it up in. Found by
+  checking what an RX 6500M would actually do before claiming anything about it.
+
+- **Every tokens/second figure on an Apple or Intel GPU timed the queue, not the work.**
+  The training loop measured a step with a `perf_counter` pair and synchronised the
+  device between them for CUDA only. MPS and XPU are asynchronous too: they queue
+  kernels and return immediately, so on an M-series Mac the loop timed dispatch, and
+  every throughput number, ETA and step duration in `metrics.jsonl` came from that
+  measurement. `trainai bench` already had a helper covering all three backends, so the
+  two disagreed about what "this step took N seconds" means — the benchmark predicted a
+  throughput the loop could not reproduce on the same machine. There is now one
+  `synchronize()` in `trainai.train.loop`, used by both. Failures stay suppressed: a
+  driver that cannot synchronise will be reported by the next real operation with a
+  better message than one from a timing call, and it should not end a training run.
+  Found while preparing for a report from an M4 Mac, on hardware this project does not
+  have; the fix is pinned by tests that stub `torch.mps` and `torch.xpu`, in the same
+  spirit as the rest of `tests/test_hardware_portability.py`.
+
 - **A machine with two GPU vendors was told "A amd/nvidia GPU is present ... cannot use
   it".** `doctor` and `setup` both print the "your hardware is here and PyTorch cannot
   see it" sentence, and both built it by slash-joining the raw vendor slugs. On a laptop

@@ -16,7 +16,8 @@ That is the whole pipeline: prepare the data, measure the machine, train, evalua
 sample. It stops once to confirm before the long step, quoting the time it *measured*
 on your machine rather than a guess, and before each step it prints the individual
 command it stands in for — so it is a shortcut *through* the CLI rather than a wizard
-around it.
+around it. Add `--time 30m` if you would rather name the budget than approve an
+estimate: the plan is sized to fit it, step count included.
 
 ## What you actually get
 
@@ -64,9 +65,11 @@ Requires Python 3.10 or newer. PyTorch is the large part of the download; how la
 depends on which build your hardware needs, and `trainai setup` tells you which that is
 before you spend it.
 
-> **Not on PyPI yet.** There is no `pip install trainai`, so install from a clone —
-> that is the only distribution channel for now, and nothing has been uploaded to any
-> package index.
+> **Not on PyPI yet.** There is no `pip install trainai`, so install from a clone — that
+> is the install path this project has actually tested, and nothing has been uploaded to
+> any package index. The
+> [v0.1.0 release](https://github.com/shubhampardule/trainAi/releases/tag/v0.1.0)
+> attaches a built wheel and an sdist for anyone who would rather not clone.
 
 **Windows** (PowerShell):
 
@@ -142,22 +145,28 @@ trainai doctor
 <details>
 <summary>What a built wheel actually installs (measured, not assumed)</summary>
 
-The wheel has been built, installed into a clean virtualenv from the local file — no
-checkout on the path, nothing else on `PATH` — and driven end to end. What that run
-found, on Windows 11 with Python 3.13:
+The wheel has been built, `twine check --strict`-ed, and installed into a clean
+virtualenv from the local file with the pip cache disabled — no checkout on the path,
+nothing else on `PATH`, nothing reused from an earlier download. What that run found,
+on Windows 11 with Python 3.13:
 
-- **The install is 38 dependencies and no build step.** Eight of those are declared;
-  the rest are theirs. Every one arrived as a wheel — nothing needed a compiler,
-  Node, or a system package. 2m 27s, of which `torch` is 122 MB.
-- **The default `torch` was CPU-only**, which is exactly the trap `trainai setup`
-  exists for: the machine has an NVIDIA card, and `setup` read the driver's CUDA
-  version and printed the `cu128` command for it. This is why `setup` comes first.
-- **`quickstart` completed on the CPU** without a GPU anywhere in the picture, at
-  the 4.7 s/step the planner measured there. It cut the step count to fit the time
-  budget and said so, rather than quietly running long.
-- **The suite in the sdist passes against the installed wheel** — 1900 passed, 55
-  skipped, the skips being the checks that need a git checkout or `transformers`,
-  each of which says so.
+- **`pip install` of the wheel is 37 packages and no build step.** Eight of those are
+  declared; the other twenty-nine are theirs. Every one arrived as a wheel — nothing
+  needed a compiler, Node, or a system package. 4m 14s cold, of which `torch` is a
+  single 124.1 MB download that unpacks to 502 MiB.
+- **The default `torch` was CPU-only** — `2.14.0+cpu`, `torch.version.cuda` `None`,
+  `cuda_available` False — on a machine with an NVIDIA card in it. That is exactly the
+  trap `trainai setup` exists for: it reads the driver's CUDA version rather than
+  asking torch, and prints the `cu128` command for it. This is why `setup` comes first.
+- **The suite in the sdist passes against the installed wheel** — 2681 passed, 66
+  skipped, 14 deselected, in 3m 20s. The skips are the checks that need a git checkout,
+  a GPU, `transformers`, or a `.github/` the sdist deliberately does not ship; each one
+  says which. Running it is what found two of those checks failing rather than skipping,
+  which no run from a checkout could have.
+- **`quickstart` completed on the CPU** with no GPU in the picture, at the 4.7 s/step
+  the planner measured there, cutting the step count to fit the time budget and saying
+  so rather than quietly running long. That bullet is from an earlier pass; the run
+  above stopped at the suite, because a raw corpus to prepare is not in the sdist.
 
 What is still unverified is the *index*: see [What has never been run](#what-has-never-been-run).
 
@@ -175,6 +184,7 @@ trainai data inspect ./my-corpus                 # what did I actually give it?
 trainai data prepare ./my-corpus --out data/mine # analyse + tokenize + binarize
 trainai plan --data data/mine                    # measure what this machine can train
 trainai train --data data/mine --plan plan.json  # train what it recommended
+trainai finetune --data data/more --from runs/mine  # continue it on a second corpus
 trainai eval runs/mine                           # measure it on held-out text
 trainai chat runs/mine                           # talk to what you made
 trainai export runs/mine --out models/mine       # take it elsewhere
@@ -189,12 +199,13 @@ example on a 1.1 MB corpus, start to finish. The short version of each step:
 
 | Step | What it does that is worth knowing |
 |---|---|
-| `data prepare` | Reads `.txt` `.md` `.jsonl` `.json` `.csv` `.docx`, each also `.gz`/`.bz2`/`.xz`, plus `.zip`/`.tar.gz` archives, files with no extension, and `.sqlite`/`.db`. Counts what it read rather than estimating. Splits train/validation **by content hash**, so a duplicate document cannot leak across the split. Same input and settings produce byte-identical shards. |
+| `data prepare` | Reads `.txt` `.md` `.jsonl` `.json` `.csv` `.tsv` `.docx`, each also `.gz`/`.bz2`/`.xz`, plus `.zip`/`.tar.gz` archives, files with no extension, and `.sqlite`/`.db`. Counts what it read rather than estimating. Splits train/validation **by content hash**, so a duplicate document cannot leak across the split. Same input and settings produce byte-identical shards. |
 | `data inspect` | Measures a corpus and writes nothing. Exits 3 when a corpus cannot be trained on, so it works as a check in a script. |
 | `plan` | Runs **real training steps** at candidate configurations and reads the allocator's own counters, then recommends the largest shape that actually fit — and says what it rejected and why. |
 | `train` | Fixed architecture (RMSNorm, RoPE, SwiGLU, grouped-query attention, tied embeddings), so things can be *asserted* rather than hoped: attention cannot see the future, and a resumed run continues bitwise-identically. |
+| `finetune` | Continues an existing checkpoint on a different corpus. It has no model flags at all — the shape is read from the checkpoint — and it **refuses** a dataset prepared with a different tokenizer, because that failure is otherwise silent: the loss curve looks ordinary while every token id indexes the wrong embedding row. |
 | `eval` | A separate code path from the trainer's validation pass, so it checks that pass rather than restating it. Reports how much of the split it scored, and labels perplexity as vocabulary-dependent. |
-| `chat` | Interactive playground where temperature, top-p and the repetition penalty change between completions. Pipes work, so it is scriptable. |
+| `chat` | Interactive playground where temperature, top-p and the repetition penalty change between completions. A chat-trained checkpoint is prompted in the template it was trained in, and the conversation is remembered, so a follow-up question has the exchange before it behind it. A reply the token limit cut off says so instead of looking finished. Pipes work, so it is scriptable. |
 | `export` | Writes a `LlamaForCausalLM` directory — the model *is* a Llama structurally, so this is a rename, not a conversion — then verifies its own output before moving it into place. |
 
 **A spreadsheet is not a corpus, and saying so is the point.** Training a language
@@ -205,6 +216,24 @@ column at a time**, and because the usual way a table arrives is a CSV renamed t
 exit code 3, before any GPU time is spent, overridable with `--allow-tabular` and
 recorded in the manifest when you do. Details and the thresholds behind them are in
 [docs/corpus-formats.md](docs/corpus-formats.md).
+
+A record can also hold a **typed conversation** — a list of `{"role", "content"}`
+objects, named with `--jsonl-messages-field` — rendered with one fixed, versioned chat
+template, which the dataset records so a reader never has to guess the layout. It is
+typed rather than sniffed on purpose: finding the replies by searching flattened text
+for `"Assistant:"` mis-marks any reply that contains that string. The share of the
+corpus that is replies is reported, and `data prepare` writes the mask itself -- one
+`uint8` per token, beside every shard, checksummed in the manifest and checked by
+`data inspect --verify`. `trainai train` and `trainai finetune` then **score only the
+replies**, weighting each micro-batch by what it scored rather than by
+`1/--grad-accum`, naming any step that scored nothing instead of logging a 0.0, and
+recording the choice in the checkpoint so `trainai eval` reports the same quantity.
+`--no-loss-mask` scores every token deliberately, which is how you measure what the
+mask bought. The layout then travels with the run: `trainai chat` prompts a model
+trained this way in the template its dataset recorded, cutting the reply where the
+model starts writing somebody else's turn, and refuses a template version it does not
+render rather than approximating it. `--raw` and `--chat` are there to override that,
+for a base-model probe and for a corpus you flattened into those labels yourself.
 
 ## Nothing starts until you have seen what it would do
 
@@ -327,6 +356,14 @@ smallest shape upward and stops at the first failure, so the configuration that 
 page 6 GiB onto a 4 GiB card is never run at all. It reports a *measured* time estimate,
 never an extrapolated one.
 
+The budget it sizes against is 85% of *free* VRAM, which on a card that is also driving
+your desktop is more than you can actually commit; `--max-vram 4GB` lowers it. That flag
+only ever lowers — sizing a plan against memory the device does not have would mean
+measuring candidates it cannot hold, which is the failure the fit check exists to
+prevent — so a cap above what is free is reported as having changed nothing rather than
+obeyed. The plan records what was asked for separately from what was measured, so a
+small plan on a small card is distinguishable from a small plan that was requested.
+
 It then names which of five regimes you are in — **data-limited**, **vram-limited**,
 **compute-limited**, **unconstrained**, or **blocked** — so that, for instance, a driver
 fault cannot be reported as a memory limit and send you shopping for a bigger card to
@@ -347,12 +384,17 @@ implemented **and** covered by a test in the suite CI runs on every push.
 | **M5** | Web interface | ⬜ postponed by design |
 | **M6** | Docs site, Docker, packaging polish | ⬜ postponed by design |
 
+`0.1.0` is M0 through M4. The pipeline is complete at that version — the two postponed
+milestones are additions to it rather than gaps in it, which is why it is a release and
+not a preview.
+
 ## Documentation
 
 | | |
 |---|---|
 | [docs/walkthrough.md](docs/walkthrough.md) | The full worked example: every command, its real output, and where each number came from |
-| [docs/corpus-formats.md](docs/corpus-formats.md) | Every input format, what one document is in each, and the tabular-data thresholds |
+| [docs/corpus-formats.md](docs/corpus-formats.md) | Every input format, what one document is in each, typed conversations, and the tabular-data thresholds |
+| [docs/finetuning.md](docs/finetuning.md) | What `finetune` inherits, what it refuses, and the measurement behind its learning rate |
 | [docs/dataset-format.md](docs/dataset-format.md) | The on-disk shard and manifest format |
 | [docs/plan-format.md](docs/plan-format.md) | What `plan.json` contains |
 | [docs/checkpoint-format.md](docs/checkpoint-format.md) | Checkpoint contents, and how exact resume works |
@@ -360,6 +402,8 @@ implemented **and** covered by a test in the suite CI runs on every push.
 | [docs/hardware-support.md](docs/hardware-support.md) | Every GPU path, and which of them anyone has actually run |
 | [docs/design/dependencies.md](docs/design/dependencies.md) | Why the dependency list is this short |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to work on it |
+| [SECURITY.md](SECURITY.md) | What the attack surface is — the corpus parsers — and what reading a checkpoint does and does not run |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, and the reasoning behind each change |
 
 ## Development
 
@@ -369,7 +413,7 @@ pytest -m gpu          # requires a CUDA device
 ruff check . && ruff format --check .
 ```
 
-The CPU suite is more than 1,800 tests and runs in about a minute. It needs no GPU and
+The CPU suite is more than 2,700 tests and runs in a few minutes. It needs no GPU and
 no network, and it enforces structural rules that are easy to break by accident: source
 files are pure ASCII (only `console.py` is exempt, since the glyphs it defines are the
 point), importing the library never imports torch, every text write states its newline
@@ -383,6 +427,14 @@ runs against all of them, which is what makes "it recommends something sane on a
 CI runs lint, that suite on Ubuntu and Windows across Python 3.10–3.13, a per-module
 coverage floor, and a build job — ten jobs, green, none with a GPU and none on macOS.
 
+A second workflow is tag-triggered, and it does the one thing CI cannot: it checks that
+the tag, the packaged version and the changelog agree, then installs the **wheel** as a
+wheel and runs the suite from the unpacked **sdist**, so a module missing from the wheel
+or a fixture missing from the sdist fails there rather than in somebody's install. CI's
+`pip install -e .` cannot see either. `v0.1.0` is the first tag, so this release is its
+first run on GitHub — its `artifacts` job is the sequence already run by hand above. It
+stops at a draft release, and nothing in it publishes to an index.
+
 ## Known limitations
 
 Stated explicitly, because the alternative is letting you discover them.
@@ -395,7 +447,13 @@ Stated explicitly, because the alternative is letting you discover them.
   synthetic profiles — but only the NVIDIA and CPU paths have ever run. See
   [docs/hardware-support.md](docs/hardware-support.md) for exactly what that distinction
   means.
-- **From-scratch pretraining only.** No fine-tuning, LoRA or instruction tuning.
+- **Full fine-tuning only.** `trainai finetune` continues one of *your own* TrainAI
+  checkpoints on a second corpus, and the second corpus has to be prepared with the base
+  model's tokenizer. Every parameter is trained: there is no LoRA, no adapter of any
+  kind, and no import of pretrained weights from anywhere else. It *is* chat tuning when
+  the corpus was prepared with `--jsonl-messages-field`, because the dataset then carries
+  a loss mask and `finetune` scores the assistant's replies only; on a flattened corpus
+  it trains on every token, prompts included.
 - **`torch.compile` is not used.** `doctor` reports whether it is usable as a fact about
   your machine, but no code path calls it, so Triton's absence costs nothing.
 - **A rerun is not bitwise on CUDA.** `--seed` fixes initialisation, dropout and batch
@@ -434,7 +492,7 @@ executed against the real thing:
 | **An AMD or Intel GPU.** | ROCm gfx-number handling and XPU detection are tested against synthetic profiles of three AMD cards and an Arc A770. Nothing has been trained on either vendor. |
 | **macOS, on Apple silicon or otherwise.** | The MPS profile — no per-device VRAM, fp32 only — is synthetic. There is no macOS CI leg, so not one line of this project has run on a Mac. |
 | **A GPU in CI.** | The `gpu`-marked tests run only on the development machine's RTX 2050. Hosted runners have no card. |
-| **A published install.** | The build job builds an sdist and a wheel and runs `twine check`, and the wheel has been installed into a clean virtualenv from the local file and run end to end — see [Install](#install). What has never happened is a *download*: nothing has been uploaded to any index, so no install has ever begun from a package name rather than a file path. |
+| **A published install.** | The build job builds an sdist and a wheel and runs `twine check`, and the wheel has been installed into a clean virtualenv from the local file and run end to end — see [Install](#install). The v0.1.0 release attaches both artifacts, so they can now be downloaded. What has never happened is an install from a *package name*: nothing has been uploaded to any index, so every install so far has begun from a path or a URL. |
 
 Where a synthetic profile stands in for hardware, that is stated rather than glossed:
 [docs/hardware-support.md](docs/hardware-support.md) lists every one of them and says

@@ -16,15 +16,29 @@ accumulation makes up the difference.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from trainai.errors import ConfigError
 from trainai.serialise import checked_fields
 
-__all__ = ["Precision", "ScheduleName", "TrainConfig"]
+__all__ = [
+    "PRECISION_CHOICES",
+    "SCHEDULE_CHOICES",
+    "Precision",
+    "ScheduleName",
+    "TrainConfig",
+]
 
 ScheduleName = Literal["cosine", "linear", "constant"]
 Precision = Literal["auto", "bf16", "fp16", "fp32"]
+
+#: The same sets as the types above, as values something can be checked against.
+#: Derived from the types rather than written twice: a ``Literal`` is erased at runtime,
+#: so a hand-kept tuple beside it is a second list of precisions free to disagree with
+#: the first -- and before these existed there were three, in this module, in the CLI
+#: help text and in the error message that listed them.
+PRECISION_CHOICES: tuple[str, ...] = get_args(Precision)
+SCHEDULE_CHOICES: tuple[str, ...] = get_args(ScheduleName)
 
 #: Warmup as a share of total steps when it is not given explicitly. Enough to get
 #: Adam's second-moment estimate off the ground before the learning rate is high
@@ -68,6 +82,14 @@ class TrainConfig:
             best-so-far and the final one are always kept.
         log_every: Steps between metric records.
         seed: Seeds parameter initialisation, dropout, and batch order.
+        loss_mask: Whether to score only the tokens a masked dataset marks as
+            targets. ``None`` -- the default -- applies the mask when the dataset has
+            one and scores every token when it does not, which is what makes a chat
+            corpus and a plain-text corpus both do the right thing unasked. ``True``
+            requires a masked dataset and refuses one without a mask, rather than
+            quietly training on everything. ``False`` scores every token of a masked
+            dataset deliberately. Optional in a recorded config, so a checkpoint
+            written before masks existed resumes as ``None``.
         precision: ``auto`` picks bf16 on hardware that supports it, fp16 with a
             gradient scaler otherwise, and fp32 on CPU.
         device: ``auto`` prefers CUDA.
@@ -92,6 +114,7 @@ class TrainConfig:
     keep_checkpoints: int = 3
     log_every: int = 10
     seed: int = 1234
+    loss_mask: bool | None = None
     precision: Precision = "auto"
     device: str = "auto"
 
@@ -166,16 +189,16 @@ class TrainConfig:
                     "keep_checkpoints": self.keep_checkpoints,
                 },
             )
-        if self.precision not in ("auto", "bf16", "fp16", "fp32"):
+        if self.precision not in PRECISION_CHOICES:
             raise ConfigError(
                 f"Unknown --precision {self.precision!r}.",
-                hint="Use one of: auto, bf16, fp16, fp32.",
+                hint=f"Use one of: {', '.join(PRECISION_CHOICES)}.",
                 details={"precision": self.precision},
             )
-        if self.schedule not in ("cosine", "linear", "constant"):
+        if self.schedule not in SCHEDULE_CHOICES:
             raise ConfigError(
                 f"Unknown --schedule {self.schedule!r}.",
-                hint="Use one of: cosine, linear, constant.",
+                hint=f"Use one of: {', '.join(SCHEDULE_CHOICES)}.",
                 details={"schedule": self.schedule},
             )
 

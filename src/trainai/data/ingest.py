@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import codecs
 import csv
+import difflib
 import gzip
 import io
 import json
@@ -58,7 +59,13 @@ from pathlib import Path
 from typing import IO, Any, Literal
 from xml.etree import ElementTree
 
-from trainai.errors import DatasetDecodeError, DatasetFormatError, DatasetNotFoundError
+from trainai.data.chat import ChatFormatError, render_conversation
+from trainai.errors import (
+    DatasetDecodeError,
+    DatasetFormatError,
+    DatasetNotFoundError,
+    UsageError,
+)
 
 # ``bz2``, ``lzma`` and ``sqlite3`` are optional at CPython *build* time. Each needs a
 # system library present when the interpreter was compiled, and a Python built
@@ -471,6 +478,12 @@ _BOM_LENGTHS = {"utf-8-sig": 3, "utf-16": 2, "utf-32": 4}
 # Wide codecs cannot be split on a newline byte.
 _WIDE_CODECS = frozenset({"utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"})
 
+# Not the set of encodings --encoding accepts, which is every text codec Python knows.
+# Only the ones worth naming back to someone who misspelt one, and the pool a near miss
+# is drawn from: a corpus is overwhelmingly one of these, and suggesting koi8-r to
+# someone who typed "uft-8" would be worse than suggesting nothing.
+_COMMON_ENCODINGS = ("utf-8", "utf-16", "utf-32", "latin-1", "cp1252", "ascii")
+
 OnError = Literal["fail", "skip"]
 
 
@@ -523,8 +536,15 @@ class _MemberStream(io.BufferedIOBase):
     (see ``Ingestor._archive_container``) and is closed when the document stream
     ends.
 
-    Only ``read`` and ``readline`` are implemented; iteration, ``readlines`` and
-    the context manager come from :class:`io.IOBase` on top of them.
+    Only ``read``, ``read1`` and ``readline`` are implemented; iteration,
+    ``readlines`` and the context manager come from :class:`io.IOBase` on top of
+    them. ``read1`` is not spare: :class:`io.BufferedIOBase` leaves it raising
+    ``UnsupportedOperation``, and it is what :class:`io.TextIOWrapper` calls to read
+    a line, so a member wrapped for text would be unreadable without it.
+
+    :meth:`close` closes ``_stream`` first, then ``_owned`` in reverse of the order
+    given, then the base class -- a layer is never asked to finish through a stream
+    that has already gone.
     """
 
     def __init__(self, stream: IO[bytes], *owned: Any) -> None:
@@ -566,12 +586,20 @@ class Document:
     offset exists to report -- the ordinal is the locator for those. For ``.docx`` it
     is an offset within the extracted prose rather than within the file, because the
     file is XML and an offset into that would point at markup instead of at text.
+
+    ``trained_spans`` is empty for every format and every option except a chat
+    corpus read with ``jsonl_messages_field``, where it holds the half-open
+    **character** ranges of ``text`` a loss mask should keep -- see
+    :mod:`trainai.data.chat`. Empty means "no opinion", not "train on nothing": the
+    ordinary case is a document with no mask, and the distinction matters because a
+    span list that came out empty by accident would silently zero the loss.
     """
 
     text: str
     source: str
     ordinal: int
     byte_offset: int
+    trained_spans: tuple[tuple[int, int], ...] = ()
 
     @property
     def location(self) -> str:
@@ -652,6 +680,12 @@ class IngestOptions:
 
     encoding: str = "utf-8"
     jsonl_field: str | None = None
+    # The field holding a typed conversation -- a list of {"role", "content"} objects
+    # -- instead of a flat string. Naming it switches the reader into chat mode: the
+    # text is rendered by :mod:`trainai.data.chat` and the assistant's characters are
+    # marked as the trained spans. Mutually exclusive with ``jsonl_field``, which
+    # names a field holding text that is trained on in full.
+    jsonl_messages_field: str | None = None
     csv_text_column: str | None = None
     # Which table to read from a SQLite database, needed only when it holds more
     # than one. The *column* inside that table is named with ``csv_text_column``,
@@ -666,12 +700,67 @@ class IngestOptions:
         return {
             "encoding": self.encoding,
             "jsonl_field": self.jsonl_field,
+            "jsonl_messages_field": self.jsonl_messages_field,
             "csv_text_column": self.csv_text_column,
             "db_table": self.db_table,
             "max_doc_chars": self.max_doc_chars,
             "min_doc_chars": self.min_doc_chars,
             "on_error": self.on_error,
         }
+
+    def __post_init__(self) -> None:
+        # Two flags naming two different fields is a contradiction, not a preference:
+        # one says "this field holds text, train on all of it" and the other says
+        # "this field holds a conversation, train on the replies". Picking either
+        # would train on something the user did not ask for, so it stops here rather
+        # than in whichever reader happened to look first.
+        if self.jsonl_field is not None and self.jsonl_messages_field is not None:
+            raise UsageError(
+                "--jsonl-field and --jsonl-messages-field cannot both be given.",
+                hint=(
+                    "They describe different records. --jsonl-field names a field "
+                    "holding text, and every token of it is trained on. "
+                    "--jsonl-messages-field names a field holding a list of "
+                    '{"role": ..., "content": ...} objects, and only the assistant '
+                    "replies are trained on. Pick the one that matches the corpus."
+                ),
+                details={
+                    "jsonl_field": self.jsonl_field,
+                    "jsonl_messages_field": self.jsonl_messages_field,
+                },
+            )
+
+        # A codec name is a string the user typed, and every reader here hands it
+        # straight to Python. Measured before this check existed, --encoding
+        # no-such-codec on a plain .txt corpus produced "LookupError: unknown
+        # encoding: no-such-codec" from inside <frozen codecs>: a traceback, with no
+        # mention of the flag that caused it and none of our own exit codes. On a
+        # BOM'd file it produced a good message by luck, and on an extensionless file
+        # it produced a wrong one -- "none of them a readable format" -- because the
+        # name had reached the sniffer before anything checked it.
+        #
+        # The empty string is encoded rather than looked up because codecs.lookup also
+        # accepts the bytes-to-bytes codecs -- base64, zlib, rot13 -- which no reader
+        # here can use. str.encode rejects those by name too, and on an empty string
+        # it has nothing else it can fail on.
+        try:
+            "".encode(self.encoding)
+        except LookupError as exc:
+            near = difflib.get_close_matches(self.encoding, _COMMON_ENCODINGS, n=1, cutoff=0.7)
+            raise UsageError(
+                f"--encoding was given as {self.encoding!r}, which is not a text encoding.",
+                hint=" ".join(
+                    part
+                    for part in (
+                        f"Did you mean {near[0]}?" if near else "",
+                        f"Common ones are {', '.join(_COMMON_ENCODINGS)}, though any "
+                        "codec Python knows by name will do.",
+                        "Leave --encoding off to read UTF-8 and honour a byte-order mark.",
+                    )
+                    if part
+                ),
+                details={"encoding": self.encoding},
+            ) from exc
 
 
 @dataclass
@@ -727,6 +816,15 @@ class IngestStats:
     # table rule safe -- if it ever picks the wrong table, the report says which.
     resolved_db_tables: dict[str, str] = field(default_factory=dict)
     resolved_db_columns: dict[str, str] = field(default_factory=dict)
+    # Chat records read with ``jsonl_messages_field``, and the characters inside them.
+    # ``chat_chars`` is the denominator for ``chat_trained_chars``: the share is the
+    # only number that says whether the mask is doing what the user thinks, and a
+    # count without its total cannot be checked against anything. Characters, not
+    # tokens -- this module has no tokenizer, and inventing one here to report a
+    # rounder-sounding figure would be the estimate this project refuses to make.
+    chat_documents: int = 0
+    chat_trained_chars: int = 0
+    chat_chars: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -752,6 +850,9 @@ class IngestStats:
             "resolved_csv_columns": self.resolved_csv_columns,
             "resolved_db_tables": self.resolved_db_tables,
             "resolved_db_columns": self.resolved_db_columns,
+            "chat_documents": self.chat_documents,
+            "chat_trained_chars": self.chat_trained_chars,
+            "chat_chars": self.chat_chars,
         }
 
 
@@ -1409,6 +1510,7 @@ class Ingestor:
             )
 
         chosen = self.options.jsonl_field
+        messages_field = self.options.jsonl_messages_field
         offset = 0
         ordinal = 0
 
@@ -1444,6 +1546,15 @@ class Ingestor:
                     if self.options.on_error == "fail":
                         raise problem from exc
                     self.stats.records_skipped_malformed += 1
+                    continue
+
+                if messages_field is not None:
+                    document = self._chat_document(source, record, line_number, start, ordinal)
+                    if document is None:
+                        continue
+                    yield document
+                    self.stats.documents_emitted += 1
+                    ordinal += 1
                     continue
 
                 text: Any = None
@@ -1546,6 +1657,87 @@ class Ingestor:
             },
         )
 
+    # -- chat --------------------------------------------------------------- #
+    def _chat_document(
+        self,
+        source: SourceFile,
+        record: Any,
+        number: int,
+        offset: int,
+        ordinal: int,
+        *,
+        unit: str = "line",
+    ) -> Document | None:
+        """One conversation, rendered and span-marked, or ``None`` if it was skipped.
+
+        Shared by JSON Lines and ``.json`` because they hold the same records. The
+        ``None`` return covers both reasons a record does not become a document -- too
+        short, or malformed under ``--on-error skip`` -- and both are counted before
+        returning, so the caller only has to increment ``documents_emitted``.
+        """
+        field_name = self.options.jsonl_messages_field
+        assert field_name is not None  # only called when the option is set
+        problem: DatasetFormatError | None = None
+        conversation = None
+
+        if not isinstance(record, dict):
+            problem = DatasetFormatError(
+                f"{source.relative} {unit} {number}: the record is a "
+                f"{type(record).__name__}, not an object with a {field_name!r} field.",
+                hint=(
+                    "--jsonl-messages-field expects each record to be a JSON object "
+                    f"holding a conversation in {field_name!r}. Use --on-error skip to "
+                    "drop records like this one."
+                ),
+                details={"path": source.relative, unit: number, "field": field_name},
+            )
+        elif field_name not in record:
+            keys = sorted(str(key) for key in record)
+            problem = DatasetFormatError(
+                f"{source.relative} {unit} {number}: field {field_name!r} is missing.",
+                hint=(
+                    f"Every record needs its conversation in {field_name!r}. This record "
+                    f"has: {', '.join(keys) if keys else '(no keys)'}. If the text is "
+                    "already flattened into one string, use --jsonl-field instead -- it "
+                    "trains on every token, with no mask."
+                ),
+                details={
+                    "path": source.relative,
+                    unit: number,
+                    "field": field_name,
+                    "available_fields": keys,
+                },
+            )
+        else:
+            try:
+                conversation = render_conversation(record[field_name])
+            except ChatFormatError as exc:
+                problem = DatasetFormatError(
+                    f"{source.relative} {unit} {number}: {exc.problem}.",
+                    hint=exc.hint,
+                    details={
+                        "path": source.relative,
+                        unit: number,
+                        "byte_offset": offset,
+                        "field": field_name,
+                        **exc.fields,
+                    },
+                )
+
+        if problem is not None:
+            if self.options.on_error == "fail":
+                raise problem
+            self.stats.records_skipped_malformed += 1
+            return None
+
+        assert conversation is not None
+        if not self._keep(conversation.text):
+            return None
+        self.stats.chat_documents += 1
+        self.stats.chat_chars += len(conversation.text)
+        self.stats.chat_trained_chars += conversation.trained_chars
+        return Document(conversation.text, source.relative, ordinal, offset, conversation.spans)
+
     # -- json --------------------------------------------------------------- #
     def _read_json(self, source: SourceFile) -> Iterator[Document]:
         """One document per element of a top-level array.
@@ -1579,9 +1771,20 @@ class Ingestor:
 
         records = self._json_records(source, document)
         chosen = self.options.jsonl_field
+        messages_field = self.options.jsonl_messages_field
         ordinal = 0
 
         for index, record in enumerate(records):
+            if messages_field is not None:
+                # byte_offset is 0 here for the same reason as below.
+                emitted = self._chat_document(source, record, index, 0, ordinal, unit="element")
+                if emitted is None:
+                    continue
+                yield emitted
+                self.stats.documents_emitted += 1
+                ordinal += 1
+                continue
+
             text: Any = None
             if isinstance(record, str):
                 text = record
@@ -1801,6 +2004,12 @@ class Ingestor:
             declared = package.getinfo(name).file_size
             if declared > _DOCX_MAX_XML_BYTES:
                 raise self._docx_part_too_large(source, name, declared)
+            # Reading a member decompresses it, so this needs the same errors a codec
+            # raises and not just ``zipfile``'s own: measured, a plain ``.docx`` on disk
+            # with eight bytes flipped inside its deflate stream ended the run with a
+            # ``zlib.error`` traceback. ``_read``'s wrapper does not cover it, because a
+            # plain file is deliberately left unwrapped -- there is no outer codec there
+            # to blame, and the compression is inside the package rather than around it.
             try:
                 with package.open(name) as handle:
                     # Deliberately not checked a second time against what arrived, the
@@ -1812,7 +2021,7 @@ class Ingestor:
                     # "Bad CRC-32", never a short read. A second ceiling check here would
                     # be a branch no input can reach.
                     xml = handle.read(declared)
-            except (KeyError, zipfile.BadZipFile, EOFError, OSError) as exc:
+            except (KeyError, zipfile.BadZipFile, *_CORRUPT_STREAM_ERRORS) as exc:
                 raise self._docx_part_unreadable(source, name, exc) from exc
         return name, xml
 
@@ -1879,7 +2088,15 @@ class Ingestor:
     def _docx_declared_part(
         self, source: SourceFile, package: zipfile.ZipFile, names: set[str]
     ) -> str | None:
-        """The main part's name as the package's relationships declare it."""
+        """The main part's name as the package's relationships declare it.
+
+        Every way of failing to read the declaration returns ``None`` rather than
+        raising, which lands on ``_docx_part_name``'s "no ``word/document.xml``
+        part" refusal. That refusal lists the parts the package does hold, so a
+        damaged package still shows the user something true; raising from here
+        instead would describe a file whose conventional part is *also* missing as
+        damaged when the more likely reading is that it was never a Word document.
+        """
         if _DOCX_RELATIONSHIPS_PART not in names:
             return None
         if package.getinfo(_DOCX_RELATIONSHIPS_PART).file_size > _DOCX_MAX_RELATIONSHIPS_BYTES:
@@ -1887,11 +2104,14 @@ class Ingestor:
         try:
             with package.open(_DOCX_RELATIONSHIPS_PART) as handle:
                 rels = handle.read(_DOCX_MAX_RELATIONSHIPS_BYTES)
-        except (KeyError, zipfile.BadZipFile, EOFError, OSError):
+        except (KeyError, zipfile.BadZipFile, *_CORRUPT_STREAM_ERRORS):
             return None
         root = self._docx_parse(source, _DOCX_RELATIONSHIPS_PART, rels)
         for relationship in root.iter(_PACKAGE_NS + "Relationship"):
             if relationship.get("Type") != _DOCX_MAIN_RELATIONSHIP:
+                # Word writes three or four of these -- core properties, extended
+                # properties, sometimes a thumbnail -- and the main one is not
+                # reliably first, so this skips rather than stops.
                 continue
             # Targets in this part are relative to the package root, and a leading
             # slash is permitted; neither is a path to resolve on disk, because
@@ -1899,6 +2119,9 @@ class Ingestor:
             target = (relationship.get("Target") or "").lstrip("/")
             if target in names:
                 return target
+            # A declaration pointing at a part the package does not hold is not a
+            # name to hand back: the caller looks it up with ``getinfo``, outside any
+            # handler, so returning it would end the run with a bare ``KeyError``.
         return None
 
     def _docx_parse(self, source: SourceFile, part: str, xml: bytes) -> ElementTree.Element:
@@ -2174,7 +2397,11 @@ class Ingestor:
                 },
             )
 
-        if not columns or not any(columns):
+        # ``not any`` rather than ``not columns or not any(columns)``: the second
+        # subsumes the first, because ``any([])`` is already False. A file whose first
+        # line is blank reaches here as no fields at all, and one whose first line is
+        # ``,,`` as three empty ones, and neither names a column.
+        if not any(columns):
             raise DatasetFormatError(
                 f"{source.relative} has no header row.",
                 hint=(
@@ -2427,7 +2654,16 @@ class Ingestor:
         """
         try:
             rows = connection.execute(f"PRAGMA table_info({_sql_quote(table)})").fetchall()
-        except sqlite3.Error as exc:
+        # Unreachable from any file. ``_sqlite_objects`` has already run a statement on
+        # this connection, and SQLite parses the whole schema before it runs the first
+        # one -- measured: a ``sqlite_master`` row rewritten to unparseable SQL fails
+        # the catalogue query itself, not this pragma. So the only way here is the
+        # database changing under the reader between two statements, which is a race
+        # rather than an input: another process taking the write lock, or a page
+        # damaged in between. Kept because both of those do happen, and the
+        # alternative is a raw sqlite3 traceback; the same translation is exercised
+        # from the two handlers a file can reach.
+        except sqlite3.Error as exc:  # pragma: no cover - see above
             raise self._sqlite_unreadable(source, exc) from exc
         return [_DbColumn(name=name, primary_key=pk) for _, name, _, _, _, pk in rows]
 
@@ -2755,7 +2991,12 @@ def _csv_delimiter(source: SourceFile) -> str:
     for suffix, delimiter in _CSV_DELIMITERS.items():
         if name.endswith(suffix):
             return delimiter
-    return ","
+    # Unreachable: only a name ending in CSV_SUFFIXES is read as a table, and
+    # test_every_extension_read_as_a_table_has_a_separator_of_its_own holds the two
+    # tables to the same keys. Kept as the fallthrough the signature needs, and a
+    # comma rather than a raise because a table read with the wrong separator is a
+    # bad dataset, not a crash.
+    return ","  # pragma: no cover
 
 
 def _quoted(names: Iterable[str]) -> str:
@@ -2949,15 +3190,14 @@ def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     return (info.external_attr >> 16) & 0o170000 == 0o120000
 
 
+# Both of these once fell back to the name as typed when the registry did not know
+# it, which is what let a misspelt --encoding reach bytes.decode and raise there:
+# an unknown name is not a wide codec, so the format guards waved it through.
+# IngestOptions rejects the name instead, and the only strings that arrive here now
+# are one it accepted or one of the codecs named in _BOMS.
 def _canonical(name: str) -> str:
-    try:
-        return codecs.lookup(name).name
-    except LookupError:
-        return name.lower()
+    return codecs.lookup(name).name
 
 
 def _same_codec(left: str, right: str) -> bool:
-    try:
-        return codecs.lookup(left).name == codecs.lookup(right).name
-    except LookupError:
-        return False
+    return codecs.lookup(left).name == codecs.lookup(right).name

@@ -140,6 +140,50 @@ def test_no_verify_says_the_checks_were_skipped(
     assert "--no-verify" in printed
 
 
+def test_a_check_that_ran_and_failed_reads_as_failed_not_as_skipped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The third state of a check, which the CLI cannot currently reach.
+
+    ``export_run`` raises ``ExportError`` the moment any check has ``ran and not
+    passed`` -- that is what ``test_corrupted_weights_are_caught_and_nothing_is_
+    written`` in :mod:`tests.test_export_hf` pins -- so a result carrying a failed
+    check never reaches ``_report``, and the red row is unreachable through the
+    command. It is not unreachable through the type: ``VerifyCheck`` permits the
+    combination, and the printer's job is to be right about every combination it
+    can be handed.
+
+    Which is why this drives the printer directly rather than the CLI. Merging the
+    branch away is the tempting simplification and it is a wrong one: a failure
+    would then fall to the ``else`` and print as "not checked", turning the one
+    outcome that means the export is broken into the one that means nobody looked.
+    That is the same overstatement ``test_a_skipped_check_is_printed_as_not_checked``
+    guards from the other side, so the assertions below check the three renderings
+    are distinct rather than only that the word "failed" appears somewhere.
+    """
+    from trainai.cli.export import _print_checks
+    from trainai.export.bundle import ExportResult, VerifyCheck
+
+    checks = [
+        VerifyCheck(name="weights round-trip", ran=True, passed=True, detail="8 tensors"),
+        VerifyCheck(name="logits parity", ran=True, passed=False, detail="0.4 above tolerance"),
+        VerifyCheck(name="tokenizer round-trip", ran=False, passed=False, detail="not applicable"),
+    ]
+    # The invariant the docstring rests on, asserted rather than assumed.
+    assert [check.ok for check in checks] == [True, False, True]
+
+    _print_checks(
+        ExportResult(format="hf", out_dir=Path("out"), dtype="float32", files=[], checks=checks)
+    )
+
+    printed = flat(capsys.readouterr().out)
+    assert "logits parity failed 0.4 above tolerance" in printed
+    assert "weights round-trip ok 8 tensors" in printed
+    assert "tokenizer round-trip not checked not applicable" in printed
+    assert "logits parity not checked" not in printed
+    assert "logits parity ok" not in printed
+
+
 # --------------------------------------------------------------------------- #
 # Flags reaching the library
 # --------------------------------------------------------------------------- #

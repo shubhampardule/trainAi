@@ -28,7 +28,6 @@ measuring something else, and seeing it side by side is what makes that visible.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
@@ -44,7 +43,7 @@ from trainai.console import (
     rule,
 )
 from trainai.data.binarize import DatasetManifest, Split, verify_dataset
-from trainai.errors import UsageError
+from trainai.errors import UsageError, check_choice
 from trainai.eval import DEFAULT_BATCH_SIZE, EvalReport, SplitResult, dataset_check, evaluate
 from trainai.infer import DEFAULT_WHICH, InferenceSession
 from trainai.train.metrics import format_perplexity
@@ -129,15 +128,15 @@ def _resolve_splits(split: str) -> tuple[Split, ...]:
     :data:`SPLIT_CHOICES`; those two orders are different things, and a CLI test pins
     this one.
     """
+    check_choice(
+        split,
+        SPLIT_CHOICES,
+        "--split",
+        hint="`both` scores the training split too, which is how you see overfitting.",
+    )
     if split == "both":
         return ("train", "val")
-    if split in ("train", "val"):
-        return (split,)  # type: ignore[return-value]
-    raise UsageError(
-        f"--split must be one of {', '.join(SPLIT_CHOICES)}, not {split!r}.",
-        hint="`both` scores the training split too, which is how you see overfitting.",
-        details={"split": split, "choices": list(SPLIT_CHOICES)},
-    )
+    return (split,)  # type: ignore[return-value]
 
 
 def _resolve_dataset(
@@ -321,8 +320,3 @@ def _progress(*, quiet: bool) -> Progress:
         transient=True,
         disable=quiet,
     )
-
-
-def describe_report(report: EvalReport) -> dict[str, Any]:
-    """The report as a plain dictionary, for the web interface in M5."""
-    return report.to_dict()

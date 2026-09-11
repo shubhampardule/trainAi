@@ -6,7 +6,7 @@ from-scratch language modelling, which makes it useful for comparing notes.
 
     python examples/get_tinyshakespeare.py
     trainai data inspect data/corpus
-    trainai data prepare data/corpus --out data/shakespeare
+    trainai data prepare data/corpus --out data/shake
 
 Needs network access; nothing else in TrainAI does. Stdlib only, no dependencies.
 
@@ -96,7 +96,7 @@ def main() -> int:
     print()
     print("Next:")
     print("  trainai data inspect data/corpus")
-    print("  trainai data prepare data/corpus --out data/shakespeare")
+    print("  trainai data prepare data/corpus --out data/shake")
     return 0
 
 

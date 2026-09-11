@@ -38,7 +38,7 @@ too — or a single file with no extension at all), or at a `.sqlite`/`.db` data
 
 ```bash
 python examples/get_tinyshakespeare.py           # ~1.1 MB of text to play with
-trainai data prepare data/corpus --out data/shakespeare
+trainai data prepare data/corpus --out data/shake
 ```
 
 It reads the corpus twice — once to measure it and train a byte-level BPE
@@ -131,8 +131,8 @@ To look before you commit, or to check a dataset you already have:
 
 ```bash
 trainai data inspect ./my-corpus            # measure it; writes nothing
-trainai data inspect data/shakespeare       # report on a prepared dataset
-trainai data inspect data/shakespeare --verify   # re-hash every shard
+trainai data inspect data/shake             # report on a prepared dataset
+trainai data inspect data/shake --verify    # re-hash every shard
 ```
 
 `data inspect` exits 3 when a corpus cannot be trained on, so it works as a check
@@ -241,7 +241,10 @@ quietly becoming a different experiment. The smallest rung is always measured, s
 
 `--time 2h` adds a third cap on top of memory and data: candidates whose measured
 step time cannot finish in the budget are rejected, and the accepted one has its step
-count cut to fit. `--max-preset`, `--seq-len`, `--precision` and `--device` pin
+count cut to fit. `--max-vram 4GB` lowers the memory cap itself, for a card you are
+sharing with a desktop or another job; it only ever lowers it, since sizing against
+memory the card does not have would mean measuring candidates it cannot hold.
+`--max-preset`, `--seq-len`, `--precision` and `--device` pin
 whatever you would rather decide yourself. `--json` emits the plan and nothing else.
 When nothing fits at all, it exits 4 and shows you the measurement of the smallest
 shape it tried, rather than a formula's opinion about it. The written format is
@@ -531,6 +534,7 @@ What is thy mother and Warwick?
 
 SOMERSET:
 He doth not
+The model was still writing at the 120-token limit, so this reply is unfinished. --tokens raises the limit.
 120 tokens in 1.1s - 107.6 tokens/s
 ```
 
@@ -540,6 +544,13 @@ they start. It has learned the *form* — speaker headings, line breaks, the reg
 real character names — and words like "siped", "purfail'd" and "blined" do not
 exist. It is not going to answer your questions, and `chat` says so on the way in
 rather than letting you discover it.
+
+It also stops mid-sentence, and the line above the timing says why: 120 tokens was
+the budget, not the end of the thought. A reply that ended on its own — at
+end-of-text, or where the model began the next speaker's heading — says nothing,
+so that line appears only when raising `--tokens` would actually get you more.
+`--json` carries the same answer as `finish`, which is `null` for a generation you
+stopped with Ctrl-C, because nothing ended that one.
 
 With no `--prompt` it is an interactive playground where temperature, top-p and the
 repetition penalty can be changed between completions, so you can see what those

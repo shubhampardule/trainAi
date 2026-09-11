@@ -21,7 +21,9 @@ Exit codes are stable so that shell scripts and CI can branch on them.
 
 from __future__ import annotations
 
+import difflib
 import json
+from collections.abc import Sequence
 from typing import Any
 
 __all__ = [
@@ -38,14 +40,12 @@ __all__ = [
     "DatasetNotFoundError",
     "ExitCode",
     "ExportError",
-    "HardwareError",
-    "InsufficientMemoryError",
-    "NoAcceleratorError",
     "TokenizerError",
     "TrainAIError",
     "TrainingDivergedError",
     "TrainingError",
     "UsageError",
+    "check_choice",
     "json_literal",
     "json_type_name",
 ]
@@ -148,22 +148,8 @@ class TokenizerError(TrainAIError):
 
 
 # --------------------------------------------------------------------------- #
-# Hardware and capacity
+# Capacity
 # --------------------------------------------------------------------------- #
-class HardwareError(TrainAIError):
-    """The machine cannot do what was asked of it."""
-
-    exit_code = ExitCode.CAPACITY
-
-
-class NoAcceleratorError(HardwareError):
-    """No GPU was found and the requested operation needs one to be practical."""
-
-
-class InsufficientMemoryError(HardwareError):
-    """Not enough VRAM or system RAM, as *measured* rather than estimated."""
-
-
 class CapacityError(TrainAIError):
     """No viable training configuration exists under the user's constraints.
 
@@ -171,6 +157,15 @@ class CapacityError(TrainAIError):
     ``details`` dict is expected to carry the rejected candidates and the
     measured evidence for each rejection, so the user learns *why* rather than
     just being told no.
+
+    This is the only error in the family, deliberately. There were three more --
+    ``HardwareError`` and its ``NoAcceleratorError`` and ``InsufficientMemoryError``
+    subclasses -- and nothing raised any of them. "Not enough VRAM" is this error:
+    it is a fact about a configuration measured against a budget, not about the
+    card, and splitting it out would have given two classes the same exit code and
+    the same meaning. "No accelerator" is not an error at all -- ``doctor`` reports
+    it, ``plan`` measures the CPU instead, and ``train`` runs there -- so a class
+    for it described a policy this project does not have.
     """
 
     exit_code = ExitCode.CAPACITY
@@ -262,3 +257,45 @@ def json_literal(value: Any, *, limit: int = 40) -> str:
     except (TypeError, ValueError):
         text = repr(value)
     return text if len(text) <= limit else json_type_name(value)
+
+
+def check_choice(value: str, choices: Sequence[str], flag: str, *, hint: str = "") -> str:
+    """``value`` unchanged if ``flag`` accepts it, or raise saying what ``flag`` accepts.
+
+    For the options whose valid values are a closed set that the CLI nevertheless declares
+    as ``TEXT``. Typer validates an ``Enum`` and a ``bool`` and nothing else, so a value
+    like ``--precision bf6`` arrives as a string, and every consumer that reaches for it
+    with ``==`` treats it as whatever its final branch does. That is how ``--precision``
+    came to accept ``fp64``: no branch matched, the fall-through was ``auto``, and the run
+    reported the precision it chose rather than the one it was asked for. A misspelt flag
+    *name* is caught by the parser; a misspelt flag *value* had nothing to catch it.
+
+    A near miss is named when there is one, because these are short values typed from
+    memory and the misses look like ``bf6``, ``fp64`` and ``Best``. The cutoff is above
+    :mod:`difflib`'s default: at 0.6, ``--device gpu`` is answered with "did you mean
+    xpu?", which is a confident wrong answer to someone holding an NVIDIA card. Listing
+    the real values and suggesting nothing is the better failure.
+
+    ``hint`` is appended for a flag whose values mean something a list of them does not
+    convey.
+
+    Raises:
+        UsageError: If ``value`` is not in ``choices``. Exit code 2 rather than a failure
+            code for the operation, because nothing was attempted.
+    """
+    if value in choices:
+        return value
+    near = difflib.get_close_matches(value, choices, n=1, cutoff=0.7)
+    raise UsageError(
+        f"Unknown {flag} {value!r}.",
+        hint=" ".join(
+            part
+            for part in (
+                f"Did you mean {near[0]}?" if near else "",
+                f"Choose one of: {', '.join(choices)}.",
+                hint,
+            )
+            if part
+        ),
+        details={"flag": flag, "given": value, "choices": list(choices)},
+    )

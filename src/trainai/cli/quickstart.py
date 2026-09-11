@@ -94,6 +94,7 @@ class _Reading:
 
     encoding: str = "utf-8"
     jsonl_field: str | None = None
+    jsonl_messages_field: str | None = None
     csv_text_column: str | None = None
     db_table: str | None = None
 
@@ -102,6 +103,7 @@ class _Reading:
         pairs = [
             ("--encoding", self.encoding if self.encoding != "utf-8" else None),
             ("--jsonl-field", self.jsonl_field),
+            ("--jsonl-messages-field", self.jsonl_messages_field),
             ("--csv-text-column", self.csv_text_column),
             ("--db-table", self.db_table),
         ]
@@ -118,6 +120,7 @@ def run_quickstart(
     tokens: int | None = None,
     encoding: str = "utf-8",
     jsonl_field: str | None = None,
+    jsonl_messages_field: str | None = None,
     csv_text_column: str | None = None,
     db_table: str | None = None,
     device: str | None = None,
@@ -136,6 +139,7 @@ def run_quickstart(
     reading = _Reading(
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
     )
@@ -193,6 +197,7 @@ def _step_prepare(
         str(layout.dataset),
         encoding=reading.encoding,
         jsonl_field=reading.jsonl_field,
+        jsonl_messages_field=reading.jsonl_messages_field,
         csv_text_column=reading.csv_text_column,
         db_table=reading.db_table,
         force=force,
@@ -302,6 +307,7 @@ def _prompt_from_corpus(corpus: str, reading: _Reading) -> str:
     options = IngestOptions(
         encoding=reading.encoding,
         jsonl_field=reading.jsonl_field,
+        jsonl_messages_field=reading.jsonl_messages_field,
         csv_text_column=reading.csv_text_column,
         db_table=reading.db_table,
     )

@@ -352,6 +352,7 @@ class GPT(nn.Module):
         inputs: Tensor,
         targets: Tensor | None = None,
         *,
+        loss_mask: Tensor | None = None,
         caches: list[tuple[Tensor, Tensor]] | None = None,
         offset: int = 0,
     ) -> tuple[Tensor, Tensor | None, list[tuple[Tensor, Tensor]]]:
@@ -361,6 +362,11 @@ class GPT(nn.Module):
             inputs: ``(batch, seq)`` token ids.
             targets: ``(batch, seq)`` token ids to score against. When given, the
                 loss is returned; when not, only logits are.
+            loss_mask: ``(batch, seq)`` of 1s and 0s, the same shape as ``targets``.
+                A 0 means the position is read but not scored, which is how a chat
+                corpus trains on replies without training on the prompts that
+                introduce them. ``None`` scores every position, which is what a
+                plain-text corpus wants and what every run did before masks existed.
             caches: Per-layer key/value cache from a previous call, for
                 incremental generation. ``inputs`` may be more than one token
                 against a cache -- a prompt fed in chunks -- and the new tokens are
@@ -397,11 +403,36 @@ class GPT(nn.Module):
         # Cross-entropy in fp32: under autocast the logits arrive in bf16/fp16,
         # and the log-sum-exp over a vocabulary of thousands is exactly the
         # reduction that loses precision in half.
-        loss = F.cross_entropy(
-            logits.float().view(-1, logits.size(-1)),
-            targets.reshape(-1),
-        )
+        flat = logits.float().view(-1, logits.size(-1))
+        if loss_mask is None:
+            loss = F.cross_entropy(flat, targets.reshape(-1))
+        else:
+            loss = self._masked_loss(flat, targets, loss_mask)
         return logits, loss, present
+
+    @staticmethod
+    def _masked_loss(flat_logits: Tensor, targets: Tensor, loss_mask: Tensor) -> Tensor:
+        """Mean cross-entropy over the positions the mask selects.
+
+        Weighted rather than ``ignore_index``: setting the ignored targets to -100
+        would be shorter, but a window that lies entirely inside a prompt has *no*
+        selected position, and cross-entropy over nothing is 0/0. That NaN reaches
+        every parameter through the backward pass, and the run is unrecoverable one
+        step later. Here the denominator is clamped, so such a window contributes a
+        loss of 0 and a gradient of exactly 0 -- it teaches nothing, which is the
+        truthful outcome, and the caller counts the scored positions so the reported
+        loss is not diluted by windows that scored none.
+        """
+        if loss_mask.shape != targets.shape:
+            raise ConfigError(
+                f"The loss mask has shape {list(loss_mask.shape)} but the targets have "
+                f"{list(targets.shape)}.",
+                hint="This is a TrainAI bug in batching; please report it.",
+                details={"mask": list(loss_mask.shape), "targets": list(targets.shape)},
+            )
+        weights = loss_mask.reshape(-1).to(flat_logits.dtype)
+        per_token = F.cross_entropy(flat_logits, targets.reshape(-1), reduction="none")
+        return (per_token * weights).sum() / weights.sum().clamp(min=1.0)
 
     # -- reporting ---------------------------------------------------------- #
 
@@ -468,14 +499,21 @@ class GPT(nn.Module):
         would shrink it on every single step -- with weight tying that row is also
         the output projection for the token, so decaying it makes the model
         progressively less able to predict rare tokens the longer training runs.
+
+        A frozen parameter is in neither group. These groups are what the optimizer
+        is handed, and :meth:`parameter_count` excludes frozen parameters by default,
+        so a frozen tensor left in a group would have the run record report one number
+        of trained parameters while AdamW held another.
         """
         decay: list[nn.Parameter] = []
         no_decay: list[nn.Parameter] = []
-        seen: set[int] = set()
+        # Nothing de-duplicates by identity here, because ``named_parameters`` already
+        # does: a tied ``lm_head.weight`` reaches this loop once, under the embedding's
+        # name (see :meth:`parameter_count`, which relies on the same thing). A ``seen``
+        # set used to sit beside this loop re-checking it, and could not fire.
         for name, parameter in self.named_parameters():
-            if not parameter.requires_grad or id(parameter) in seen:
+            if not parameter.requires_grad:
                 continue
-            seen.add(id(parameter))
             if parameter.ndim < 2 or "embed_tokens" in name:
                 no_decay.append(parameter)
             else:
@@ -594,6 +632,9 @@ class GPT(nn.Module):
         )
         tokens = prompt[:, -self.config.seq_len :]
         if not pieces:
+            # ``max_new_tokens`` 0, which a token budget computed as a limit minus a
+            # prompt length reaches on its own. ``torch.cat`` of a one-element list
+            # returns the same values; this hands back the slice without copying it.
             return tokens
         return torch.cat([tokens, *pieces], dim=1)
 

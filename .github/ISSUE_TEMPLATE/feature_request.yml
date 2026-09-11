@@ -1,0 +1,80 @@
+name: Feature request
+description: Something TrainAI should do and does not.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Worth reading first: v0.1 is deliberately narrow - **training small language
+        models from scratch on your own text, on consumer hardware.** LoRA,
+        multi-GPU, quantization, importing pretrained weights and non-text
+        modalities are out of scope for now, not because they are bad ideas but
+        because the from-scratch path has to be reliable first. The
+        [status table](https://github.com/shubhampardule/trainAi#status) says what is
+        postponed by design.
+
+
+        Asking for something out of scope is fine. Say what it would let you do, and
+        it becomes a data point about the order rather than a rejected ticket.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >-
+        The task, not the feature. "My corpus is 40 GiB and `data prepare` needs to
+        fit it in RAM" is actionable in ways that "add streaming" is not, because
+        the second one names a solution and the first one names the constraint.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What happens today
+      description: >-
+        What you tried, and where it stopped. If TrainAI refused with a hint, quote
+        the hint - a hint that pointed you somewhere useless is its own bug.
+      render: text
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+      description: >-
+        A flag, a command, a different default? If it is a flag, what would `--help`
+        say about it?
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints this would have to respect
+      description: >-
+        Not a quiz - these are the four things most likely to decide whether a
+        feature can land as described, so it saves a round trip to think about them
+        now. Tick what applies; leave the rest.
+      options:
+        - label: >-
+            It needs a new dependency. (The install has to stay a plain `pip install`
+            with no Node, no compiler and no system packages; an optional extra is
+            usually the answer.)
+        - label: >-
+            It changes what a prepared dataset contains, which changes its
+            `content_hash` and invalidates existing runs.
+        - label: >-
+            It depends on hardware nobody here has, so I would have to be the one who
+            tests it.
+        - label: >-
+            It needs a real measurement to be honest about (memory, throughput, a
+            time estimate) rather than a formula.
+
+  - type: dropdown
+    id: help
+    attributes:
+      label: Would you want to implement it?
+      options:
+        - "No, just reporting the need"
+        - "Maybe, with guidance on where it goes"
+        - "Yes"
+    validations:
+      required: true

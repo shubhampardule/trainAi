@@ -1,0 +1,75 @@
+name: Hardware report
+description: You ran TrainAI on a machine nobody here has. Tell us what happened.
+title: "Hardware: "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This is the most useful thing you can send. TrainAI has only ever *run* on
+        NVIDIA CUDA and CPU - one 4 GiB RTX 2050 on Windows 11. AMD ROCm, Intel XPU
+        and Apple MPS are detected and handled by generic code whose *decisions* are
+        tested against synthetic machine profiles, but no code path on those
+        platforms has been executed by anyone. See
+        [docs/hardware-support.md](https://github.com/shubhampardule/trainAi/blob/main/docs/hardware-support.md)
+        for exactly what that distinction means.
+
+
+        A report that everything worked is as valuable as a report that it broke.
+        Both change what the documents are allowed to claim.
+
+  - type: input
+    id: hardware
+    attributes:
+      label: What the machine actually is
+      description: >-
+        GPU (or "none"), its memory, the CPU, the RAM, the OS. In your words - this
+        is the ground truth the detection is being scored against.
+      placeholder: Radeon RX 7900 XTX 24 GiB, Ryzen 7 7800X3D, 64 GiB, Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: What TrainAI concluded
+      description: >-
+        `trainai doctor --json` and `trainai setup --json`. Those two outputs plus
+        the field above are a complete detection report; detection failures are the
+        class of bug this project is least able to find on its own.
+      render: json
+    validations:
+      required: true
+
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: How far did it get?
+      options:
+        - Detection was wrong (doctor or setup described the machine incorrectly)
+        - Detection was right, but a command failed
+        - Everything worked
+        - Everything worked, but a number looked wrong
+    validations:
+      required: true
+
+  - type: textarea
+    id: ran
+    attributes:
+      label: What you ran, and what it printed
+      description: >-
+        Whichever of these you got to, with their output: `trainai plan --data ...`,
+        `trainai train`, `pytest -m gpu`. If training ran, the throughput and the
+        loss are the interesting part - the throughput figures in the documents come
+        from one GPU and nothing above 35M parameters has been timed.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: >-
+        Especially: anything you had to do by hand that TrainAI should have done,
+        and anything it told you that turned out not to be true on your machine.

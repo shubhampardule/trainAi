@@ -209,6 +209,15 @@ def quickstart(
         "--jsonl-field",
         help="Field holding the text in .jsonl or .json records. Auto-detected when unset.",
     ),
+    jsonl_messages_field: str | None = typer.Option(
+        None,
+        "--jsonl-messages-field",
+        metavar="NAME",
+        help=(
+            "Field holding a conversation: a list of {role, content} objects, "
+            "rendered with TrainAI's chat template."
+        ),
+    ),
     csv_text_column: str | None = typer.Option(
         None,
         "--csv-text-column",
@@ -258,6 +267,7 @@ def quickstart(
         tokens=tokens,
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
         device=device,
@@ -314,6 +324,15 @@ def data_prepare(
         "--jsonl-field",
         help="Field holding the text in .jsonl or .json records. Auto-detected when unset.",
     ),
+    jsonl_messages_field: str | None = typer.Option(
+        None,
+        "--jsonl-messages-field",
+        metavar="NAME",
+        help=(
+            "Field holding a conversation: a list of {role, content} objects, "
+            "rendered with TrainAI's chat template."
+        ),
+    ),
     csv_text_column: str | None = typer.Option(
         None,
         "--csv-text-column",
@@ -351,6 +370,20 @@ def data_prepare(
         "--allow-tabular",
         help="Prepare a corpus of table rows anyway. Recorded in the manifest.",
     ),
+    loss_mask: bool | None = typer.Option(
+        None,
+        "--loss-mask/--no-loss-mask",
+        help="Write a mask marking which tokens are assistant replies. On by default "
+        "for a corpus read with --jsonl-messages-field, off otherwise.",
+    ),
+    tokenizer: str | None = typer.Option(
+        None,
+        "--tokenizer",
+        metavar="PATH",
+        help="Reuse an existing tokenizer.json instead of training one. Required to "
+        "prepare a fine-tuning dataset: the base model's embedding rows are its "
+        "token ids. Point at the file or at the dataset directory holding it.",
+    ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit the manifest as JSON and print nothing else."
     ),
@@ -361,6 +394,11 @@ def data_prepare(
     encode it. Writes the shards, [bold]tokenizer.json[/bold] and a checksummed
     [bold]manifest.json[/bold] into [bold]--out[/bold]. The same corpus with the
     same settings and seed produces byte-identical shards.
+
+    [bold]--tokenizer[/bold] reuses one instead of training a fresh one. A dataset
+    prepared without it gets its own vocabulary, which no existing checkpoint's
+    embedding matrix matches -- so fine-tuning an earlier run means preparing the new
+    corpus with that run's [bold]tokenizer.json[/bold].
     """
     from trainai.cli.data import run_prepare
 
@@ -373,6 +411,7 @@ def data_prepare(
         seed=seed,
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
         min_doc_chars=min_doc_chars,
@@ -382,6 +421,8 @@ def data_prepare(
         force=force,
         json_output=json_output,
         allow_tabular=allow_tabular,
+        tokenizer=tokenizer,
+        loss_mask=loss_mask,
     )
 
 
@@ -411,6 +452,15 @@ def data_inspect(
         None,
         "--jsonl-field",
         help="Field holding the text in .jsonl or .json records. Auto-detected when unset.",
+    ),
+    jsonl_messages_field: str | None = typer.Option(
+        None,
+        "--jsonl-messages-field",
+        metavar="NAME",
+        help=(
+            "Field holding a conversation: a list of {role, content} objects, "
+            "rendered with TrainAI's chat template."
+        ),
     ),
     csv_text_column: str | None = typer.Option(
         None,
@@ -460,6 +510,7 @@ def data_inspect(
         sample_chars=sample_chars,
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
         min_doc_chars=min_doc_chars,
@@ -495,7 +546,17 @@ def plan(
         None,
         "--max-preset",
         metavar="NAME",
-        help="Do not measure anything larger than this preset.",
+        help="Stop the ladder at this preset: tiny, small, medium or large.",
+    ),
+    max_vram: str | None = typer.Option(
+        None,
+        "--max-vram",
+        metavar="SIZE",
+        help=(
+            "Use at most this much VRAM: [bold]6GB[/], [bold]6.5GiB[/], [bold]512MB[/], or "
+            "a bare number of gigabytes. For sharing the GPU with a desktop or another "
+            "job. Only ever lowers the budget, never raises it past what the card has."
+        ),
     ),
     seq_len: int | None = typer.Option(
         None,
@@ -553,6 +614,7 @@ def plan(
         json_output=json_output,
         out=out,
         verify=verify,
+        max_vram=max_vram,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,
     )
@@ -660,7 +722,11 @@ def train(
         None,
         "--steps",
         rich_help_panel="Training",
-        help="Optimizer steps. Defaults to about three passes over the training split.",
+        help=(
+            "Optimizer steps. Defaults to about three passes over the training split, "
+            "capped at 20,000 -- on a large corpus that cap means well under one pass, "
+            "and --dry-run reports how many you actually get."
+        ),
     ),
     batch_size: int | None = typer.Option(
         None,
@@ -747,6 +813,14 @@ def train(
         rich_help_panel="Training",
         help="Seeds initialisation, dropout and batch order.",
     ),
+    loss_mask: bool | None = typer.Option(
+        None,
+        "--loss-mask/--no-loss-mask",
+        rich_help_panel="Training",
+        help="Score only the tokens the dataset marks as targets -- the assistant's "
+        "replies in a chat corpus. Applied automatically when the dataset has a mask; "
+        "--loss-mask requires one, --no-loss-mask scores every token.",
+    ),
     precision: str | None = typer.Option(
         None,
         "--precision",
@@ -757,7 +831,7 @@ def train(
         None,
         "--device",
         rich_help_panel="Hardware",
-        help="auto, cuda, cpu or mps. An explicit choice is never silently downgraded.",
+        help="auto, cuda, cpu, mps or xpu. An explicit choice is never silently downgraded.",
     ),
 ) -> None:
     """Train a language model from scratch on a prepared dataset.
@@ -804,6 +878,189 @@ def train(
         keep_checkpoints=keep_checkpoints,
         log_every=log_every,
         seed=seed,
+        loss_mask=loss_mask,
+        precision=precision,
+        device=device,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# finetune
+# --------------------------------------------------------------------------- #
+@app.command()
+def finetune(
+    data: str = typer.Option(
+        ...,
+        "--data",
+        "-d",
+        metavar="DIR",
+        help=(
+            "A dataset directory produced by `trainai data prepare --tokenizer "
+            "<the base model's tokenizer.json>`. Preparing it without --tokenizer "
+            "gives it its own vocabulary, which the base model's embedding rows do "
+            "not match, and this command will refuse it."
+        ),
+    ),
+    base: str = typer.Option(
+        ...,
+        "--from",
+        metavar="PATH",
+        help="Base model: a run directory, a checkpoints directory, or a step-*.pt file.",
+    ),
+    out: str | None = typer.Option(
+        None, "--out", "-o", metavar="DIR", help="Run directory. Defaults to runs/<name>."
+    ),
+    name: str | None = typer.Option(None, "--name", help="Name for the run directory under runs/."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing run directory."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the plan -- the base model's shape, the schedule, the data budget -- and exit.",
+    ),
+    verify: bool = typer.Option(
+        False, "--verify", help="Re-hash the dataset's shards before starting."
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit the result as JSON and print nothing else."
+    ),
+    steps: int | None = typer.Option(
+        None,
+        "--steps",
+        rich_help_panel="Training",
+        help="Optimizer steps. Defaults to about three passes over the training split.",
+    ),
+    batch_size: int | None = typer.Option(
+        None, "--batch-size", "-b", rich_help_panel="Training", help="Sequences per forward pass."
+    ),
+    grad_accum: int | None = typer.Option(
+        None,
+        "--grad-accum",
+        rich_help_panel="Training",
+        help="Forward passes summed per optimizer step. Effective batch is the product.",
+    ),
+    seq_len: int | None = typer.Option(
+        None,
+        "--seq-len",
+        rich_help_panel="Training",
+        help="Tokens per sequence. Cannot exceed the base model's context length.",
+    ),
+    lr: float | None = typer.Option(
+        None,
+        "--lr",
+        rich_help_panel="Training",
+        help=(
+            "Peak learning rate. Defaults to 3e-5, a tenth of the from-scratch default: "
+            "on this project's own measurement a higher rate learns the new corpus faster "
+            "and loses more of the base model, monotonically in both directions."
+        ),
+    ),
+    min_lr_ratio: float | None = typer.Option(
+        None, "--min-lr-ratio", rich_help_panel="Training", help="Floor as a fraction of --lr."
+    ),
+    warmup_steps: int | None = typer.Option(
+        None,
+        "--warmup",
+        rich_help_panel="Training",
+        help="Steps spent ramping up from zero. A fine-tune warms up from scratch: "
+        "its schedule is new, not a continuation of the base model's.",
+    ),
+    schedule: str | None = typer.Option(
+        None, "--schedule", rich_help_panel="Training", help="cosine, linear or constant."
+    ),
+    weight_decay: float | None = typer.Option(
+        None, "--weight-decay", rich_help_panel="Training", help="AdamW decay."
+    ),
+    grad_clip: float | None = typer.Option(
+        None, "--grad-clip", rich_help_panel="Training", help="Global gradient-norm clip."
+    ),
+    eval_every: int | None = typer.Option(
+        None,
+        "--eval-every",
+        rich_help_panel="Training",
+        help="Steps between validation passes. 0 measures nothing held out.",
+    ),
+    eval_batches: int | None = typer.Option(
+        None, "--eval-batches", rich_help_panel="Training", help="Validation batches per pass."
+    ),
+    checkpoint_every: int | None = typer.Option(
+        None,
+        "--checkpoint-every",
+        rich_help_panel="Training",
+        help="Steps between checkpoints. 0 saves only at the end.",
+    ),
+    keep_checkpoints: int | None = typer.Option(
+        None,
+        "--keep-checkpoints",
+        rich_help_panel="Training",
+        help="Step checkpoints to retain. The best and the newest are always kept.",
+    ),
+    log_every: int | None = typer.Option(
+        None, "--log-every", rich_help_panel="Training", help="Steps between metric records."
+    ),
+    seed: int | None = typer.Option(
+        None,
+        "--seed",
+        rich_help_panel="Training",
+        help="Seeds dropout and batch order. Initialisation comes from the checkpoint.",
+    ),
+    loss_mask: bool | None = typer.Option(
+        None,
+        "--loss-mask/--no-loss-mask",
+        rich_help_panel="Training",
+        help="Score only the tokens the dataset marks as targets -- the assistant's "
+        "replies in a chat corpus. Applied automatically when the dataset has a mask; "
+        "--loss-mask requires one, --no-loss-mask scores every token.",
+    ),
+    precision: str | None = typer.Option(
+        None, "--precision", rich_help_panel="Hardware", help="auto, bf16, fp16 or fp32."
+    ),
+    device: str | None = typer.Option(
+        None, "--device", rich_help_panel="Hardware", help="auto, cuda, cpu, mps or xpu."
+    ),
+) -> None:
+    """Continue training an existing model on a different dataset.
+
+    This is not [bold]--resume[/bold]. Resuming continues one run: same data, same
+    schedule, the optimizer's moments and the random streams restored so that the
+    next step is the step that would have happened anyway. Fine-tuning is the
+    opposite claim -- new data, new schedule -- so only the weights come across, and
+    the learning rate warms up from zero again.
+
+    There are no model flags: the shape is whatever the checkpoint was built as.
+    The one thing that must match is the tokenizer, because a token id is a row
+    index into the embedding matrix -- the same id read through a different
+    tokenizer selects a vector trained for some other piece of text, and nothing
+    about the loss curve would look wrong. Prepare the dataset with
+    [bold]data prepare --tokenizer[/bold] and that holds by construction.
+    """
+    from trainai.cli.train import run_finetune
+
+    run_finetune(
+        data,
+        base=base,
+        out=out,
+        name=name,
+        force=force,
+        dry_run=dry_run,
+        json_output=json_output,
+        verify=verify,
+        steps=steps,
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+        seq_len=seq_len,
+        lr=lr,
+        min_lr_ratio=min_lr_ratio,
+        warmup_steps=warmup_steps,
+        schedule=schedule,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        eval_every=eval_every,
+        eval_batches=eval_batches,
+        checkpoint_every=checkpoint_every,
+        keep_checkpoints=keep_checkpoints,
+        log_every=log_every,
+        seed=seed,
+        loss_mask=loss_mask,
         precision=precision,
         device=device,
     )
@@ -978,15 +1235,32 @@ def chat(
         metavar="PATH",
         help="A tokenizer.json to use, for a run whose dataset moved.",
     ),
+    chat_format: bool = typer.Option(
+        False,
+        "--chat",
+        help="Wrap what you type in the chat template, even if the run does not record "
+        "one. For a corpus flattened into User:/Assistant: text by hand.",
+    ),
+    raw_format: bool = typer.Option(
+        False,
+        "--raw",
+        help="Send your text to the model unchanged, even if the run was trained on conversations.",
+    ),
     json_output: bool = typer.Option(
         False, "--json", help="With --prompt, emit the completion as JSON and nothing else."
     ),
 ) -> None:
     """Generate text from a trained run, once or interactively.
 
-    What a run produces is a [bold]base[/bold] language model: it continues text. It
-    does not answer questions or follow instructions, because none of its training data
-    was a dialogue -- so give it the beginning of something rather than a request.
+    What a run produces is a [bold]base[/bold] language model: it continues text.
+    Whether it answers a question depends on the corpus it was trained on, not on this
+    command -- a prose corpus gives you a model that continues prose, so give it the
+    beginning of something rather than a request.
+
+    A run trained on conversations records the chat template its dataset was rendered in.
+    For those, what you type is wrapped in that template and generation stops where the
+    model starts writing the next turn; [bold]--raw[/bold] switches that off and
+    [bold]--chat[/bold] forces it on.
 
     With no [bold]--prompt[/bold] this is an interactive playground where sampling can
     be changed between completions. Piped input is used as the prompt, so
@@ -1008,6 +1282,8 @@ def chat(
         device=device,
         precision=precision,
         tokenizer=tokenizer,
+        chat_format=chat_format,
+        raw_format=raw_format,
         json_output=json_output,
     )
 

@@ -20,20 +20,32 @@ error. The fingerprint is checked before anything is generated.
 not produce the same logits as fp32, so which one ran is part of the answer rather
 than an implementation detail. ``--precision fp32`` is available for when a
 reproducible sample matters more than speed.
+
+**Stopping is text, and the text comes from elsewhere.** Generation can be cut at
+strings the caller passes in, but this module does not know what any of them mean -- the
+role labels a chat model runs on live in :mod:`trainai.data.chat`, next to the renderer
+that put them in the shards. A sampler with its own copy of ``"\\nUser:"`` is a second
+place the layout is written down, which is one more than can be kept in agreement.
+
+**A stream says why it ended.** A reply that finished and a reply that ran out of budget
+look identical -- both are text that stops -- and only one of them is worth continuing.
+So the stream ends with a :class:`Finish`, naming end-of-text, the stop string that
+matched, or the token limit. Without it every caller has to guess from the token count,
+which is wrong exactly when the model happened to finish on its last allowed token.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
 from trainai.data.binarize import TOKENIZER_NAME
 from trainai.data.tokenizer import ByteLevelBPE
-from trainai.errors import UsageError
+from trainai.errors import UsageError, check_choice
 from trainai.model.config import ModelConfig
 from trainai.model.gpt import GPT
 from trainai.train.checkpoint import (
@@ -43,7 +55,7 @@ from trainai.train.checkpoint import (
     load_checkpoint,
     pointer_fallback_reason,
 )
-from trainai.train.config import TrainConfig
+from trainai.train.config import PRECISION_CHOICES, TrainConfig
 from trainai.train.loop import resolve_device, resolve_precision
 
 #: Sampling defaults. Temperature 0.8 with top-p 0.95 is the usual "readable but not
@@ -64,6 +76,41 @@ DEFAULT_WHICH = "best"
 WHICH_CHOICES = ("best", "latest")
 
 
+#: Why a generation ended. ``"stop"`` and ``"end-of-text"`` are the model deciding it
+#: was done; ``"length"`` is the caller's budget running out while it was still writing.
+FinishReason = Literal["end-of-text", "stop", "length"]
+
+
+@dataclass(frozen=True)
+class Finish:
+    """Why a generation ended, and at which stop string when that is what ended it.
+
+    Carried as a value rather than left to the caller to infer. "the token count equals
+    ``max_new_tokens``" is the obvious guess and it is wrong in both directions: a model
+    that finishes on its last allowed token is reported as cut off, and a generation
+    whose stop string matched on that same token is too.
+
+    ``stop`` is the string that matched, not the index of it, because a caller that
+    assembled the list from a template wants to know *which* label the model started
+    writing -- and an index into a list it built is a thing it has to look up.
+    """
+
+    reason: FinishReason
+    stop: str | None = None
+
+    @property
+    def cut(self) -> bool:
+        """Whether the model was still writing when the budget ran out.
+
+        The one distinction most callers act on: a cut generation is worth continuing,
+        and a finished one is not.
+        """
+        return self.reason == "length"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"reason": self.reason, "stop": self.stop}
+
+
 @dataclass(frozen=True)
 class StreamPiece:
     """One step of a generation: the new text, and the tokens produced so far.
@@ -77,10 +124,16 @@ class StreamPiece:
 
     ``tokens`` is cumulative, not a delta, so a caller that misses a piece (an
     interrupted stream) still ends up with the right total.
+
+    ``finish`` is set on the **last** piece of a stream and on no other. That piece
+    carries no new token -- its ``tokens`` repeats the previous one -- and may carry the
+    last of the held-back text. A stream that was abandoned mid-generation never reaches
+    it, which is the honest answer for one: nothing ended it, the caller stopped asking.
     """
 
     text: str
     tokens: int
+    finish: Finish | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +177,69 @@ class RunLayout:
 #: byte-level BPE token can be half of one, so this shows up mid-stream on any
 #: non-ASCII text and means "wait for the next token", not "the model produced junk".
 REPLACEMENT_CHAR = "\ufffd"
+
+
+def _normalise_stops(stop: Sequence[str]) -> tuple[str, ...]:
+    """Validate the stop strings and keep the caller's order.
+
+    An empty string is refused rather than ignored. It matches at position zero of any
+    text, so honouring it would end every generation with nothing produced, and dropping
+    it silently would hide the mistake that computed it -- a caller assembling stop
+    strings from a template with a label missing gets a reason instead of a model that
+    has apparently stopped answering.
+    """
+    stops = tuple(stop)
+    if any(not piece for piece in stops):
+        raise UsageError(
+            "A stop string cannot be empty: it matches before the model has written "
+            "anything, so nothing would ever be generated.",
+            hint="Pass the text generation should stop at, or pass no stop strings at all.",
+            details={"stop": list(stops)},
+        )
+    return stops
+
+
+def _earliest_stop(text: str, stops: tuple[str, ...]) -> tuple[int, str] | None:
+    """Where the first stop string begins in ``text`` and which one it is, or ``None``.
+
+    Matched on the decoded text rather than on token ids. A stop string is not
+    necessarily a token -- how ``"\\nUser:"`` tokenizes depends on what precedes it, so
+    a token-id comparison would have to enumerate every tokenization of it and would
+    quietly miss the ones it did not think of.
+
+    Searches the whole continuation each step rather than only the new tail. That is
+    quadratic in the length of the continuation, and it is still nothing next to one
+    forward pass; the alternative bounds the search by :func:`_held_back` being correct,
+    which turns a bug there into a stop string that is silently never found.
+
+    Two stop strings can begin at the same position -- ``"\\nUser"`` and ``"\\nUser:"``
+    both do -- and the cut is the same either way, so the tie goes to the caller's order.
+    Which one is *reported* is then a property of the list that was passed in rather than
+    of this loop's iteration, and the same generation cannot name a different one twice.
+    """
+    found: tuple[int, str] | None = None
+    for piece in stops:
+        where = text.find(piece)
+        if where >= 0 and (found is None or where < found[0]):
+            found = (where, piece)
+    return found
+
+
+def _held_back(text: str, stops: tuple[str, ...]) -> int:
+    """How many characters at the end of ``text`` must not be emitted yet.
+
+    The longest suffix of ``text`` that is a *proper* prefix of some stop string. A
+    stream that emits it anyway has already shown the user the first half of
+    ``"\\nUser:"`` by the time the second half arrives, and no later cut can take it
+    back -- the text is on their terminal.
+    """
+    longest = 0
+    for piece in stops:
+        for size in range(min(len(piece) - 1, len(text)), longest, -1):
+            if text.endswith(piece[:size]):
+                longest = size
+                break
+    return longest
 
 
 def _checkpoint_dir_of(target: Path) -> Path | None:
@@ -180,12 +296,12 @@ def _locate_checkpoint(target: Path, which: str) -> tuple[Path, Path | None, str
 
 def _check_target(target: str | Path, which: str) -> Path:
     """Validate ``--which`` and that ``target`` exists, before any loading happens."""
-    if which not in WHICH_CHOICES:
-        raise UsageError(
-            f"--which must be one of {', '.join(WHICH_CHOICES)}, not {which!r}.",
-            hint="best is the checkpoint with the lowest validation loss; latest is the last one.",
-            details={"which": which, "choices": list(WHICH_CHOICES)},
-        )
+    check_choice(
+        which,
+        WHICH_CHOICES,
+        "--which",
+        hint="best is the checkpoint with the lowest validation loss; latest is the last one.",
+    )
 
     target = Path(target)
     if not target.exists():
@@ -232,7 +348,10 @@ def _locate_tokenizer(
     ``checkpoint`` is the already-loaded checkpoint when the caller has one. Without
     it, and only when the run directory has no tokenizer of its own, this loads the
     checkpoint to read the dataset path it recorded -- the alternative is loading
-    weights before discovering there is nothing to decode them with.
+    weights before discovering there is nothing to decode them with. A checkpoint that
+    will not load is not fatal here, but it is not silent either: it gets its own
+    ``reason``, because the run may well record a dataset and this is simply a file
+    nobody could read.
     """
     if run_dir is not None:
         local = run_dir / TOKENIZER_NAME
@@ -240,10 +359,17 @@ def _locate_tokenizer(
             return local, "the run directory"
 
     dataset_root: str | None = None
+    unreadable = False
     if checkpoint is None:
         try:
             checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
         except Exception:
+            # Deliberately broad, and deliberately not fatal: this function's job is to
+            # find a tokenizer, and a read that fails here must not replace the report
+            # about the tokenizer with a traceback. But it must be recorded, because
+            # "the checkpoint records no dataset" is a claim about a file that could not
+            # be read -- see the reasons below.
+            unreadable = True
             checkpoint = None
     if checkpoint is not None:
         recorded = checkpoint.dataset.get("root")
@@ -258,8 +384,8 @@ def _locate_tokenizer(
     if dataset_root:
         searched.append(str(Path(dataset_root) / TOKENIZER_NAME))
 
-    # Which of the four ways to get here this is, rather than one story that is wrong
-    # for the other three. This used to read "Runs trained by a newer version keep
+    # Which of the five ways to get here this is, rather than one story that is wrong
+    # for the other four. This used to read "Runs trained by a newer version keep
     # their own copy; this one does not, and the dataset it names is gone or moved" --
     # both halves false for a run trained a minute earlier by this build against a
     # dataset that was still sitting there: `trainai train` copies the dataset's
@@ -271,7 +397,14 @@ def _locate_tokenizer(
     # relative whenever that argument was. Reporting a relative path as "gone or
     # moved" would be the same mistake in a new costume: it is merely not resolvable
     # from *here*.
-    if not dataset_root:
+    if unreadable:
+        reason, why = (
+            "checkpoint_unreadable",
+            f"Its checkpoint, {checkpoint_path.name}, could not be read, so the dataset "
+            "it recorded cannot be looked up -- and --tokenizer will not get this run "
+            "working, because the weights are in that same file.",
+        )
+    elif not dataset_root:
         reason, why = (
             "no_dataset_recorded",
             "This run records no dataset, so there is nothing to find one from.",
@@ -345,6 +478,11 @@ class InferenceSession:
                 match the one the model was trained with.
         """
         path = _check_target(target, which)
+        # Checked here rather than left to resolve_precision below, for the same reason
+        # --which is checked before the run is located: a value that cannot work should
+        # not cost a multi-gigabyte load first. The call is idempotent -- resolve_precision
+        # validates too -- so this is fail-fast, not the only guard.
+        check_choice(precision, PRECISION_CHOICES, "--precision")
         checkpoint_path, run_dir, resolved_which, available, note = _locate_checkpoint(path, which)
         resolved_device = resolve_device(device)
         checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
@@ -423,6 +561,25 @@ class InferenceSession:
         value = self.checkpoint.metrics.get("best_val_step")
         return int(value) if isinstance(value, (int, float)) else None
 
+    @property
+    def chat_template(self) -> dict[str, Any]:
+        """The chat template this run's dataset was rendered in, or empty for prose.
+
+        The shape :func:`~trainai.data.chat.describe_template` returns. Read from the
+        checkpoint rather than from the dataset's manifest, because a run must be usable
+        after the dataset is deleted -- the same reason the tokenizer is copied into the
+        run directory.
+
+        Empty for three different situations, and they are deliberately not
+        distinguished here: a run trained on prose, a run trained before the template
+        was recorded, and a checkpoint whose ``dataset`` block holds something that is
+        not an object. All three mean the same thing to a caller -- there is no layout
+        to reproduce -- and a caller that has to *report* the difference can look at
+        ``checkpoint.dataset`` itself.
+        """
+        block = self.checkpoint.dataset.get("chat")
+        return dict(block) if isinstance(block, dict) else {}
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "step": self.step,
@@ -435,6 +592,7 @@ class InferenceSession:
             "vocab_size": self.tokenizer.vocab_size,
             "context": self.model_config.seq_len,
             "parameters": self.model.parameter_count(),
+            "chat_template": self.chat_template,
         }
 
     # -- generating --------------------------------------------------------- #
@@ -461,6 +619,10 @@ class InferenceSession:
         """
         if self.dtype == torch.float32 or self.device.type == "cpu":
             return torch.autocast(device_type=self.device.type, enabled=False)
+        # ``self.dtype``, not a hardcoded bf16. :func:`precision_for` resolves ``auto``
+        # to fp16 on every CUDA device that predates bf16, and on those devices asking
+        # torch for a bf16 context raises rather than downgrading -- so hardcoding bf16
+        # here broke inference and eval on exactly the hardware that fallback serves.
         return torch.autocast(device_type=self.device.type, dtype=self.dtype)
 
     def _generator(self, seed: int | None) -> torch.Generator | None:
@@ -481,11 +643,19 @@ class InferenceSession:
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
         seed: int | None = None,
         stop_at_eot: bool = True,
+        stop: Sequence[str] = (),
     ) -> str:
         """Generate a continuation and return **only the new text**.
 
         Not prompt-plus-continuation: the caller already has the prompt, and a
         function that hands it back is one that makes every caller slice it off.
+
+        ``stop`` is text generation ends at, and it is **not** part of the result -- see
+        :meth:`stream_pieces`.
+
+        Why it ended is not in a string, so a caller that needs to tell a finished reply
+        from one that ran out of budget wants :meth:`stream_pieces` and its
+        :class:`Finish`.
         """
         return "".join(
             self.stream(
@@ -497,6 +667,7 @@ class InferenceSession:
                 repetition_penalty=repetition_penalty,
                 seed=seed,
                 stop_at_eot=stop_at_eot,
+                stop=stop,
             )
         )
 
@@ -511,12 +682,15 @@ class InferenceSession:
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
         seed: int | None = None,
         stop_at_eot: bool = True,
+        stop: Sequence[str] = (),
     ) -> Iterator[str]:
         """Yield the continuation as text, in pieces, as the model produces it.
 
         Pieces are *string deltas*, not tokens, and never empty -- see
         :meth:`stream_pieces` for why those are not the same thing, and use that
-        instead when the token count matters.
+        instead when the token count or the reason it ended matters. The last piece
+        carries both the finish and any text still held back, and only the text of it
+        survives this view.
         """
         for piece in self.stream_pieces(
             prompt,
@@ -527,6 +701,7 @@ class InferenceSession:
             repetition_penalty=repetition_penalty,
             seed=seed,
             stop_at_eot=stop_at_eot,
+            stop=stop,
         ):
             if piece.text:
                 yield piece.text
@@ -542,6 +717,7 @@ class InferenceSession:
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
         seed: int | None = None,
         stop_at_eot: bool = True,
+        stop: Sequence[str] = (),
     ) -> Iterator[StreamPiece]:
         """Yield one :class:`StreamPiece` per token produced.
 
@@ -554,11 +730,27 @@ class InferenceSession:
 
         The end-of-text token is a boundary, not content: it stops the stream, is not
         decoded into the output, and is not counted.
+
+        ``stop`` is text that ends the generation when the model writes it. Matched on
+        the decoded continuation, cut at the **earliest** match, and never emitted --
+        including partially: a suffix of the text that is the beginning of a stop string
+        is held back until the next token says whether it completes one, because text
+        already on somebody's terminal cannot be taken back. The tokens that produced
+        the match *are* counted, unlike end-of-text, because they were computed and they
+        took time; it is only the text that is discarded.
+
+        The stream ends with one extra piece carrying a :class:`Finish`: no new token,
+        whatever text was still held back, and why it stopped. It is a piece of its own
+        rather than a field on the last real one, because which token is last is only
+        known one token later -- holding every piece back until then would delay each
+        character by a token, and the point of streaming is that it does not.
         """
+        stops = _normalise_stops(stop)
         ids = self.encode_prompt(prompt)
         eot = self.tokenizer.eot_id if stop_at_eot else None
         produced: list[int] = []
         emitted = 0
+        finish: Finish | None = None
 
         with self.autocast():
             for token in self.model.generate_stream(
@@ -573,24 +765,49 @@ class InferenceSession:
             ):
                 value = int(token[0, 0])
                 if eot is not None and value == eot:
+                    finish = Finish("end-of-text")
                     break
                 produced.append(value)
                 text = self.tokenizer.decode(produced)
+                if stops:
+                    match = _earliest_stop(text, stops)
+                    if match is not None:
+                        cut, matched = match
+                        # Slices to nothing rather than backwards if a hold-back ever let
+                        # a partial match through: that text is already out, and a
+                        # negative slice on top of it would be a second bug.
+                        yield StreamPiece(text[emitted:cut], len(produced))
+                        finish = Finish("stop", stop=matched)
+                        break
+                    visible = len(text) - _held_back(text, stops)
+                else:
+                    visible = len(text)
                 # A trailing incomplete character decodes to U+FFFD, which would be
                 # emitted now and contradicted next step. Hold it back instead -- but
                 # report the token, so a caller timing the stream counts it.
-                if text.endswith(REPLACEMENT_CHAR) or len(text) <= emitted:
+                if text.endswith(REPLACEMENT_CHAR) or visible <= emitted:
                     yield StreamPiece("", len(produced))
                     continue
-                yield StreamPiece(text[emitted:], len(produced))
-                emitted = len(text)
+                yield StreamPiece(text[emitted:visible], len(produced))
+                emitted = visible
 
-        # Whatever the hold-back above kept, if generation ended mid-character. No new
-        # token, so the count is unchanged from the last piece.
-        if produced:
+        # The generator ran out of budget rather than breaking: the only other way out of
+        # the loop above. ``generate_stream`` ends for exactly two reasons -- the token
+        # count and end-of-text -- so this needs no third guess.
+        if finish is None:
+            finish = Finish("length")
+
+        # Whatever a hold-back kept, if generation ended mid-character or with the
+        # beginning of a stop string that never completed. Goes out on the finish piece,
+        # which is the one piece guaranteed to exist. Nothing is due once a stop string
+        # has matched: there the held-back text *is* the match, and the caller asked for
+        # it gone.
+        tail = ""
+        if produced and finish.reason != "stop":
             final = self.tokenizer.decode(produced)
             if len(final) > emitted:
-                yield StreamPiece(final[emitted:], len(produced))
+                tail = final[emitted:]
+        yield StreamPiece(tail, len(produced), finish=finish)
 
 
 def _check_tokenizer_matches(

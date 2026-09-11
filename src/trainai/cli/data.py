@@ -23,7 +23,7 @@ Two failure modes this module works to avoid:
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
@@ -74,7 +74,7 @@ from trainai.data import (
     validate_corpus,
     verify_dataset,
 )
-from trainai.data.binarize import TOKENIZER_NAME
+from trainai.data.binarize import TOKENIZER_NAME, ShardInfo
 from trainai.errors import DatasetError, TokenizerError, UsageError
 
 __all__ = ["run_inspect", "run_prepare"]
@@ -113,6 +113,7 @@ def _ingest_options(
     *,
     encoding: str,
     jsonl_field: str | None,
+    jsonl_messages_field: str | None,
     csv_text_column: str | None,
     db_table: str | None,
     min_doc_chars: int,
@@ -145,6 +146,7 @@ def _ingest_options(
     return IngestOptions(
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
         max_doc_chars=max_doc_chars,
@@ -166,6 +168,7 @@ def run_prepare(
     seed: int = DEFAULT_SEED,
     encoding: str = "utf-8",
     jsonl_field: str | None = None,
+    jsonl_messages_field: str | None = None,
     csv_text_column: str | None = None,
     db_table: str | None = None,
     min_doc_chars: int = 1,
@@ -175,13 +178,18 @@ def run_prepare(
     force: bool = False,
     json_output: bool = False,
     allow_tabular: bool = False,
+    tokenizer: str | None = None,
+    loss_mask: bool | None = None,
 ) -> DatasetManifest:
     """Prepare ``corpus`` into ``out`` and return the manifest that was written."""
     quiet = json_output
     out_dir = Path(out)
+    write_mask = _resolve_loss_mask(loss_mask, jsonl_messages_field)
+    reuse = _load_reference_tokenizer(tokenizer, vocab_size) if tokenizer else None
     options = _ingest_options(
         encoding=encoding,
         jsonl_field=jsonl_field,
+        jsonl_messages_field=jsonl_messages_field,
         csv_text_column=csv_text_column,
         db_table=db_table,
         min_doc_chars=min_doc_chars,
@@ -198,28 +206,37 @@ def run_prepare(
         print_kv("Input", _input_rows(corpus, out_dir, sources, replacing=replacing))
 
     meter = CorpusMeter()
-    tokenizer = _measure_and_train(
+    tokenizer_obj = _measure_and_train(
         ingestor,
         sources,
         meter,
         vocab_size=vocab_size,
         min_frequency=min_frequency,
         quiet=quiet,
+        reuse=reuse,
     )
     report = meter.report()
     validation = validate_corpus(
         report,
         ingestor.stats,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=tokenizer_obj.vocab_size,
         max_doc_chars=max_doc_chars,
         allow_tabular=allow_tabular,
-        requested_vocab_size=vocab_size,
+        # A reused tokenizer was not asked to reach a size, so it cannot have
+        # undershot one. Passing --vocab-size here would report a shortfall against
+        # a target that does not apply to this run.
+        requested_vocab_size=tokenizer_obj.vocab_size if reuse else vocab_size,
     )
 
     if not quiet:
         print_kv("Measured", _corpus_rows(report))
-        print_kv("Read", _ingest_rows(ingestor.stats))
-        print_kv("Tokenizer", _tokenizer_rows(tokenizer, vocab_size))
+        print_kv("Read", _ingest_rows(ingestor.stats, loss_mask=write_mask))
+        print_kv(
+            "Tokenizer",
+            _reused_tokenizer_rows(tokenizer_obj, tokenizer)
+            if reuse
+            else _tokenizer_rows(tokenizer_obj, vocab_size),
+        )
         _print_issues(validation)
     # Everything above is measurement, so it is printed before the verdict: a user
     # whose corpus is rejected still gets to see what TrainAI saw.
@@ -230,7 +247,7 @@ def run_prepare(
     manifest = _binarize(
         Ingestor(options),
         sources,
-        tokenizer,
+        tokenizer_obj,
         out_dir,
         report=report,
         validation=validation,
@@ -239,6 +256,7 @@ def run_prepare(
         val_fraction=val_fraction,
         shard_tokens=shard_tokens,
         quiet=quiet,
+        loss_mask=write_mask,
     )
     _check_passes_agree(manifest, report, out_dir)
 
@@ -297,6 +315,7 @@ def _measure_and_train(
     vocab_size: int,
     min_frequency: int,
     quiet: bool,
+    reuse: ByteLevelBPE | None = None,
 ) -> ByteLevelBPE:
     """First pass: one read of the corpus, feeding the meter and the BPE trainer.
 
@@ -304,6 +323,11 @@ def _measure_and_train(
     spends an unrelated and unobservable amount of time computing merges; a bar
     that reached 100% and then sat still for a minute would be a lie about what
     the program was doing.
+
+    ``reuse`` skips the merge computation and returns that tokenizer instead. The read
+    still happens in full: the meter's report is what corpus validation describes and
+    what the shard planner sizes against, so a pass that measured nothing would produce
+    a dataset whose own record of its corpus is empty.
     """
     total_bytes = sum(source.size_bytes for source in sources)
     # Whether the trainer ever asked for a document. It is the whole basis on which the
@@ -312,7 +336,10 @@ def _measure_and_train(
     read_began = False
 
     with _progress(quiet=quiet) as progress:
-        task = progress.add_task("Reading corpus, training tokenizer", total=None)
+        task = progress.add_task(
+            "Reading corpus" if reuse is not None else "Reading corpus, training tokenizer",
+            total=None,
+        )
 
         def stream() -> Iterator[str]:
             nonlocal read_began
@@ -332,6 +359,11 @@ def _measure_and_train(
                         ),
                     )
                 yield document.text
+
+        if reuse is not None:
+            for _ in stream():
+                pass
+            return reuse
 
         try:
             return train_tokenizer(stream(), vocab_size=vocab_size, min_frequency=min_frequency)
@@ -356,6 +388,32 @@ def _measure_and_train(
             raise
 
 
+def _resolve_loss_mask(requested: bool | None, messages_field: str | None) -> bool:
+    """Whether to write mask shards, from the flag and the corpus format.
+
+    Unset means on for a typed corpus and off for everything else, because a mask over
+    text with no marked replies is a file of all ones: half the size of the token
+    shards, and it says nothing. ``--loss-mask`` without ``--jsonl-messages-field`` is
+    that file, so it is refused rather than written -- the request is a
+    misunderstanding of what the mask comes from, and silently producing a useless
+    file would leave the user believing their prompts are excluded.
+    """
+    if requested is None:
+        return messages_field is not None
+    if requested and messages_field is None:
+        raise UsageError(
+            "--loss-mask needs a corpus of typed conversations, and this run has none.",
+            hint=(
+                "The mask marks which characters are assistant replies, which only a "
+                "record read with --jsonl-messages-field has. Without it every token "
+                "would be marked as a target, which is what training already does. See "
+                "docs/corpus-formats.md."
+            ),
+            details={"loss_mask": requested, "jsonl_messages_field": messages_field},
+        )
+    return requested
+
+
 def _binarize(
     ingestor: Ingestor,
     sources: list[SourceFile],
@@ -369,6 +427,7 @@ def _binarize(
     val_fraction: float,
     shard_tokens: int,
     quiet: bool,
+    loss_mask: bool,
 ) -> DatasetManifest:
     """Second pass: encode every document and write the shards.
 
@@ -397,6 +456,7 @@ def _binarize(
             ingest_options=options,
             sources=[source.to_dict() for source in sources],
             progress=advance,
+            loss_mask=loss_mask,
         )
 
 
@@ -450,6 +510,7 @@ def run_inspect(
     sample_chars: int = 0,
     encoding: str = "utf-8",
     jsonl_field: str | None = None,
+    jsonl_messages_field: str | None = None,
     csv_text_column: str | None = None,
     db_table: str | None = None,
     min_doc_chars: int = 1,
@@ -471,6 +532,7 @@ def run_inspect(
         options=_ingest_options(
             encoding=encoding,
             jsonl_field=jsonl_field,
+            jsonl_messages_field=jsonl_messages_field,
             csv_text_column=csv_text_column,
             db_table=db_table,
             min_doc_chars=min_doc_chars,
@@ -511,9 +573,15 @@ def _inspect_dataset(
 
     if verify:
         shards = sum(len(manifest.shards.get(split, ())) for split in SPLITS)
+        # Masks are hashed too, so a count of shards alone would understate what was
+        # checked by half on a dataset that has them.
+        subject = (
+            f"{shards} shard(s) and {shards} loss mask(s)"
+            if manifest.has_loss_mask
+            else f"{shards} shard(s)"
+        )
         console.print(
-            f"[green]Verified[/] {shards} shard(s): every byte matches the sha256 "
-            "recorded in the manifest."
+            f"[green]Verified[/] {subject}: every byte matches the sha256 recorded in the manifest."
         )
     else:
         console.print(
@@ -702,7 +770,7 @@ def _corpus_rows(report: DatasetReport) -> list[tuple[str, str]]:
     return rows
 
 
-def _ingest_rows(stats: IngestStats) -> list[tuple[str, str]]:
+def _ingest_rows(stats: IngestStats, *, loss_mask: bool | None = None) -> list[tuple[str, str]]:
     """Ingest counters. Zero-valued rows are omitted except the two that always matter."""
     rows = [
         (
@@ -760,6 +828,38 @@ def _ingest_rows(stats: IngestStats) -> list[tuple[str, str]]:
         # .jsonl, .ndjson and .json, and labelling a .json file's row "JSONL"
         # reads as though the wrong reader ran.
         rows.append(("JSON field", fields))
+    if stats.chat_documents:
+        # The share is the point of this row. A rendered conversation looks exactly
+        # like prose in every other number here -- same document count, same
+        # character count -- so the one figure that says the template understood the
+        # records is how much of the text turned out to be replies. A template
+        # mistake shows up as a share far too low, or at 100% as a template that
+        # marked everything.
+        share = stats.chat_trained_chars / max(1, stats.chat_chars)
+        rows.append(
+            (
+                "Chat records",
+                f"{fmt_int(stats.chat_documents)} rendered, {share:.0%} of characters "
+                f"are assistant replies "
+                f"({fmt_int(stats.chat_trained_chars)} of {fmt_int(stats.chat_chars)})",
+            )
+        )
+        # Said here rather than only in the docs, because the alternative is a user
+        # who reads the share above and cannot tell whether the prompts are excluded
+        # from the loss. They are: `trainai train` applies the mask when the dataset
+        # carries one, and --no-loss-mask there scores every token instead.
+        #
+        # ``loss_mask`` is None when nothing is being written -- `data inspect` reads a
+        # corpus and produces no dataset -- so the three cases are genuinely
+        # different, and collapsing them would either promise a file that was not
+        # written or hide one that was.
+        if loss_mask is None:
+            state = f"measured only {DASH} `trainai data prepare` writes it to disk"
+        elif loss_mask:
+            state = f"written beside every shard {DASH} `trainai train` scores targets only"
+        else:
+            state = f"not written {DASH} --no-loss-mask was passed"
+        rows.append(("Loss mask", f"[yellow]{state}[/]"))
     if stats.resolved_csv_columns:
         # Named rather than merely counted: the whole corpus came out of these
         # columns and nothing else in the file was read, so a user who expected a
@@ -785,6 +885,44 @@ def _ingest_rows(stats: IngestStats) -> list[tuple[str, str]]:
     return rows
 
 
+def _reused_tokenizer_rows(tokenizer: ByteLevelBPE, source: str | None) -> list[tuple[str, str]]:
+    """The tokenizer section when ``--tokenizer`` supplied it rather than this run.
+
+    The fingerprint leads, because it is the thing the user is trying to match: it is
+    what ``train`` and ``finetune`` compare against a checkpoint, and a run that reused
+    the wrong file has no other symptom.
+    """
+    return [
+        ("Vocabulary", f"[bold]{fmt_int(tokenizer.vocab_size)}[/]  [dim](reused, not trained)[/]"),
+        ("End-of-text id", str(tokenizer.eot_id)),
+        ("Fingerprint", f"[dim]{tokenizer.fingerprint()[:16]}[/]"),
+        ("Reused from", f"[dim]{source}[/]"),
+    ]
+
+
+def _load_reference_tokenizer(path: str, vocab_size: int) -> ByteLevelBPE:
+    """Load the tokenizer named by ``--tokenizer``, accepting a dataset directory too.
+
+    ``--vocab-size`` alongside it is refused rather than ignored. The loaded file's
+    vocabulary is a fact about that file; a second number describing what this run
+    would have trained cannot be honoured, and silently dropping a flag the user typed
+    is how a dataset ends up not being the one they think they asked for.
+    """
+    if vocab_size != DEFAULT_VOCAB_SIZE:
+        raise UsageError(
+            "--vocab-size cannot be combined with --tokenizer.",
+            hint=(
+                "A reused tokenizer already has its vocabulary; there is nothing for "
+                f"--vocab-size {fmt_int(vocab_size)} to change. Drop one of the two."
+            ),
+            details={"tokenizer": path, "vocab_size": vocab_size},
+        )
+    candidate = Path(path)
+    if candidate.is_dir():
+        candidate = candidate / TOKENIZER_NAME
+    return ByteLevelBPE.load(candidate)
+
+
 def _tokenizer_rows(tokenizer: ByteLevelBPE, requested: int) -> list[tuple[str, str]]:
     vocab = f"[bold]{fmt_int(tokenizer.vocab_size)}[/]"
     if tokenizer.vocab_shortfall:
@@ -801,7 +939,7 @@ def _tokenizer_rows(tokenizer: ByteLevelBPE, requested: int) -> list[tuple[str, 
 
 
 def _dataset_rows(manifest: DatasetManifest) -> list[tuple[str, str]]:
-    return [
+    rows = [
         ("Format", f"{manifest.format} v{manifest.format_version}"),
         ("Created", f"{manifest.created_at or 'unknown'}  [dim]by {manifest.created_with}[/]"),
         (
@@ -817,6 +955,78 @@ def _dataset_rows(manifest: DatasetManifest) -> list[tuple[str, str]]:
             "little-endian)[/]",
         ),
     ]
+    rows.extend(_loss_mask_rows(manifest))
+    rows.extend(_chat_template_rows(manifest))
+    return rows
+
+
+def _chat_template_rows(manifest: DatasetManifest) -> list[tuple[str, str]]:
+    """The template the documents were rendered with, or nothing for a plain corpus.
+
+    Worth a row of its own rather than a footnote on the loss mask: the two are
+    independent. A chat corpus prepared with --no-loss-mask has a template and no mask,
+    and it is the template -- not the mask -- that a model trained on this dataset has
+    to be prompted in.
+    """
+    template = manifest.chat
+    if not template:
+        return []
+    labels = template.get("labels") or {}
+    trained = template.get("trained_roles") or []
+    return [
+        (
+            "Chat template",
+            f"v{template.get('version', '?')}  [dim]{DASH} "
+            f"{', '.join(f'{label}:' for label in labels.values())}[/]",
+        ),
+        (
+            "",
+            f"[dim]{DASH} trained on {', '.join(trained) or 'nothing'}; a model trained "
+            "on this dataset has to be prompted in the same layout, which trainai chat "
+            "does for it[/]",
+        ),
+    ]
+
+
+def _loss_mask_rows(manifest: DatasetManifest) -> list[tuple[str, str]]:
+    """What the mask on disk says, or nothing at all if there is no mask.
+
+    The share here is over *tokens*, and the one the ingest report gives is over
+    characters, so the two will not match exactly and are labelled so that nobody
+    tries to reconcile them: a reply of 40 characters is not 40% of a document's
+    tokens when the tokenizer compresses prose and prompts differently.
+    """
+    if not manifest.has_loss_mask:
+        return []
+    total = manifest.total_tokens
+    trained = int(manifest.totals.get("trained_tokens", 0))
+    straddling = int(manifest.totals.get("straddling_tokens", 0))
+    share = trained / total if total else 0.0
+    rows = [
+        (
+            "Loss mask",
+            f"{fmt_int(trained)} of {fmt_int(total)} tokens are targets ({share:.0%})"
+            f"  [dim]{DASH} one uint8 per token, beside each shard[/]",
+        ),
+        (
+            "",
+            f"[dim]{DASH} `trainai train` scores those tokens only; "
+            f"--no-loss-mask scores every token[/]",
+        ),
+    ]
+    if straddling:
+        # Zero on this repo's corpus, and reported when it is not: a token covering
+        # text on both sides of a span edge is scored on characters the mask calls
+        # context. It is a property of the corpus, not a failure, but an unreported
+        # one would make the share above look more exact than it is.
+        rows.append(
+            (
+                "",
+                f"[yellow]{fmt_int(straddling)} tokens straddle a reply boundary[/] "
+                f"[dim]{DASH} each is counted as a target[/]",
+            )
+        )
+    return rows
 
 
 def _manifest_tokenizer_rows(manifest: DatasetManifest) -> list[tuple[str, str]]:
@@ -898,7 +1108,7 @@ def _manifest_corpus_rows(corpus: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _ingest_option_rows(options: dict[str, Any]) -> list[tuple[str, str]]:
     """The ingest settings recorded in the manifest, so a run can be repeated."""
-    return [
+    rows = [
         ("Encoding", escape(str(options.get("encoding", "utf-8")))),
         ("JSONL field", escape(str(options.get("jsonl_field") or "auto-detected"))),
         ("CSV column", escape(str(options.get("csv_text_column") or "auto-detected"))),
@@ -910,6 +1120,14 @@ def _ingest_option_rows(options: dict[str, Any]) -> list[tuple[str, str]]:
         ),
         ("On decode error", escape(str(options.get("on_error", "fail")))),
     ]
+    # Only when it was used. The other rows describe a setting every corpus has;
+    # this one says the dataset was built from typed conversations with a loss mask,
+    # which is a different kind of fact and worth its own line rather than an
+    # "auto-detected" that would be meaningless here.
+    messages_field = options.get("jsonl_messages_field")
+    if messages_field:
+        rows.insert(2, ("Chat messages field", escape(str(messages_field))))
+    return rows
 
 
 def _splits_table(manifest: DatasetManifest) -> Table:
@@ -919,6 +1137,14 @@ def _splits_table(manifest: DatasetManifest) -> Table:
     table.add_column("Tokens", justify="right")
     table.add_column("Shards", justify="right")
     table.add_column("On disk", justify="right")
+    # The mask is one byte per token beside shards of two, so it is half again as much
+    # disk. Counting only the token shards would print a total the user can see is
+    # wrong by looking at the directory, which is the kind of small dishonesty that
+    # makes every other number here worth less.
+    masked = manifest.has_loss_mask
+
+    def on_disk(shards: Iterable[ShardInfo]) -> int:
+        return sum(shard.bytes + (shard.mask_bytes or 0) for shard in shards)
 
     for split in SPLITS:
         shards = manifest.shards.get(split, ())
@@ -926,17 +1152,17 @@ def _splits_table(manifest: DatasetManifest) -> Table:
             split,
             fmt_int(manifest.documents.get(split, 0)),
             fmt_int(manifest.tokens(split)),
-            str(len(shards)),
-            fmt_bytes(sum(shard.bytes for shard in shards)),
+            str(len(shards) * 2 if masked else len(shards)),
+            fmt_bytes(on_disk(shards)),
         )
     table.add_section()
     total_shards = sum(len(manifest.shards.get(split, ())) for split in SPLITS)
-    total_bytes = sum(shard.bytes for split in SPLITS for shard in manifest.shards.get(split, ()))
+    total_bytes = on_disk(shard for split in SPLITS for shard in manifest.shards.get(split, ()))
     table.add_row(
         "[bold]total[/]",
         f"[bold]{fmt_int(sum(manifest.documents.get(s, 0) for s in SPLITS))}[/]",
         f"[bold]{fmt_int(manifest.total_tokens)}[/]",
-        f"[bold]{total_shards}[/]",
+        f"[bold]{total_shards * 2 if masked else total_shards}[/]",
         f"[bold]{fmt_bytes(total_bytes)}[/]",
     )
     return table

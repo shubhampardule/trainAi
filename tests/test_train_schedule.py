@@ -124,6 +124,27 @@ def test_the_schedule_describes_itself() -> None:
     assert "100" in described
 
 
+def test_a_constant_schedule_describes_the_peak_as_after_warmup() -> None:
+    """The one ``describe`` sentence with no decay in it.
+
+    ``test_the_schedule_describes_itself`` exercises the default cosine branch of
+    ``LearningRateSchedule.describe``, which is the only branch every other test
+    reaches. A ``constant`` schedule takes the other one on purpose: there is no
+    ``min_lr`` to slide toward, so the sentence names the peak and the warmup and
+    says nothing about the steps past it -- the ``from ... to ... over ...`` form
+    describes a fall that is not going to happen.
+
+    The string is pinned exactly rather than by substring, because the whole point
+    of the branch is that it is a different sentence, not the same one with a word
+    swapped.
+    """
+    config = TrainConfig(steps=1000, warmup_steps=100, lr=5e-4, schedule="constant")
+    schedule = LearningRateSchedule(config)
+
+    expected = f"constant {config.lr:g} after {config.resolved_warmup_steps} warmup steps"
+    assert schedule.describe() == expected
+
+
 # --------------------------------------------------------------------------- #
 # Configuration: derived values
 # --------------------------------------------------------------------------- #
@@ -320,11 +341,19 @@ def required_serialised_fields() -> list[str]:
     )
 
 
-def test_the_only_optional_field_is_the_one_post_init_derives() -> None:
-    """A control on the derivation above, so a widened annotation is noticed."""
+def test_only_the_derived_and_the_three_state_fields_are_optional() -> None:
+    """A control on the derivation above, so a widened annotation is noticed.
+
+    Two fields, for two different reasons. ``warmup_steps`` is ``None`` when
+    ``__post_init__`` should derive it. ``loss_mask`` is genuinely three-valued --
+    ``None`` means "apply the dataset's mask if it has one" -- and the annotation being
+    ``bool | None`` is also what lets a checkpoint written before masks existed resume:
+    a required new field would be refused as missing, so every run trained before this
+    release would become unresumable.
+    """
     optional = set(TrainConfig.__dataclass_fields__) - set(required_serialised_fields())
 
-    assert optional == {"warmup_steps"}
+    assert optional == {"warmup_steps", "loss_mask"}
 
 
 @pytest.mark.parametrize("missing", required_serialised_fields())
@@ -363,6 +392,24 @@ def test_from_dict_names_every_missing_field_at_once() -> None:
     assert "lr, schedule and seed" in caught.value.message
 
 
+def test_a_config_recorded_before_masks_existed_resumes_deciding_from_the_dataset() -> None:
+    """The compatibility this field's annotation buys, asserted rather than assumed.
+
+    ``loss_mask`` is the first field added to ``TrainConfig`` since checkpoints started
+    being written, and ``from_dict`` refuses a missing *required* key by design -- so
+    getting the annotation wrong would make every checkpoint from before this release
+    unresumable, with an error blaming an incomplete file. ``None`` is also the right
+    value to land on: it means "apply the dataset's mask if it has one", which is what
+    those runs did, because there was no mask to apply.
+    """
+    payload = TrainConfig(steps=600).to_dict()
+    del payload["loss_mask"]
+
+    assert TrainConfig.from_dict(payload).loss_mask is None
+    assert TrainConfig.from_dict({**payload, "loss_mask": False}).loss_mask is False
+    assert TrainConfig.from_dict({**payload, "loss_mask": True}).loss_mask is True
+
+
 WRONG_TYPES = [
     ("steps", 100.5, "an integer"),
     ("batch_size", 2.5, "an integer"),
@@ -373,6 +420,8 @@ WRONG_TYPES = [
     ("min_lr_ratio", "half", "a number"),
     ("device", 5, "a string"),
     ("warmup_steps", "10", "an integer"),
+    ("lr", {"peak": 3e-4}, "a number"),
+    ("seq_len", [256], "an integer"),
 ]
 
 
@@ -404,6 +453,27 @@ def test_a_true_that_should_be_a_count_is_named_as_a_boolean() -> None:
 
     assert "grad_accum is true" in caught.value.message
     assert caught.value.details["found"] == "a boolean"
+
+
+def test_a_nested_object_where_a_number_belongs_is_named_as_an_object() -> None:
+    """The shape a hand-edited plan file actually takes: a value moved one level down.
+
+    ``"lr": {"peak": 0.0003}`` is what someone writes who thinks the peak lives under
+    ``lr`` rather than being it. So the message has to do three things: name the field,
+    quote what is there so it can be found in the file, and say what it is -- and say it
+    in the file's own words, because ``dict`` is not a word that appears in JSON.
+
+    The table above covers the scalar confusions. This is the branch of
+    :func:`trainai.errors.json_type_name` that only a container reaches, and every
+    caller of that helper elsewhere asks about a value that is *not* an object, which is
+    why it had never run against a real error.
+    """
+    with pytest.raises(ConfigError) as caught:
+        TrainConfig.from_dict({**TrainConfig(steps=600).to_dict(), "lr": {"peak": 3e-4}})
+
+    assert 'lr is {"peak": 0.0003}' in caught.value.message
+    assert caught.value.message.endswith("which is not a number.")
+    assert caught.value.details["found"] == "an object"
 
 
 @pytest.mark.parametrize("raw", [None, "cosine", 7, [1, 2], True])

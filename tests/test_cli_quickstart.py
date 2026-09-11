@@ -13,6 +13,7 @@ measures candidates by running training steps, which is a minute even for the sm
 from __future__ import annotations
 
 import re
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -218,18 +219,51 @@ def test_the_evaluation_scores_both_splits(steps: _Recorder, tmp_path: Path) -> 
     assert steps.kwargs["run_eval"]["split"] == "both"
 
 
-def test_the_reading_flags_reach_the_prepare_step(steps: _Recorder, tmp_path: Path) -> None:
-    """A corpus that needs a flag to be read at all needs it on the step that reads it."""
-    qs.run_quickstart(
-        "corpus.csv",
-        out=str(tmp_path / "qs"),
-        prompt="Once",
-        encoding="latin-1",
-        csv_text_column="body",
+#: One non-default value for every field of ``_Reading``, and the flag it is typed as.
+#: A registry rather than a hand-written list of calls because the hand-written list is
+#: what failed: this test named ``encoding`` and ``csv_text_column``, and
+#: ``--jsonl-messages-field`` was dropped on the floor by three separate call sites
+#: without a single test noticing. Keyed by field name, which is also the keyword
+#: ``run_quickstart`` and ``run_prepare`` both use, so one row drives all three checks.
+#:
+#: One field at a time, never all five at once: ``IngestOptions`` refuses ``jsonl_field``
+#: and ``jsonl_messages_field`` together, because they describe contradictory records.
+READING_FIELDS: dict[str, tuple[str, str]] = {
+    "encoding": ("--encoding", "latin-1"),
+    "jsonl_field": ("--jsonl-field", "prose"),
+    "jsonl_messages_field": ("--jsonl-messages-field", "messages"),
+    "csv_text_column": ("--csv-text-column", "body"),
+    "db_table": ("--db-table", "rows"),
+}
+
+
+def test_every_reading_field_has_a_value_to_test_with() -> None:
+    """The gate on the registry above: a sixth field cannot arrive untested.
+
+    Without this, adding a field to ``_Reading`` and forgetting it in ``flags()`` or in
+    the ``run_prepare`` call is invisible -- which is precisely what happened.
+    """
+    declared = tuple(field.name for field in fields(qs._Reading))
+
+    assert declared == tuple(READING_FIELDS), (
+        "_Reading's fields and this file's registry have diverged; add the new field "
+        "here with a distinguishable value and the flag it is typed as"
     )
 
-    assert steps.kwargs["run_prepare"]["encoding"] == "latin-1"
-    assert steps.kwargs["run_prepare"]["csv_text_column"] == "body"
+
+@pytest.mark.parametrize(("name", "value"), [(k, v[1]) for k, v in READING_FIELDS.items()])
+def test_every_reading_flag_reaches_the_step_that_reads_the_corpus(
+    steps: _Recorder, tmp_path: Path, name: str, value: str
+) -> None:
+    """A corpus that needs a flag to be read at all needs it on the step that reads it.
+
+    Regression: ``--jsonl-messages-field`` reached ``_Reading`` and stopped there, so a
+    chat corpus was prepared as though the flag had never been passed -- every record
+    read as flat text, the assistant spans unmarked, and no error anywhere.
+    """
+    qs.run_quickstart("corpus", out=str(tmp_path / "qs"), prompt="Once", **{name: value})
+
+    assert steps.kwargs["run_prepare"][name] == value
 
 
 def test_tokens_is_omitted_rather_than_guessed(steps: _Recorder, tmp_path: Path) -> None:
@@ -302,6 +336,34 @@ def test_an_empty_opening_falls_back(tmp_path: Path) -> None:
     assert _prompt_for("   \n\n  ", tmp_path) == qs.FALLBACK_PROMPT
 
 
+@pytest.mark.parametrize(("name", "value"), [(k, v[1]) for k, v in READING_FIELDS.items()])
+def test_every_reading_flag_reaches_the_read_the_sample_prompt_comes_from(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, value: str
+) -> None:
+    """Step 5 reads the corpus a second time, and has to read it the same way step 1 did.
+
+    Not a duplicate of the ``run_prepare`` check: this is a second, independent
+    construction of the reader's options, and a field threaded into one and not the other
+    fails here only. Concretely -- a chat corpus whose text lives in a ``messages`` field
+    yields nothing for a reader that does not know the field, so the sample prompt silently
+    becomes the fallback and the user's first generation starts from ``"The "``.
+    """
+    recorded: dict[str, Any] = {}
+    real = qs.IngestOptions
+
+    def spy(**kwargs: Any) -> Any:
+        recorded.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(qs, "IngestOptions", spy)
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("First Citizen: Before we proceed", encoding="utf-8", newline="\n")
+
+    qs._prompt_from_corpus(str(corpus), qs._Reading(**{name: value}))
+
+    assert recorded.get(name) == value, f"the sample prompt is read without {name}"
+
+
 # --------------------------------------------------------------------------- #
 # The printed equivalents
 # --------------------------------------------------------------------------- #
@@ -333,6 +395,31 @@ def test_the_reading_flags_are_printed_only_when_they_are_not_defaults() -> None
     assert qs._Reading(csv_text_column="body").flags() == " --csv-text-column body"
     assert "--encoding" in qs._Reading(encoding="latin-1").flags()
 
+    both = qs._Reading(encoding="latin-1", csv_text_column="body").flags()
+    assert both == " --encoding latin-1 --csv-text-column body"
+
+
+@pytest.mark.parametrize(("name", "flag", "value"), [(k, *v) for k, v in READING_FIELDS.items()])
+def test_a_reading_flag_that_was_used_appears_in_the_printed_command(
+    steps: _Recorder,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    flag: str,
+    value: str,
+) -> None:
+    """The printed line has to be the command that actually ran, flags included.
+
+    This is the half of "nothing here is a black box" that is easy to get wrong in the
+    quiet direction: a step that reads the corpus one way while printing the command for
+    reading it another way is worse than printing nothing, because the user copies it,
+    gets a different dataset, and has no reason to suspect the line they were shown.
+    """
+    qs.run_quickstart("corpus", out=str(tmp_path / "qs"), prompt="Once", **{name: value})
+
+    shown = flat(capsys.readouterr().out)
+    assert f"{flag} {value}" in shown, f"the step 1 command does not show {flag}"
+
 
 def test_the_final_report_names_the_held_out_loss(
     steps: _Recorder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -343,6 +430,48 @@ def test_the_final_report_names_the_held_out_loss(
     assert "5.4657" in shown
     assert "236.44" in shown
     assert "trainai export" in shown
+
+
+def test_a_time_budget_reaches_the_plan_and_the_printed_command(
+    steps: _Recorder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``--time`` half of the step-2 command, and where it lands.
+
+    ``run_quickstart`` forwards any ``time_budget`` to ``run_plan`` and to the command
+    it prints, but nothing in the suite sets one: the default is ``None``, so the
+    conditional append to the step-2 line is the one branch *not* exercised by
+    ``test_each_step_prints_the_command_it_stands_in_for``. A user copying the printed
+    line and a user typing the line themselves have to get the same flag, so both halves
+    are checked together.
+    """
+    qs.run_quickstart("corpus.txt", out=str(tmp_path / "qs"), prompt="Once", time_budget="45m")
+
+    assert steps.kwargs["run_plan"]["time_budget"] == "45m"
+    shown = flat(capsys.readouterr().out)
+    assert "--time 45m" in shown
+
+
+def test_a_default_prompt_is_read_from_the_corpus_and_announced(
+    steps: _Recorder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With ``--prompt`` unset the prompt is the corpus's own opening, and it is said so.
+
+    The half of ``_step_sample`` that runs when the user gave no prompt. Reaching it
+    needs the full "yes" path -- answering anything other than yes returns at the
+    confirmation, before the sample step -- and a corpus that actually exists, because
+    the opening is read from disk rather than from a constant. So where
+    ``test_the_default_prompt_is_the_corpus_own_opening`` checks the extraction helper in
+    isolation, this checks the wiring: the derived prompt is the one handed to
+    ``run_chat`` and the note that explains it is printed.
+    """
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("First Citizen: Before we proceed, hear me.", encoding="utf-8", newline="\n")
+
+    qs.run_quickstart(str(corpus), out=str(tmp_path / "qs"), assume_yes=True)
+
+    expected = "First Citizen: Before we proceed, hear me."
+    assert steps.kwargs["run_chat"]["prompt"] == expected
+    assert "own opening" in flat(capsys.readouterr().out)
 
 
 # --------------------------------------------------------------------------- #

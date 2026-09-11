@@ -35,7 +35,7 @@ import torch
 
 from trainai.data.binarize import TOKENIZER_NAME
 from trainai.data.tokenizer import ByteLevelBPE
-from trainai.errors import ExportError, UsageError
+from trainai.errors import ExportError, check_choice
 from trainai.export import hf as hf_layout
 from trainai.infer import InferenceSession
 from trainai.model.config import ModelConfig
@@ -129,14 +129,6 @@ class ExportResult:
     def total_bytes(self) -> int:
         return sum(item.bytes for item in self.files)
 
-    @property
-    def verified(self) -> list[VerifyCheck]:
-        return [check for check in self.checks if check.ran]
-
-    @property
-    def skipped(self) -> list[VerifyCheck]:
-        return [check for check in self.checks if not check.ran]
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": self.format,
@@ -183,8 +175,8 @@ def export_run(
         ExportError: The destination is occupied by something that is not an
             export, a weight has no mapping, or a verification failed.
     """
-    resolved_format = _check_choice(export_format, FORMAT_CHOICES, "--format")
-    resolved_dtype_name = _check_choice(dtype, tuple(DTYPE_CHOICES), "--dtype")
+    resolved_format = check_choice(export_format, FORMAT_CHOICES, "--format")
+    resolved_dtype_name = check_choice(dtype, tuple(DTYPE_CHOICES), "--dtype")
     torch_dtype = DTYPE_CHOICES[resolved_dtype_name]
 
     destination = Path(out_dir).expanduser()
@@ -721,13 +713,3 @@ run at `{session.layout.run_dir.as_posix()}`. Tokenizer fingerprint
 model was trained with, and no other tokenizer will produce sensible output from
 these weights.
 """
-
-
-def _check_choice(value: str, choices: tuple[str, ...], flag: str) -> str:
-    if value not in choices:
-        raise UsageError(
-            f"Unknown {flag} {value!r}.",
-            hint=f"Choose one of: {', '.join(choices)}.",
-            details={"given": value, "choices": list(choices)},
-        )
-    return value

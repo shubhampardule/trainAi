@@ -26,7 +26,7 @@ import pytest
 from conftest import flat, unwrapped
 from test_hardware_portability import ALL_MACHINES
 from test_planner import GIB, card, dataset, fake_measure
-from trainai.cli.plan import describe_plan, run_plan
+from trainai.cli.plan import run_plan
 from trainai.data.binarize import DatasetManifest
 from trainai.errors import DatasetError
 from trainai.hardware.planner import PLAN_FILENAME, plan_training
@@ -116,15 +116,25 @@ def test_json_writes_the_plan_as_well_as_printing_it(
     assert "Planning" not in printed.out, "--json must emit nothing but the document"
 
 
-def test_json_and_the_report_describe_the_same_plan(
-    capsys: pytest.CaptureFixture[str], planning: Planning
+def test_json_and_the_written_file_are_the_same_document(
+    capsys: pytest.CaptureFixture[str], planning: Planning, tmp_path: Path
 ) -> None:
-    """The web interface in M5 reads `describe_plan`, so it has to agree with the file."""
-    plan = run_plan("data/prepared", json_output=True)
-    capsys.readouterr()
+    """``--json`` prints a plan *and* writes one, so the two have to agree.
 
-    assert describe_plan(plan) == plan.to_dict()
-    assert describe_plan(plan)["preset"] == plan.preset_name
+    This replaces a test that asserted ``describe_plan(plan) == plan.to_dict()`` against a
+    ``describe_plan`` whose body was ``return plan.to_dict()`` -- true by construction, and
+    green for any plan whatsoever. What it was standing in for is this: a script reads
+    stdout, a person opens the file, and nothing until now checked that they see the same
+    thing. The document is compared whole rather than key by key, because a field added
+    later would otherwise be outside the claim.
+    """
+    plan = run_plan("data/prepared", json_output=True)
+    printed = json.loads(capsys.readouterr().out)
+
+    written = json.loads((tmp_path / PLAN_FILENAME).read_text(encoding="utf-8"))
+    assert printed == written, "stdout and the file disagree about the same plan"
+    assert printed == plan.to_dict(), "and neither matches the object they came from"
+    assert printed["preset"] == plan.preset_name, "the test is vacuous on an empty document"
 
 
 # --------------------------------------------------------------------------- #
@@ -337,10 +347,83 @@ def test_a_bad_duration_is_refused_before_anything_is_measured(
     from trainai.errors import UsageError
 
     with pytest.raises(UsageError):
-        run_plan("data/prepared", time_budget="soon")
+        run_plan("data/prepared", time_budget="soon", verify=True)
 
     assert planning.kwargs == {}, "the refusal has to come before the measurement pass"
+    assert planning.verified == [], "and before re-hashing gigabytes of shards"
     assert not (tmp_path / PLAN_FILENAME).exists()
+
+
+def test_a_vram_cap_reaches_the_planner_as_bytes(
+    capsys: pytest.CaptureFixture[str], planning: Planning
+) -> None:
+    """The flag takes text and the planner takes bytes, so this one is not a pass-through."""
+    run_plan("data/prepared", max_vram="2GB")
+
+    assert planning.kwargs["max_vram_bytes"] == 2 * GIB
+
+
+def test_no_vram_cap_is_passed_as_none_rather_than_zero(
+    capsys: pytest.CaptureFixture[str], planning: Planning
+) -> None:
+    """Zero would be a budget of no memory at all, which is a different instruction."""
+    run_plan("data/prepared")
+
+    assert planning.kwargs["max_vram_bytes"] is None
+
+
+def test_a_bad_vram_cap_is_refused_before_anything_is_read_or_probed(
+    capsys: pytest.CaptureFixture[str], planning: Planning, tmp_path: Path
+) -> None:
+    """A mistyped size is a usage error, and `--verify` re-hashes gigabytes."""
+    from trainai.errors import UsageError
+
+    with pytest.raises(UsageError):
+        run_plan("data/prepared", max_vram="plenty", verify=True)
+
+    assert planning.kwargs == {}, "the refusal has to come before the measurement pass"
+    assert planning.verified == [], "and before re-hashing gigabytes of shards"
+    assert not (tmp_path / PLAN_FILENAME).exists()
+
+
+def test_the_machine_table_shows_a_cap_as_the_budget_and_says_what_was_given_up(
+    capsys: pytest.CaptureFixture[str], planning: Planning
+) -> None:
+    """Printing the device's own limit under a cap would contradict the plan below it."""
+    run_plan("data/prepared", max_vram="2GB")
+
+    report = flat(capsys.readouterr().out)
+    assert "Memory budget 2.00 GiB" in report
+    assert "--max-vram, below the 5.44 GiB this device would have allowed" in report
+    assert "85% of what is free" not in report, (
+        "the device's own limit is not the budget when a cap is lower than it"
+    )
+
+
+def test_the_machine_table_shows_the_devices_own_limit_when_a_cap_is_above_it(
+    capsys: pytest.CaptureFixture[str], planning: Planning
+) -> None:
+    """A cap never raises the budget, so a generous one must not be printed as one."""
+    run_plan("data/prepared", max_vram="64GB")
+
+    report = flat(capsys.readouterr().out)
+    assert "Memory budget 5.44 GiB" in report
+    assert "85% of what is free" in report
+    assert "64.0 GiB" not in report.split("Worth knowing")[0], (
+        "the machine table states the budget that applied; the note explains the cap"
+    )
+
+
+def test_no_cap_prints_the_budget_as_a_fraction_of_free_vram(
+    capsys: pytest.CaptureFixture[str], planning: Planning
+) -> None:
+    """The negative control for the row: the ordinary path must not mention the flag."""
+    run_plan("data/prepared")
+
+    report = flat(capsys.readouterr().out)
+    assert "Memory budget 5.44 GiB" in report
+    assert "85% of what is free" in report
+    assert "--max-vram" not in report
 
 
 @pytest.mark.parametrize(

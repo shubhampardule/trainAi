@@ -14,7 +14,6 @@ progress bar.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from trainai.console import (
     DASH,
@@ -36,6 +35,7 @@ from trainai.hardware.planner import (
     Candidate,
     TrainingPlan,
     parse_duration,
+    parse_vram,
     plan_training,
 )
 from trainai.hardware.probe import DEFAULT_VRAM_SAFETY_FRACTION, HardwareProfile, probe_hardware
@@ -55,19 +55,24 @@ def run_plan(
     out: str | None = None,
     verify: bool = False,
     safety_fraction: float = DEFAULT_VRAM_SAFETY_FRACTION,
+    max_vram: str | None = None,
     warmup_steps: int = 2,
     measure_steps: int = 3,
     seed: int = 1234,
 ) -> TrainingPlan:
     """Measure candidate configurations and report the largest one that works."""
     quiet = json_output
+    # Both flags are parsed before anything is read or probed. A mistyped size is a usage
+    # error, and `--verify` re-hashes gigabytes while `probe_hardware` initialises CUDA --
+    # neither is a thing to make someone wait through to be told they typed "lots".
+    horizon = parse_duration(time_budget) if time_budget else None
+    cap = parse_vram(max_vram) if max_vram else None
     dataset = verify_dataset(data, deep=verify) if verify else DatasetManifest.load(data)
     hardware = probe_hardware(disk_path=".")
-    horizon = parse_duration(time_budget) if time_budget else None
 
     if not quiet:
         rule("Planning")
-        print_kv("Machine", _hardware_rows(hardware, safety_fraction))
+        print_kv("Machine", _hardware_rows(hardware, safety_fraction, cap))
         console.print(
             "[dim]Measuring candidates by running real training steps. Each one takes a "
             "few seconds and briefly allocates VRAM.[/]"
@@ -83,6 +88,7 @@ def run_plan(
         seq_len=seq_len,
         precision=precision,
         safety_fraction=safety_fraction,
+        max_vram_bytes=cap,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,
         seed=seed,
@@ -141,7 +147,10 @@ def _report(plan: TrainingPlan, written: Path) -> None:
     )
 
 
-def _hardware_rows(hardware: HardwareProfile, safety_fraction: float) -> list[tuple[str, str]]:
+def _hardware_rows(
+    hardware: HardwareProfile, safety_fraction: float, cap: int | None = None
+) -> list[tuple[str, str]]:
+
     rows = [("Platform", hardware.platform_summary)]
     gpu = hardware.primary_gpu
     if gpu is None:
@@ -160,14 +169,24 @@ def _hardware_rows(hardware: HardwareProfile, safety_fraction: float) -> list[tu
             f"{fmt_bytes(gpu.total_vram_bytes)}",
         )
     )
-    rows.append(
-        (
-            "Memory budget",
-            f"[bold]{fmt_bytes(hardware.vram_budget_bytes(safety_fraction))}[/]  "
-            f"[dim]({safety_fraction:.0%} of what is free, leaving room for the driver "
-            "and the desktop)[/]",
+    device_budget = hardware.vram_budget_bytes(safety_fraction)
+    if cap is not None and cap < device_budget:
+        rows.append(
+            (
+                "Memory budget",
+                f"[bold]{fmt_bytes(cap)}[/]  [dim](--max-vram, below the "
+                f"{fmt_bytes(device_budget)} this device would have allowed)[/]",
+            )
         )
-    )
+    else:
+        rows.append(
+            (
+                "Memory budget",
+                f"[bold]{fmt_bytes(device_budget)}[/]  "
+                f"[dim]({safety_fraction:.0%} of what is free, leaving room for the driver "
+                "and the desktop)[/]",
+            )
+        )
     if hardware.silent_vram_spillover:
         rows.append(
             (
@@ -311,8 +330,3 @@ def _print_rejected(plan: TrainingPlan) -> None:
             for record in rejected
         ],
     )
-
-
-def describe_plan(plan: TrainingPlan) -> dict[str, Any]:
-    """The plan as a plain dictionary, for the web interface in M5."""
-    return plan.to_dict()

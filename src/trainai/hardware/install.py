@@ -196,6 +196,14 @@ def _torch_build() -> tuple[str | None, bool]:
 
     Returns ``(description, has_accelerator)``. ``description`` is ``None`` when
     torch is not installed at all.
+
+    Every read here is defensive, and that is the point rather than caution for its
+    own sake: this runs inside ``trainai setup``, the command a user reaches for
+    *because* their install is wrong, so a torch that imports and then answers badly
+    has to produce a description instead of a traceback. The case that is not
+    hypothetical is a file named ``torch.py`` next to the script -- a beginner's
+    mistake with a name this popular -- which imports as an empty module and has
+    none of the attributes below.
     """
     try:
         import torch
@@ -215,7 +223,7 @@ def _torch_build() -> tuple[str | None, bool]:
         with suppress(Exception):
             has_accelerator = bool(xpu is not None and xpu.is_available())
     if not has_accelerator:
-        mps = getattr(torch.backends, "mps", None)
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
         with suppress(Exception):
             has_accelerator = bool(mps is not None and mps.is_available())
 

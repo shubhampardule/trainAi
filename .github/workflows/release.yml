@@ -1,0 +1,143 @@
+name: release
+
+# Tag-triggered, and it stops at a **draft**. Nothing here publishes to an index: no
+# TrainAI artifact has ever been uploaded to PyPI, no trusted publisher or token is
+# configured, and a `pypi-publish` step that has never once succeeded is worse than no
+# step -- it turns the first real release into a debugging session. The job that would
+# do it goes in with the commit that actually claims the name.
+#
+# `workflow_dispatch` builds and verifies without a tag, which is how this workflow is
+# tested. The release job is skipped there, because there is nothing to attach to.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not cancel-in-progress. A cancelled release is a half-created one, and unlike CI
+  # there is nothing cheap about re-running it: the tag it read may already be public.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  agree:
+    name: tag, version and changelog agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Runs first and on its own so a disagreement costs seconds rather than a full
+      # build. The same command is meant to be run locally *before* the tag is pushed
+      # -- see the module docstring for why a tag is the one thing here that cannot be
+      # quietly corrected.
+      - name: Check the tag against the packaged version and the changelog
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python tools/release_check.py --tag "${{ github.ref_name }}"
+
+      - name: Report the packaged version
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: python tools/release_check.py
+
+  artifacts:
+    name: build, then install and test what will be released
+    needs: agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+
+      # --strict, unlike the CI build job: a rendering warning on the long-form README
+      # is only interesting at the moment it would be published, and only here is it
+      # worth failing over.
+      - name: Check metadata
+        run: python -m twine check --strict dist/*
+
+      # The point of this job. CI installs the repository with `pip install -e .` and
+      # therefore never tests the artifact anybody would actually download. Here the
+      # wheel is installed as a wheel, and the suite is run from the *unpacked sdist*,
+      # so the two failures this catches are the ones no editable install can:
+      # a module missing from the wheel, and a file the tests read missing from the
+      # sdist. pyproject.toml records that this was verified once by hand; a check
+      # performed once is a claim with a date on it, so it runs on every tag.
+      - name: Install CPU-only torch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the built wheel, not the checkout
+        # The `[dev]` extras come along so the suite below has pytest. `cd /tmp` and the
+        # site-packages assertion together are what make this a real check: `src/` layout
+        # already keeps the checkout off sys.path, and an assertion says so rather than
+        # leaving it to be inferred from a printed path nobody reads.
+        run: |
+          python -m pip install "$(ls dist/*.whl)[dev]"
+          cd /tmp
+          python -c "import trainai, pathlib; p = pathlib.Path(trainai.__file__).resolve(); print(p); assert 'site-packages' in p.parts, p"
+
+      - name: The console script works when installed from the wheel
+        run: |
+          cd /tmp
+          trainai --version
+          trainai doctor
+
+      - name: Run the suite from the unpacked sdist against the installed wheel
+        run: |
+          mkdir -p /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist && python -m pytest -m "not gpu" -q -p no:cacheprovider
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  draft:
+    name: draft release
+    needs: artifacts
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      # The only job that needs write, and it needs it only to create the draft.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      # The notes are the changelog section, not a second copy of it written by hand.
+      # release_check.py only writes the file when every check passed, so a failed
+      # check cannot produce release notes.
+      - name: Take the release notes from the changelog
+        run: python tools/release_check.py --tag "${{ github.ref_name }}" --notes-out notes.md
+
+      # Draft, deliberately. The maintainer reads the rendered notes and the attached
+      # files and presses publish; that is the last point at which any of this is still
+      # reversible.
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --draft \
+            --title "TrainAI ${{ github.ref_name }}" \
+            --notes-file notes.md \
+            dist/*

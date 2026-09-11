@@ -287,6 +287,166 @@ know what to pass it. A line that is not valid JSON is reported with its line
 number; `--on-error skip` counts and skips such lines instead, and the count is
 surfaced as a `records_skipped` warning rather than swallowed.
 
+## Conversations
+
+A record may hold a **typed conversation** instead of a flat string: a list of
+`{"role": ..., "content": ...}` objects, in a field named with
+`--jsonl-messages-field`. It works for `.jsonl` and for whole-file `.json`, which
+hold the same records.
+
+```jsonl
+{"messages": [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hey! What would you like help with?"}]}
+```
+
+The roles are `system`, `user` and `assistant`, matched case-insensitively.
+Anything else is an error listing the three, **not** a guess: rendering an unknown
+role under the wrong label, or dropping it, changes what the model is trained to
+produce without saying so.
+
+TrainAI renders that with one fixed template -- `{Label}: {content}`, messages joined
+with a newline, and a blank line before any message that starts a new turn:
+
+```
+User: Hi!
+Assistant: Hey! What would you like help with?
+
+User: what is 2 + 2?
+Assistant: 2 + 2 = 4.
+```
+
+There is exactly one template, and it is versioned, because a model trained with one
+chat layout and prompted with another degrades **without an error** — the same class
+of silent mismatch as a tokenizer fingerprint, and the reason that one is checked.
+
+The dataset records which template it was rendered in, in the manifest's
+[`chat` block](dataset-format.md#chat), and `data inspect` shows it as a
+`Chat template` row. That is what makes the layout a fact about the dataset rather
+than something a reader has to remember — and the fact is what `trainai chat` reads.
+The trainer copies the block into every checkpoint, so a run trained this way is
+prompted in this layout without being asked to be:
+
+```
+$ trainai chat runs/assistant
+  Mode  chat -- wraps what you type in User: / Assistant:  (this run's dataset was rendered as conversations)
+
+> what is 2 + 2?
+ 2 + 2 = 4.
+
+> and 3 + 3?
+ 3 + 3 = 6.
+```
+
+What you type becomes the `user` message, and generation stops where the model starts
+writing somebody else's turn. `--raw` sends your text through unchanged — a chat model
+is still a base model worth probing — and `--chat` turns the wrapping on for a run that
+records nothing, which is what a corpus you flattened into these labels yourself needs.
+
+**The second question is asked with the first exchange in front of it**, which is why
+the transcript above is a conversation rather than two unrelated completions. The corpus
+this template renders is conversations: the typed corpus in `data/chat-typed` is 4,000 of
+4,000 `user`/`assistant`/`user`/`assistant`, so a follow-up carrying what came before is
+the layout the model was trained on and a bare follow-up is the one that is not. `/new`
+forgets the conversation, `/more` continues the last reply rather than starting a turn,
+and `/raw` keeps it — switching to probe the model unwrapped and switching back resumes
+where you were. In raw mode nothing accumulates, because prose has no turns.
+
+**A conversation that outgrows the context loses whole messages, oldest first, and says
+so.** The sampler's own truncation keeps the last `seq_len` tokens, which for a
+conversation cuts wherever the count happens to land: mid-word, inside a message, leaving
+a first label that is half a label — a layout no corpus contains, which still produces a
+reply, so nothing about it looks wrong. Messages come off in pairs where they have to, so
+what is left still begins with a question. The message you just typed is never dropped;
+if it alone does not fit, it is truncated and reported as such.
+
+**The prompt ends at `Assistant:`, not after the space that follows it in the shards**,
+and that one character decides whether this works at all. A byte-level BPE keeps a space
+with the word after it, so the shards hold `Assistant:` and then a single `" 2"` token
+and never a lone space; a prompt ending in the space asks the model to continue from a
+token sequence that appears nowhere in its training data, and what comes back is noise
+rather than a slightly worse reply. Measured on the 4,000-conversation corpus in
+`data/chat-typed` with its own tokenizer: ending at the colon, 4,000 of 4,000 prompts
+are a token prefix of the conversation the model was trained on; ending after the space,
+0 of 4,000. The model writes the space itself, which is why the reply above begins with
+one.
+
+Two things this is not:
+
+- **Not a way to find the replies in text you already have.** The input is typed. The
+  obvious alternative — take a flattened corpus and split it on `"Assistant:"` —
+  mis-splits any reply that contains that string, and a model discussing itself
+  produces many. That is the [tabular](#tabular-data-that-is-not-a-table-on-the-outside)
+  mistake in a new costume, so roles are read from a field or not at all.
+- **Not a guarantee that the prompt is invisible.** The model still *reads* every
+  prompt token — it is context, and attention sees it. What the mask changes is what
+  the loss is averaged over: the replies. `trainai train --no-loss-mask` scores
+  everything instead.
+
+`--jsonl-messages-field` and `--jsonl-field` cannot both be given. One says "this
+field holds text, train on all of it"; the other says "this field holds a
+conversation". A record with no `assistant` message at all is refused, as is an empty
+message — an empty one renders as a bare label, which teaches the model to produce
+one. `--on-error skip` drops and counts such records instead.
+
+### The loss mask on disk
+
+For a corpus read with `--jsonl-messages-field`, `data prepare` writes one mask file
+beside every token shard:
+
+```
+train_00000.bin        token ids,  uint16/uint32
+train_00000.mask.bin   loss mask,  one uint8 per token
+```
+
+A mask byte is `1` where the token is a training target and `0` where it is context
+the model reads but is not scored on. The mask is named after the shard it describes
+rather than numbered on its own, its length is the shard's token count exactly, and
+its sha256 is recorded in the same manifest entry as the shard's — so a mask paired
+with the wrong shard, or one that rotted after preparation, is caught by
+`data inspect --verify` instead of quietly scoring the wrong tokens.
+
+Three details worth knowing:
+
+- **The token that ends a document is always a target.** A model never scored on the
+  end-of-text token never learns to stop.
+- **A document with no conversation structure is trained on in full.** Empty spans mean
+  "no opinion", not "train on nothing", so a `.txt` file sitting beside a `chat.jsonl`
+  is unaffected.
+- **A token is selected by intersection with a span**, not by containment, because the
+  tokenizer reports a token beginning with a space as covering only its text. A token
+  covering characters on both sides of a span edge would be scored on text the mask
+  calls context; the count is reported (`straddling`) rather than assumed, and it is
+  zero for this template — a span always ends on a newline run, which the
+  pre-tokenizer never merges with the word after it.
+
+`--no-loss-mask` prepares the same dataset without the mask files, and
+`--loss-mask` on a corpus that has no typed conversations is a usage error rather
+than a mask of all ones. A masked dataset has a different `content_hash` from an
+unmasked one built from the same corpus: the mask is part of what was prepared.
+
+### What training does with it
+
+`trainai train` and `trainai finetune` apply the mask when the dataset has one, with
+no flag needed. Three things follow from that, all reported rather than assumed:
+
+- **The loss is a weighted mean, not `ignore_index`.** A window that lands entirely
+  inside a prompt has no scored position, and cross-entropy over nothing is `0/0` —
+  a NaN that reaches every parameter through the backward pass. Such a window
+  contributes loss 0 and gradient exactly 0 instead.
+- **Gradient accumulation weights by count, not by `1/--grad-accum`.** Micro-batches
+  of a masked dataset score different numbers of tokens, so each one is scaled by its
+  share of the step's total. On an unmasked dataset this reduces to `1/--grad-accum`
+  exactly.
+- **A step that scores nothing is named.** It appears in `metrics.jsonl` as an
+  `unscored` event with a null loss rather than as a 0.0 that would be a fake minimum
+  in the curve, and the first one is noted on the console.
+
+`--loss-mask` on a dataset with no mask is a usage error, for the same reason it is
+at prepare time: a run that silently trained on everything is indistinguishable in
+its output from one that did what was asked. `--no-loss-mask` scores every token of
+a masked dataset deliberately, which is the honest way to measure what the mask buys.
+Either choice is recorded in the checkpoint, so `trainai eval` reports the same
+quantity the training curve did.
+
 ## Whole-file JSON
 
 A `.json` file is **one array of records**, and each element is one document. This
@@ -559,6 +719,17 @@ decodes accordingly.
 UTF-8 by default. A byte order mark is honoured over that default, so a file saved
 by Excel as "UTF-8 with BOM" reads correctly without a flag. `--encoding` takes any
 codec Python knows (`--encoding latin-1` covers most Western European text).
+
+A name Python has no text codec for is refused before any file is opened, with the
+nearest common spelling when there is one:
+
+```
+--encoding was given as 'uft-8', which is not a text encoding.
+```
+
+Aliases are the same encoding, not a mismatch: `--encoding UTF_16` on a file with a
+UTF-16 byte order mark is agreement, and `--encoding utf_16_le` is refused for JSON
+Lines for the same reason `utf-16` is.
 
 A decoding failure names the file and the byte offset of the first bad sequence,
 not just the file:

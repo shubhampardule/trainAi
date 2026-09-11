@@ -37,16 +37,24 @@ from trainai.data import ingest as ingest_module
 from trainai.data.ingest import (
     _BOMS,
     _JSON_MAX_BYTES,
+    CSV_SUFFIXES,
     CUT_BY_MAX_DOC_CHARS,
+    Compression,
     Document,
     IngestOptions,
     Ingestor,
     IngestStats,
     Kind,
     SourceFile,
+    _MemberStream,
     describe_supported_formats,
 )
-from trainai.errors import DatasetDecodeError, DatasetFormatError, DatasetNotFoundError
+from trainai.errors import (
+    DatasetDecodeError,
+    DatasetFormatError,
+    DatasetNotFoundError,
+    UsageError,
+)
 
 
 def ingest(root: Path, **options: object) -> tuple[list[Document], IngestStats]:
@@ -241,6 +249,75 @@ def test_jsonl_ordinal_counts_records(tmp_path: Path) -> None:
     assert "docs.jsonl:2" in documents[2].location
 
 
+def test_a_blank_line_between_records_is_skipped_and_still_counted_in_the_offsets(
+    tmp_path: Path,
+) -> None:
+    """The common shape of a hand-assembled corpus, and it must not be an error.
+
+    ``json.loads("")`` raises, so without the skip an ordinary blank line is a
+    malformed record and the run stops on a line that holds nothing. Every writer of
+    JSON Lines ends the last record with a newline, so `cat a.jsonl b.jsonl` leaves a
+    blank line in the middle whenever one of them ended with two -- this is the
+    everyday case rather than a corner of one.
+
+    Two things have to be true at once, and the second is the one a naive skip gets
+    wrong. Nothing is counted: a blank line is not a dropped record, and
+    ``records_skipped_malformed`` is the number that tells someone whether the corpus
+    lost anything (`test_on_error_skip_counts_malformed_records` is where that count
+    is the point). And the byte offset still advances across it: the reader adds the
+    line's length *before* deciding to skip it, so the second record's offset counts
+    the blank line, and a decode error later in the file names a byte someone can
+    actually seek to.
+    """
+    first = json.dumps({"text": "the first record, long enough to keep"})
+    second = json.dumps({"text": "the second record, also long enough"})
+    write(tmp_path / "docs.jsonl", first + "\n\n" + second + "\n")
+
+    documents, stats = ingest(tmp_path)
+
+    assert [document.text for document in documents] == [
+        "the first record, long enough to keep",
+        "the second record, also long enough",
+    ]
+    assert [document.ordinal for document in documents] == [0, 1]
+    assert stats.documents_emitted == 2
+    assert stats.records_skipped_malformed == 0
+    assert documents[1].byte_offset == len(first) + 2, "the blank line fell out of the offsets"
+
+
+def test_a_record_that_is_a_bare_string_is_the_document(tmp_path: Path) -> None:
+    """One JSON string per line, with no object around it -- still JSON Lines.
+
+    `test_reads_a_json_array_of_bare_strings` is the same shape one format over, and
+    the two readers hold separate copies of the check, so covering one leaves the other
+    able to refuse a file the sibling accepts. This is also what TrainAI's own advice
+    produces: the ``--json`` too-large hint prints ``json.dumps(record)`` per element,
+    which for an array of strings is exactly this file, and refusing it would mean
+    refusing the output of the command in the error message.
+
+    No field is resolved for a bare string, which is why this file needs no
+    ``--jsonl-field``. The mixed file is the part worth pinning: field detection
+    happens on the first record that *has* fields, so a bare string ahead of it must
+    not consume the decision or leave ``chosen`` set to something a later object is
+    then measured against.
+    """
+    write(
+        tmp_path / "docs.jsonl",
+        json.dumps("a bare string, and the whole document")
+        + "\n"
+        + json.dumps({"text": "an object in the same file"})
+        + "\n",
+    )
+
+    documents, stats = ingest(tmp_path)
+
+    assert [document.text for document in documents] == [
+        "a bare string, and the whole document",
+        "an object in the same file",
+    ]
+    assert stats.documents_emitted == 2
+
+
 def test_honours_a_declared_encoding(tmp_path: Path) -> None:
     (tmp_path / "latin.txt").write_bytes("caf\xe9 na\xefve\n".encode("latin-1"))
 
@@ -249,12 +326,150 @@ def test_honours_a_declared_encoding(tmp_path: Path) -> None:
     assert documents[0].text == "caf\xe9 na\xefve\n"
 
 
+def test_an_encoding_that_is_no_codec_at_all_is_refused_where_it_was_typed() -> None:
+    """The flag is free-form text, and a misspelling used to arrive as a traceback.
+
+    ``--encoding`` names any text codec Python has, so there is no closed set to
+    check it against the way ``check_choice`` checks ``--precision``. What it had
+    instead was nothing at all: the string went from the CLI into ``IngestOptions``
+    and from there into ``bytes.decode``, and a typo surfaced as ``LookupError:
+    unknown encoding: uft-8`` raised inside ``<frozen codecs>``. Measured on three
+    corpora before the check existed -- a traceback and no exit code of ours for
+    ``.txt``, ``.jsonl``, ``.csv`` and ``.json``; by luck a correct
+    ``DatasetDecodeError`` for a file with a byte-order mark; and for a file with
+    no extension ``No readable text files found ... none of them a readable
+    format``, which blames the corpus for a mistake in the command.
+
+    No corpus is built here, and that is the assertion: the options object refuses
+    the name before there is a file to open. ``test_prepare_refuses_a_misspelt_
+    encoding`` is the same refusal reached through the CLI, and
+    ``test_the_two_field_options_cannot_both_be_given`` covers the other thing this
+    constructor checks.
+    """
+    with pytest.raises(UsageError) as caught:
+        IngestOptions(encoding="uft-8")
+
+    assert "--encoding was given as 'uft-8'" in str(caught.value)
+    assert "not a text encoding" in str(caught.value)
+    assert "Leave --encoding off" in (caught.value.hint or "")
+    assert caught.value.details["encoding"] == "uft-8"
+
+
+@pytest.mark.parametrize("codec", ["base64", "zlib", "rot13"])
+def test_a_codec_python_knows_but_no_reader_can_use_is_refused_as_well(codec: str) -> None:
+    """``codecs.lookup`` is the wrong question, and this is how the two differ.
+
+    The registry holds bytes-to-bytes codecs beside the text ones, so
+    ``codecs.lookup("base64")`` succeeds and a check built on it would pass the
+    name through. It would then fail in the reader with a second, differently
+    worded ``LookupError`` -- "not a text encoding; use codecs.decode() to handle
+    arbitrary codecs" -- which is advice for someone writing Python, not for
+    someone who typed a flag. Encoding the empty string is what separates the two
+    kinds of codec, which is the whole reason the check is not a lookup.
+
+    Nothing is suggested for these, and that is deliberate: the pool a near miss is
+    drawn from holds only text encodings, so ``base64`` matches none of them.
+    """
+    with pytest.raises(UsageError) as caught:
+        IngestOptions(encoding=codec)
+
+    assert f"--encoding was given as {codec!r}" in str(caught.value)
+    assert "Did you mean" not in (caught.value.hint or "")
+    assert caught.value.details["encoding"] == codec
+
+
+@pytest.mark.parametrize(
+    ("typo", "meant"),
+    [
+        ("uft-8", "utf-8"),
+        ("utf-88", "utf-8"),
+        ("latn-1", "latin-1"),
+        ("cp1225", "cp1252"),
+        ("shift_jsi", None),
+    ],
+    ids=["transposed", "doubled", "dropped", "swapped", "unrelated"],
+)
+def test_a_near_miss_on_an_encoding_name_is_offered_the_spelling_it_probably_meant(
+    typo: str, meant: str | None
+) -> None:
+    """These names are typed from memory, and the misses are one keystroke wide.
+
+    The four that get an answer are the shapes a hand makes: a transposition, a
+    doubled digit, a dropped letter, two digits the wrong way round. The fifth is
+    the reason the cutoff is 0.7 rather than :mod:`difflib`'s 0.6 -- ``shift_jsi``
+    is a real misspelling of a real codec, but the pool here holds only the six
+    encodings a corpus is usually in, and the nearest of those is not what the user
+    meant. Listing the common names and guessing nothing is the better failure,
+    which is the same reasoning ``check_choice`` records for ``--device gpu``.
+    """
+    with pytest.raises(UsageError) as caught:
+        IngestOptions(encoding=typo)
+
+    hint = caught.value.hint or ""
+    if meant is None:
+        assert "Did you mean" not in hint
+    else:
+        assert f"Did you mean {meant}?" in hint
+    assert "any codec Python knows by name will do" in hint
+
+
 def test_byte_order_mark_is_honoured_over_the_default_encoding(tmp_path: Path) -> None:
     (tmp_path / "bom.txt").write_bytes(b"\xff\xfe" + "utf-16 text\n".encode("utf-16-le"))
 
     documents, _ = ingest(tmp_path)
 
     assert documents[0].text == "utf-16 text\n"
+
+
+# One codec has many names -- utf-8, utf8, UTF_8, u8 are one encoding, and Python's
+# registry is what says so. Two decisions here consult it rather than compare strings,
+# and both of them look correct against a canonically spelled flag while being wrong:
+# whether an explicit --encoding agrees with the byte-order mark on disk, and whether
+# an encoding is one of the wide ones a line-based reader cannot split. The two tests
+# below pass the same codecs by an alias, which is the only spelling that tells the
+# difference.
+def test_an_alias_of_the_encoding_a_byte_order_mark_names_is_not_a_contradiction(
+    tmp_path: Path,
+) -> None:
+    """``--encoding UTF_16`` on a UTF-16 file is agreement, however it is spelled.
+
+    The BOM check refuses a file whose mark contradicts the flag, and the refusal is
+    right -- see ``test_the_byte_order_mark_hint_names_two_things_that_both_work``.
+    Comparing the two names as text would make it fire here too, telling someone who
+    named the correct codec that their file "starts with a utf-16 byte-order mark,
+    but --encoding was given as 'UTF_16'", which is a difference in punctuation
+    dressed up as a difference in format.
+    """
+    body = "a corpus with a mark on the front, long enough to keep\n"
+    (tmp_path / "marked.txt").write_bytes(b"\xff\xfe" + body.encode("utf-16-le"))
+
+    documents, stats = ingest(tmp_path, encoding="UTF_16")
+
+    assert [document.text for document in documents] == [body]
+    assert stats.files_read == 1
+
+
+def test_a_wide_encoding_named_by_an_alias_is_still_refused_for_json_lines(
+    tmp_path: Path,
+) -> None:
+    """The alias has to reach the format guard as the codec it is, not as its spelling.
+
+    A UTF-16 record cannot be found by splitting on the ``0a`` byte, which is why
+    ``test_utf16_jsonl_is_refused_before_it_can_be_misdiagnosed`` exists. That guard
+    tests membership of a set of canonical names, so an alias that never reaches it
+    canonicalised is waved through into the line splitter -- and the file has no
+    byte-order mark, deliberately, because a mark would canonicalise the name on the
+    way past and hide it.
+    """
+    record = json.dumps({"text": "a record that decodes fine and splits wrong"}) + "\n"
+    (tmp_path / "docs.jsonl").write_bytes(record.encode("utf-16-le"))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path, encoding="utf_16_le")
+
+    assert "docs.jsonl" in str(caught.value)
+    assert "JSON Lines" in str(caught.value)
+    assert caught.value.details["encoding"] == "utf_16_le", "the name as typed is what to fix"
 
 
 #: Every distinct codec named by :data:`trainai.data.ingest._BOMS`, taken from the table
@@ -368,6 +583,144 @@ def test_on_error_skip_counts_malformed_records(tmp_path: Path) -> None:
 
     assert len(documents) == 1
     assert stats.records_skipped_malformed == 1
+
+
+def test_an_undecodable_jsonl_line_is_reported_at_its_offset_in_the_file(tmp_path: Path) -> None:
+    """JSON Lines has its own copy of the decode handler, and it had never run either.
+
+    A record exported as latin-1: the JSON is well formed and the bytes are not utf-8,
+    so this fails one step before `json.loads` ever sees it and the JSON error above is
+    not what comes back. Byte 44 is the accented byte of the second record, counted
+    from the start of the file -- the first record is valid utf-8 and not ASCII, so a
+    reader that counted characters instead of bytes would say 43.
+
+    The two readers keep separate copies of this arithmetic, which is exactly why both
+    need a test: a fix applied to one of them leaves the other wrong and quiet.
+    """
+    (tmp_path / "docs.jsonl").write_bytes(
+        b'{"text": "caf\xc3\xa9 by the river"}\n{"text": "caf\xe9 in the morning"}\n'
+    )
+
+    with pytest.raises(DatasetDecodeError) as caught:
+        ingest(tmp_path)
+
+    assert "byte 44 begins the invalid sequence e9" in str(caught.value)
+    assert caught.value.details["byte_offset"] == 44
+    assert caught.value.details["bad_bytes"] == "e9"
+
+
+def test_utf16_jsonl_is_refused_before_it_can_be_misdiagnosed(tmp_path: Path) -> None:
+    """A wide encoding is a *format* problem here, and the reader must say so itself.
+
+    Records are separated by the newline byte, and in UTF-16 that byte is half of a
+    character. Splitting on it leaves the first line one byte too long and every line
+    after it shifted by one, so line 1 fails to decode ("truncated data" on its
+    trailing 0a) and line 2 decodes cleanly into entirely different characters. The
+    file is not damaged and the encoding was detected correctly -- the line splitting
+    is what cannot work.
+
+    Which is why this refusal exists rather than letting the decode error happen.
+    Measured with the guard removed, the same file reports ``docs.jsonl is not valid
+    utf-16: byte 60 begins the invalid sequence 0a`` and advises passing "the encoding
+    it actually uses": the reader blames the user's file for the byte the reader itself
+    split on, and the advice it gives cannot fix anything. ``--encoding utf-16`` is
+    already what it is using.
+
+    `test_utf16_csv_is_refused_with_an_instruction` is the same decision in the reader
+    with the same newline dependency, and `test_utf16_json_is_read_rather_than_refused`
+    is the one format that does *not* refuse, because whole-file JSON is parsed as a
+    single value and never split. All three answers come from the same
+    ``_WIDE_CODECS`` table; the three tests are what keep them from being made uniform.
+    """
+    body = json.dumps({"text": "a record that decodes fine and splits wrong"}) + "\n"
+    (tmp_path / "docs.jsonl").write_bytes(b"\xff\xfe" + body.encode("utf-16-le"))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path)
+
+    assert "docs.jsonl" in str(caught.value)
+    assert "utf-16" in str(caught.value).lower()
+    assert "JSON Lines" in str(caught.value)
+    assert "UTF-8" in (caught.value.hint or "")
+    assert caught.value.details["encoding"] == "utf-16"
+
+
+@pytest.mark.parametrize(
+    ("record", "named"),
+    [(["a cell", "another cell"], "list"), (7, "int"), (None, "NoneType")],
+    ids=["array", "number", "null"],
+)
+def test_a_record_that_is_neither_an_object_nor_a_string_names_its_type(
+    tmp_path: Path, record: object, named: str
+) -> None:
+    """Valid JSON with nowhere for a text field to be, and no field to blame.
+
+    The two messages above name a field -- 'text' is missing, 'text' holds int -- and
+    both are about a record that *has* fields. Saying "field 'text' is missing" of the
+    number ``7`` sends someone to ``--jsonl-field``, which cannot fix a record that has
+    no fields at all, so this branch drops the field from the sentence and names the
+    record's own type instead.
+
+    A row-per-line dump is the realistic cause: an export that writes each line as a
+    JSON array of cells rather than an object, which is why ``list`` leads the cases
+    here. ``null`` is included because an exporter emitting a blank row as bare
+    ``null`` is the other way to arrive, and because ``NoneType`` proves the name comes
+    from the record rather than from a table of the shapes the reader expected.
+
+    ``available_fields`` is empty rather than absent: the key is in every one of these
+    errors so that a caller reading the details never has to test for it, and it is the
+    one field that separates this branch from the two above it in a structured log.
+    """
+    write(tmp_path / "docs.jsonl", json.dumps(record) + "\n")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path)
+
+    assert f"the record is a {named}, not an object or a string" in str(caught.value)
+    assert "docs.jsonl line 1" in str(caught.value)
+    assert "bare JSON" in (caught.value.hint or "")
+    assert caught.value.details["available_fields"] == []
+    assert caught.value.details["field"] is None
+
+
+def test_on_error_skip_drops_a_record_of_the_wrong_shape_and_counts_it(tmp_path: Path) -> None:
+    """``--on-error skip`` has to cover the shape check too, not only the JSON parse.
+
+    `test_on_error_skip_counts_malformed_records` above is the same option one step
+    earlier in the same loop: a line that is not JSON at all. This is a line that
+    parses and then holds no string to take, which is the more common of the two in a
+    real corpus -- an exporter that writes ``{"text": null}`` for an empty row produces
+    a perfectly valid file that this reader cannot take a document from.
+
+    The reader keeps the two skips as separate copies of the same four lines, and they
+    add into the same counter, so the accounting is the assertion: two records offered
+    and dropped, two emitted, and no ordinal spent on the ones that went nowhere. An
+    ordinal that advanced on a skipped record would leave a gap in
+    ``docs.jsonl:0,1,3,4`` and make the location strings disagree with the shard.
+    """
+    write(
+        tmp_path / "docs.jsonl",
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {"text": "a record with a string in it"},
+                {"text": None},
+                {"text": 42},
+                {"text": "another record with a string"},
+            )
+        )
+        + "\n",
+    )
+
+    documents, stats = ingest(tmp_path, on_error="skip")
+
+    assert [document.text for document in documents] == [
+        "a record with a string in it",
+        "another record with a string",
+    ]
+    assert [document.ordinal for document in documents] == [0, 1]
+    assert stats.records_skipped_malformed == 2
+    assert stats.documents_emitted == 2
 
 
 def test_missing_jsonl_field_names_the_fields_that_are_present(tmp_path: Path) -> None:
@@ -573,6 +926,39 @@ def test_utf16_json_is_read_rather_than_refused(tmp_path: Path) -> None:
     assert [document.text for document in documents] == ["first", "second"]
 
 
+def test_an_undecodable_json_file_is_reported_at_its_offset(tmp_path: Path) -> None:
+    """The fourth copy of the decode error, and the only one that adds nothing to it.
+
+    Four readers call ``_decode_error`` and three of them pass ``<start of the chunk> +
+    exc.start``, because they decode a line or a block at a time and the exception's
+    offset is relative to that piece. This one decodes the whole file as a single
+    buffer, so ``exc.start`` is already the offset in the file and adding anything to it
+    would be wrong. That makes it the copy most likely to be broken by someone making
+    the four look alike, and the only one where the mistake is invisible in a one-line
+    file.
+
+    The accented word before the bad byte is deliberate: ``cafe`` with an e-acute is two
+    bytes in utf-8 and one in latin-1, so a reader counting decoded characters instead
+    of raw bytes reports an offset one lower, and both numbers point inside the same
+    short file. Only the byte count is seekable, and only the byte count is what
+    ``--encoding`` advice is worth acting on.
+
+    `test_an_undecodable_jsonl_line_is_reported_at_its_offset_in_the_file` is the same
+    corpus content in the streaming reader, where the arithmetic that is absent here is
+    the thing under test.
+    """
+    prefix = b'[{"text": "caf\xc3\xa9 by the river"}, {"text": "caf'
+    (tmp_path / "docs.json").write_bytes(prefix + b'\xe9 in the morning"}]')
+
+    with pytest.raises(DatasetDecodeError) as caught:
+        ingest(tmp_path)
+
+    assert "docs.json is not valid utf-8" in str(caught.value)
+    assert caught.value.details["byte_offset"] == len(prefix)
+    assert caught.value.details["bad_bytes"] == "e9"
+    assert "--encoding" in (caught.value.hint or "")
+
+
 # --------------------------------------------------------------------------- #
 # Document bounds
 # --------------------------------------------------------------------------- #
@@ -616,6 +1002,67 @@ def test_split_pieces_end_at_a_boundary_rather_than_mid_word(tmp_path: Path) -> 
 
     for document in documents[:-1]:
         assert document.text.endswith(("\n", " ")), repr(document.text[-20:])
+
+
+def test_a_script_that_writes_without_spaces_is_cut_at_the_limit_itself(
+    tmp_path: Path,
+) -> None:
+    """Chinese, Japanese and Thai put no separator between words, and the cut lands anyway.
+
+    Every cut point is a search backwards for a paragraph break, then a line break,
+    then a space, and a script that uses none of those offers nothing to find. The
+    answer then is the limit itself -- the one case where a document is exactly
+    ``--max-doc-chars`` long, which is the deliberate contrast with
+    ``test_split_pieces_end_at_a_boundary_rather_than_mid_word`` just above, where
+    every piece is *shorter* than the limit because it ends on a boundary.
+
+    Cutting mid-word is the right outcome here and not a compromise: the model reads
+    a continuous token stream either way. Losing a character would not be, so the
+    pieces are rejoined and compared against the file. The offsets are checked in the
+    same breath because these characters are three bytes each in UTF-8, so a byte
+    offset that was really a character count would look correct on ASCII prose and be
+    wrong by a factor of three here.
+    """
+    payload = "\u6f22\u5b57" * 400
+    write(tmp_path / "cjk.txt", payload)
+
+    documents, stats = ingest(tmp_path, max_doc_chars=100)
+
+    assert "".join(document.text for document in documents) == payload
+    assert {len(document.text) for document in documents} == {100}
+    assert stats.documents_emitted == 8
+    assert [document.byte_offset for document in documents[:3]] == [0, 300, 600]
+
+
+def test_prose_on_one_long_line_is_cut_between_words(tmp_path: Path) -> None:
+    """The third separator, and the only one a corpus with no line breaks can offer.
+
+    A scraped page, a transcript, a column of a spreadsheet pasted into a file: text
+    with no paragraph break and no newline anywhere in it. ``_cut_point`` searches
+    for a paragraph break, then a line break, then a space, and only the last of
+    those is present here -- which makes this the one test where removing ``" "``
+    from that search fails. Measured before it existed: dropping the space from the
+    search left all 682 corpus-reading tests passing, because every other long-file
+    test has newlines in it and stops at the second separator.
+
+    A piece ends with the space it was cut after, so no word is split across two
+    documents -- a few characters short of the limit usually, and exactly at it when
+    a space happens to fall there.
+    ``test_a_script_that_writes_without_spaces_is_cut_at_the_limit_itself`` above is
+    the same function with nothing to find.
+    """
+    payload = "the quick brown fox jumps over the lazy dog and keeps running " * 40
+    write(tmp_path / "oneline.txt", payload)
+
+    documents, _ = ingest(tmp_path, max_doc_chars=200)
+
+    pieces = [document.text for document in documents]
+    assert "".join(pieces) == payload
+    assert len(pieces) > 3, "the corpus has to be cut more than once for this to mean anything"
+    assert all(piece.endswith(" ") for piece in pieces[:-1]), [piece[-12:] for piece in pieces[:-1]]
+    assert not any(piece.startswith(" ") for piece in pieces), "the space belongs to the piece"
+    assert all(len(piece) <= 200 for piece in pieces), max(len(piece) for piece in pieces)
+    assert any(len(piece) < 200 for piece in pieces[:-1]), "every cut landed on the limit"
 
 
 def test_byte_offsets_advance_through_the_file(tmp_path: Path) -> None:
@@ -731,6 +1178,24 @@ def test_a_tsv_is_split_on_tabs(tmp_path: Path) -> None:
     documents, _ = ingest(tmp_path)
 
     assert [document.text for document in documents] == ["prose, with a comma in it"]
+
+
+def test_every_extension_read_as_a_table_has_a_separator_of_its_own() -> None:
+    """Two tables decide this, and a suffix in one and not the other reads as commas.
+
+    ``CSV_SUFFIXES`` is what routes a file to the CSV reader, and
+    ``_CSV_DELIMITERS`` is what that reader splits it on. Adding ``.psv`` to the
+    first alone would send pipe-separated rows through ``csv.reader`` with a comma,
+    which does not fail: the header arrives as one column, and the refusal in
+    ``test_a_semicolon_file_called_csv_says_so_specifically`` then blames the file
+    for an omission here. The fallback comma in ``_csv_delimiter`` is unreachable
+    while these two agree, which is what its no-cover marker records.
+
+    One character each because ``csv.reader`` takes exactly one and raises on
+    anything longer, and it raises at read time -- on a corpus, not on a table.
+    """
+    assert set(ingest_module._CSV_DELIMITERS) == set(CSV_SUFFIXES)
+    assert all(len(delimiter) == 1 for delimiter in ingest_module._CSV_DELIMITERS.values())
 
 
 def test_a_gzipped_csv_reads_the_same(tmp_path: Path) -> None:
@@ -899,6 +1364,37 @@ def test_a_header_with_no_rows_is_not_an_error(tmp_path: Path) -> None:
     assert stats.files_read == 1
 
 
+@pytest.mark.parametrize(
+    ("label", "first_line"),
+    [
+        ("blank first line", ""),
+        ("delimiters and nothing else", ",,"),
+        ("column names that are only spaces", " , "),
+    ],
+    ids=["blank", "delimiters", "spaces"],
+)
+def test_a_csv_whose_first_line_names_no_columns_says_so(
+    tmp_path: Path, label: str, first_line: str
+) -> None:
+    """The mirror of test_a_header_with_no_rows_is_not_an_error: rows, and no header.
+
+    Zero rows is a number; zero column names is not, because --csv-text-column has
+    nothing to name and the reader would have to guess which field holds the prose.
+    All three shapes come out of real exports -- a leading blank line survives a
+    hand-edited file, and ``,,`` is what a spreadsheet writes for a first row inside
+    its used range but empty. The third is why the names are stripped before they
+    are counted rather than after: `` , `` is two fields, both of them nothing.
+    """
+    write(tmp_path / "hotels.csv", f"{first_line}\nid,review\n1,first row of prose\n")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path)
+
+    assert "has no header row" in str(caught.value), label
+    assert "must name the columns" in (caught.value.hint or "")
+    assert caught.value.details["path"] == "hotels.csv"
+
+
 def test_a_csv_column_holding_numbers_still_reads(tmp_path: Path) -> None:
     """Ingest does not judge. The corpus measurement is what catches this.
 
@@ -912,6 +1408,117 @@ def test_a_csv_column_holding_numbers_still_reads(tmp_path: Path) -> None:
     documents, _ = ingest(tmp_path, csv_text_column="temperature")
 
     assert len(documents) == 30
+
+
+# A table breaks in four ways, and each one is a separate handler in `_read_csv`
+# because the reader is asked for the header once and for rows in a loop. None of
+# them had ever run: a broken export got its error message from code no test had
+# executed, which is the worst place to find a typo in a byte offset.
+def test_an_empty_csv_is_zero_documents_rather_than_a_failure(tmp_path: Path) -> None:
+    """A file with no header at all, which is what an interrupted export leaves.
+
+    `StopIteration` from the reader's first `next` is the only signal a csv reader
+    gives for "there was nothing here", and it arrives at the same place a real read
+    would. One zero-byte file among a hundred good ones must not stop the run: it is
+    counted as read, contributes nothing, and the report states the zero. Compare
+    `test_a_header_with_no_rows_is_not_an_error`, which is the same answer one line
+    further in -- there the header exists and the rows do not.
+    """
+    (tmp_path / "rows.csv").write_bytes(b"")
+    write(tmp_path / "other.txt", "a wholly unrelated document\n")
+
+    documents, stats = ingest(tmp_path)
+
+    assert [document.location.split(":")[0] for document in documents] == ["other.txt"]
+    assert stats.files_read == 2, "the empty file was read, not skipped"
+    assert stats.documents_emitted == 1
+
+
+def test_a_csv_with_classic_mac_line_endings_stops_on_the_header(tmp_path: Path) -> None:
+    """A CR-only file is one enormous line to anything that splits on the newline byte.
+
+    Which is a real export rather than a curiosity: spreadsheets on Mac OS wrote CR
+    line terminators for fifteen years, and files from that era are still in
+    circulation and still being handed to tools like this one. The break lands on the
+    header, because the first row the reader is asked for is the entire file, so the
+    line it reports is 1 -- and the hint has to admit that the reported line is where
+    reading stopped rather than where the mistake is.
+    """
+    (tmp_path / "rows.csv").write_bytes(b"id,review\r1,first row of prose\r2,second row\r")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path, csv_text_column="review")
+
+    assert "could not be read as a table at line 1" in str(caught.value)
+    assert caught.value.details["line"] == 1
+    assert "new-line character" in caught.value.details["reason"]
+    assert "Re-export the file" in (caught.value.hint or "")
+
+
+def test_a_stray_carriage_return_in_one_row_names_that_row(tmp_path: Path) -> None:
+    """The same break on a data row, where the line number is one a user can look at.
+
+    A field pasted in from something that used CR terminators, in a file that is
+    otherwise ordinary. This is the second of the two `csv.Error` handlers, and the
+    only one whose line number is worth anything: line 3 is the row to go and fix.
+    """
+    (tmp_path / "rows.csv").write_bytes(
+        b"id,review\n1,first row of prose\n2,broken\rrow\n3,third row of prose\n"
+    )
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(tmp_path, csv_text_column="review")
+
+    assert "at line 3" in str(caught.value)
+    assert caught.value.details["line"] == 3
+
+
+def test_a_latin1_byte_in_a_csv_is_reported_at_its_offset_in_the_file(tmp_path: Path) -> None:
+    """The fourth handler: the bytes are not utf-8, and the offset must be absolute.
+
+    A table exported as latin-1 -- one accented word is enough -- reaches the decoder
+    one line at a time, so the only offset the exception carries is an offset *into
+    that line*. Adding the bytes consumed so far is what turns it into something a
+    person can find with a hex editor, and getting that arithmetic wrong produces a
+    number that is plausible, wrong, and silent.
+
+    The row before the bad one is deliberately valid utf-8 *and* not ASCII, because
+    that is the only shape of file that can tell the two mistakes apart: counting the
+    decoded line rather than the raw bytes gives 35 here and gives the right answer on
+    every all-ASCII file anyone would think to write a test with.
+    """
+    (tmp_path / "rows.csv").write_bytes(
+        b"id,review\n1,caf\xc3\xa9 by the river\n2,caf\xe9 in the morning\n"
+    )
+
+    with pytest.raises(DatasetDecodeError) as caught:
+        ingest(tmp_path, csv_text_column="review")
+
+    assert "byte 36 begins the invalid sequence e9" in str(caught.value)
+    assert caught.value.details["byte_offset"] == 36
+    assert caught.value.details["bad_bytes"] == "e9"
+
+
+def test_skipping_an_undecodable_csv_keeps_the_rows_that_came_before_it(tmp_path: Path) -> None:
+    """`on_error="skip"` on a table that fails mid-file, which is not all-or-nothing.
+
+    Rows are emitted as they are read, so the row before the bad byte is already a
+    document by the time the failure arrives, and nothing rewinds it. The file is
+    counted as skipped *and* has contributed -- a pair of numbers that looks
+    contradictory in the report and is the honest description of a streaming read.
+    Pinned deliberately: whichever way this is decided it should be decided on
+    purpose, and a later change that starts discarding the partial rows should have
+    to come here and say so.
+    """
+    (tmp_path / "rows.csv").write_bytes(
+        b"id,review\n1,first row of prose\n2,caf\xe9 in the morning\n"
+    )
+
+    documents, stats = ingest(tmp_path, csv_text_column="review", on_error="skip")
+
+    assert [document.text for document in documents] == ["first row of prose"]
+    assert stats.files_skipped == 1
+    assert stats.documents_emitted == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1202,26 +1809,199 @@ def test_a_member_size_is_what_it_unpacks_to(tmp_path: Path) -> None:
     assert sources[0].size_bytes > path.stat().st_size
 
 
-def test_the_archive_is_closed_when_the_document_stream_ends(tmp_path: Path) -> None:
+def recorded_archives(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Every archive opened from here on, so a test can assert each one was closed.
+
+    The two tests below used to prove this with ``path.unlink()`` alone, which raises
+    ``PermissionError`` on Windows while a handle is open. That is a real proof --
+    on Windows. On Linux unlinking an open file is ordinary, so the same test passed
+    whether or not the handle leaked, and half the CI matrix was asserting nothing.
+    ``ZipFile.close`` clears ``fp`` and ``TarFile.close`` sets ``closed``, so the
+    state is readable on every platform.
+
+    Zip is recorded by subclassing, so ``isinstance`` and the error classes are
+    unaffected. Tar is recorded by wrapping ``tarfile.open`` rather than ``TarFile``:
+    ``tarfile.open`` is a bound classmethod of the real class, captured at import, so
+    replacing ``tarfile.TarFile`` would record nothing at all.
+    """
+    opened: list[Any] = []
+    real_zipfile = zipfile.ZipFile
+    real_tar_open = tarfile.open
+
+    class RecordedZip(real_zipfile):  # type: ignore[misc,valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    def recorded_tar_open(*args: Any, **kwargs: Any) -> Any:
+        archive = real_tar_open(*args, **kwargs)
+        opened.append(archive)
+        return archive
+
+    monkeypatch.setattr(zipfile, "ZipFile", RecordedZip)
+    monkeypatch.setattr(tarfile, "open", recorded_tar_open)
+    return opened
+
+
+def still_open(archive: Any) -> bool:
+    """Whether one recorded archive still holds its handle."""
+    if isinstance(archive, tarfile.TarFile):
+        return not archive.closed
+    return archive.fp is not None
+
+
+def assert_all_closed(opened: list[Any]) -> None:
+    """Every recorded archive is closed, and there was at least one to check."""
+    assert opened, "no archive was opened, so this test proves nothing"
+    leaked = [archive for archive in opened if still_open(archive)]
+    assert leaked == [], f"{len(leaked)} of {len(opened)} archives were left open"
+
+
+def test_the_archive_is_closed_when_the_document_stream_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On Windows an open handle blocks deleting the file, so this is load-bearing."""
     path = zip_of(tmp_path / "papers.zip", [("a.txt", "one\n"), ("b.txt", "two\n")])
     ingestor = Ingestor()
+    opened = recorded_archives(monkeypatch)
 
     list(ingestor.documents(ingestor.discover(path)))
 
+    assert_all_closed(opened)
     path.unlink()  # PermissionError on Windows if a handle is still open
 
 
-def test_abandoning_the_document_stream_still_closes_the_archive(tmp_path: Path) -> None:
+def test_abandoning_the_document_stream_still_closes_the_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A caller that stops early -- sampling does -- must not leak a handle."""
     path = zip_of(tmp_path / "papers.zip", [("a.txt", "one\n"), ("b.txt", "two\n")])
     ingestor = Ingestor()
+    opened = recorded_archives(monkeypatch)
 
     stream = ingestor.documents(ingestor.discover(path))
     next(stream)
     stream.close()
 
+    assert_all_closed(opened)
     path.unlink()
+
+
+def test_a_tar_is_closed_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other container. ``_close_archive`` is shared, and that is worth pinning."""
+    path = tar_of(tmp_path / "papers.tar", [("a.txt", "one\n"), ("b.txt", "two\n")])
+    ingestor = Ingestor()
+    opened = recorded_archives(monkeypatch)
+
+    list(ingestor.documents(ingestor.discover(path)))
+
+    assert_all_closed(opened)
+    path.unlink()
+
+
+# An archive is listed once and read later, and everything between those two moments
+# is a window in which the file on disk can change. Three handlers translate what
+# comes back through that window -- one for reopening the container, one for a zip
+# member, one for a tar member -- and none of them had ever run, so the message a
+# user gets for a corpus that moved under them came from code no test had executed.
+# All three are reached the way a user reaches them: by changing the file between
+# `discover` and `documents`, which is a real sequence rather than a patched one.
+def test_an_archive_that_stopped_being_an_archive_is_named_rather_than_re_raised(
+    tmp_path: Path,
+) -> None:
+    """The container reopens for reading, and by then it is not a container.
+
+    `test_a_corrupt_archive_says_so_instead_of_raising_zipfile_errors` is the same
+    damaged file met at the other end of the window: discovery has its own handler,
+    its own message, and its own reason to exist. This one cannot borrow that message,
+    because by the time reading starts the archive was already listed successfully --
+    "check the file downloaded completely" is wrong advice for a file that parsed a
+    moment ago. The advice here is to re-run, and the sentence says the archive may
+    have been *replaced*, because that is what a synced or rebuilt corpus does.
+
+    A rebuild is the ordinary cause: a directory being written by another process
+    while TrainAI walks it, or a download that replaces the file in place. What must
+    not happen is a raw `zipfile.BadZipFile` reaching the caller, which is neither the
+    type the CLI catches to print a hint nor a sentence that names the member.
+    """
+    path = zip_of(tmp_path / "papers.zip", [("a.txt", "the first paper\n")])
+    ingestor = Ingestor()
+    sources = ingestor.discover(path)
+    path.write_bytes(b"not a zip any more, and not a paper either")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        list(ingestor.documents(sources))
+
+    assert "papers.zip::a.txt could not be read from the archive" in str(caught.value)
+    assert "replaced or truncated" in (caught.value.hint or "")
+    assert caught.value.details["member"] == "a.txt"
+    assert caught.value.details["path"] == "papers.zip::a.txt"
+    assert caught.value.details["reason"], "the underlying zipfile complaint is dropped"
+
+
+@pytest.mark.parametrize("kind", ["zip", "tar"], ids=["zip", "tar"])
+def test_a_member_that_is_gone_from_a_rebuilt_archive_names_the_member(
+    tmp_path: Path, kind: str
+) -> None:
+    """The archive still opens, and the member listed a moment ago is not in it.
+
+    A rebuild that dropped a file, rather than a rebuild that produced garbage: the
+    container is valid, so the failure lands one step further in than the test above,
+    on the call that opens the member. The two containers reach it through different
+    exceptions -- ``KeyError`` from ``ZipFile.open``, ``KeyError`` from
+    ``TarFile.getmember`` inside ``extractfile`` -- and they are two separate handlers
+    listing two disjoint sets of exception types, which is why this runs twice rather
+    than picking whichever one was convenient.
+
+    Both members are still in the rebuilt archive except the one being read, so the
+    run gets as far as opening a member at all; an archive rebuilt empty would fail
+    the same way for the less interesting reason that there is nothing in it.
+    """
+    build = zip_of if kind == "zip" else tar_of
+    path = build(
+        tmp_path / f"papers.{kind}", [("a.txt", "the first paper\n"), ("b.txt", "the second\n")]
+    )
+    ingestor = Ingestor()
+    sources = ingestor.discover(path)
+    assert [source.member for source in sources] == ["a.txt", "b.txt"]
+    build(path, [("b.txt", "the second\n")])
+
+    with pytest.raises(DatasetFormatError) as caught:
+        list(ingestor.documents(sources))
+
+    assert f"papers.{kind}::a.txt could not be read from the archive" in str(caught.value)
+    assert "Re-run to list it again" in (caught.value.hint or "")
+    assert caught.value.details["member"] == "a.txt"
+    assert "a.txt" in caught.value.details["reason"]
+
+
+def test_an_archive_that_moved_under_the_reader_is_fatal_even_under_on_error_skip(
+    tmp_path: Path,
+) -> None:
+    """The one thing ``--on-error skip`` is not allowed to hide, and why.
+
+    Skip exists for a corpus with bad files in it, and this is not that: the file was
+    readable when it was listed, so whatever is happening is happening *now*, to the
+    tree being read. Every source after this one was listed from the same archive, so
+    continuing would skip one member and then read the rest through a container that
+    is already known to be wrong -- reporting a corpus size, a checksum and a success
+    for a dataset that was never on disk in that shape.
+
+    `_read` and `documents` both narrow what they catch to make this true, so the
+    assertion is on the counters as much as on the exception: nothing was recorded as
+    skipped on the way out.
+    """
+    path = zip_of(tmp_path / "papers.zip", [("a.txt", "the first paper\n"), ("b.txt", "second\n")])
+    ingestor = Ingestor(IngestOptions(on_error="skip"))
+    sources = ingestor.discover(path)
+    path.write_bytes(b"not a zip any more")
+
+    with pytest.raises(DatasetFormatError):
+        list(ingestor.documents(sources))
+
+    assert ingestor.stats.files_skipped == 0
+    assert ingestor.stats.skipped_files == []
+    assert ingestor.stats.files_read == 0
 
 
 def test_a_plain_directory_gains_no_archive_counters(tmp_path: Path) -> None:
@@ -1474,6 +2254,9 @@ _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
 _MAIN_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+# Two of the three relationships Word writes into ``_rels/.rels`` beside the main one.
+_CORE_REL = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties"
+_APP_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties"
 
 
 def para(*runs: str) -> str:
@@ -1482,11 +2265,25 @@ def para(*runs: str) -> str:
     return f"<w:p>{inner}</w:p>"
 
 
+def relationship(target: str, *, kind: str = _MAIN_REL, rid: str = "rId1") -> str:
+    return f'<Relationship Id="{rid}" Type="{kind}" Target="{target}"/>'
+
+
+def relationships(*declared: str) -> str:
+    """A whole ``_rels/.rels`` part, from the declarations it should hold."""
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{_PKG}">'
+        + "".join(declared)
+        + "</Relationships>"
+    )
+
+
 def docx(
     path: Path,
     body: str,
     *,
     main_part: str = "word/document.xml",
+    rels: str | None = None,
 ) -> Path:
     """A minimal package with the same shape as one Word writes."""
     document = (
@@ -1498,16 +2295,34 @@ def docx(
         'openxmlformats.org/package/2006/content-types"><Default Extension="xml" '
         'ContentType="application/xml"/></Types>'
     )
-    rels = (
-        f'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{_PKG}">'
-        f'<Relationship Id="rId1" Type="{_MAIN_REL}" Target="{main_part}"/></Relationships>'
-    )
     path.parent.mkdir(parents=True, exist_ok=True)
+    declared = relationships(relationship(main_part)) if rels is None else rels
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
         package.writestr("[Content_Types].xml", types)
-        package.writestr("_rels/.rels", rels)
+        package.writestr("_rels/.rels", declared)
         package.writestr(main_part, document)
     return path
+
+
+def _damage_member(path: Path, member: str, count: int = 8) -> None:
+    """Flip bytes inside one member's compressed data, leaving every header valid.
+
+    So the package still opens and still lists its contents; only decompressing
+    that one member fails, which is what a damaged download of a real ``.docx``
+    looks like from ``zipfile``'s side.
+    """
+    raw = bytearray(path.read_bytes())
+    at = 0
+    while True:
+        at = raw.index(b"PK\x03\x04", at)
+        name_length, extra_length = struct.unpack_from("<HH", raw, at + 26)
+        data = at + 30 + name_length + extra_length
+        if bytes(raw[at + 30 : at + 30 + name_length]) == member.encode():
+            break
+        at = data
+    for index in range(data, data + count):
+        raw[index] ^= 0xFF
+    path.write_bytes(bytes(raw))
 
 
 def test_a_word_document_yields_its_paragraphs(tmp_path: Path) -> None:
@@ -1673,6 +2488,142 @@ def test_the_main_part_may_be_named_by_the_relationships(tmp_path: Path) -> None
     documents, _ = ingest(path)
 
     assert [d.text for d in documents] == ["Named elsewhere."]
+
+
+def test_the_main_relationship_is_found_among_the_ones_word_writes_beside_it(
+    tmp_path: Path,
+) -> None:
+    """A real ``_rels/.rels`` holds three or four declarations, not one.
+
+    Word writes core properties and extended properties in there too, and nothing
+    fixes the order, so the main one has to be searched for rather than read off
+    the front. The fixture above declares only the main relationship, which cannot
+    tell a search from a look at the first element; this one puts it last.
+    """
+    path = docx(
+        tmp_path / "a.docx",
+        para("Found past its siblings."),
+        main_part="word/main.xml",
+        rels=relationships(
+            relationship("docProps/core.xml", kind=_CORE_REL, rid="rId2"),
+            relationship("docProps/app.xml", kind=_APP_REL, rid="rId3"),
+            relationship("word/main.xml"),
+        ),
+    )
+
+    documents, _ = ingest(path)
+
+    assert [d.text for d in documents] == ["Found past its siblings."]
+
+
+def test_a_declared_target_may_begin_with_a_slash(tmp_path: Path) -> None:
+    """A package-root-relative target, which OPC permits and some producers write.
+
+    The leading slash means "from the root of the package", which is where these
+    names are resolved from regardless -- so it is stripped rather than resolved.
+    Nothing is ever extracted, so there is no filesystem path here for the slash to
+    turn absolute; the name is only ever looked up in the package's own namelist.
+    """
+    path = docx(
+        tmp_path / "rooted.docx",
+        para("Named from the root."),
+        main_part="word/main.xml",
+        rels=relationships(relationship("/word/main.xml")),
+    )
+
+    documents, _ = ingest(path)
+
+    assert [d.text for d in documents] == ["Named from the root."]
+
+
+def test_a_relationship_naming_a_part_that_is_not_there_is_not_followed(tmp_path: Path) -> None:
+    """A declared name is a claim about the package, and it is checked against it.
+
+    Handing the name back unchecked would not produce a worse message, it would
+    produce no message: ``_docx_main_part`` looks the name up with ``getinfo``
+    outside any handler, so the run would end on a bare ``KeyError`` naming a part
+    the user never heard of. Refusing on the parts that *are* there is the same
+    answer a zip of text files gets from
+    test_a_zip_renamed_to_docx_names_what_it_holds_instead.
+    """
+    path = docx(
+        tmp_path / "dangling.docx",
+        para("Unreachable."),
+        main_part="word/main.xml",
+        rels=relationships(relationship("word/document2.xml")),
+    )
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(path)
+
+    assert "no word/document.xml part" in str(caught.value)
+    assert "word/main.xml" in (caught.value.hint or ""), "the parts it does hold are listed"
+    assert "word/document2.xml" not in str(caught.value), (
+        "the name it could not use is not the error"
+    )
+
+
+def test_a_relationships_part_over_its_ceiling_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The part is a handful of lines, and a zip can declare any size it likes.
+
+    Lowering the ceiling rather than writing a real megabyte of XML: at the true
+    1 MiB the fixture would be testing how well ``zipfile`` deflates padding. Both
+    halves are read here because the refusal is the same one a package with no
+    usable declaration gets, so only the pair shows the ceiling caused it.
+    """
+    path = docx(tmp_path / "a.docx", para("Named elsewhere."), main_part="word/main.xml")
+
+    documents, _ = ingest(path)
+    assert [d.text for d in documents] == ["Named elsewhere."]
+
+    monkeypatch.setattr(ingest_module, "_DOCX_MAX_RELATIONSHIPS_BYTES", 16)
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(path)
+
+    assert "no word/document.xml part" in str(caught.value)
+
+
+def test_a_damaged_relationships_part_is_not_a_name_either(tmp_path: Path) -> None:
+    """Reading a member decompresses it, so this needs a codec's errors too.
+
+    Measured before the handler was widened: eight bytes flipped inside this
+    member's deflate stream ended the run with a ``zlib.error`` traceback, because
+    the handler named ``EOFError`` and ``OSError`` and ``zlib.error`` is neither.
+    ``_CORRUPT_STREAM_ERRORS`` exists for exactly that -- see
+    test_a_corrupt_compressed_corpus_is_a_clean_error, which is the same class of
+    bug one layer out -- and the three ``.docx`` handlers had hand-written tuples.
+    """
+    path = docx(tmp_path / "torn-rels.docx", para("Unreachable."), main_part="word/main.xml")
+    _damage_member(path, "_rels/.rels")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(path)
+
+    assert "no word/document.xml part" in str(caught.value)
+
+
+def test_a_damaged_document_part_says_so_rather_than_ending_the_run(tmp_path: Path) -> None:
+    """The same widening, on the part that holds the prose.
+
+    This is the one that matters in practice, because it is the ordinary shape of a
+    damaged download: the package opens, lists its contents, and fails on the one
+    member being read. A plain file on disk is deliberately outside ``_read``'s
+    corrupt-stream wrapper -- see
+    test_an_io_failure_on_a_plain_file_is_not_called_corruption -- so nothing else
+    was going to catch it, and the compression here is inside the package anyway
+    rather than around it.
+    """
+    path = docx(tmp_path / "torn.docx", "".join(para(f"paragraph {n}") for n in range(60)))
+    _damage_member(path, "word/document.xml")
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(path)
+
+    assert "lists word/document.xml but it could not be read" in str(caught.value)
+    assert caught.value.details["part"] == "word/document.xml"
+    assert "Re-download it." in (caught.value.hint or "")
 
 
 def test_a_legacy_doc_renamed_to_docx_says_so(tmp_path: Path) -> None:
@@ -2347,6 +3298,69 @@ def test_a_right_header_over_a_broken_body_passes_sqlites_own_words_on(tmp_path:
     assert caught.value.details["reason"] == "file is not a database"
 
 
+def test_a_database_damaged_past_its_catalogue_fails_on_the_rows(tmp_path: Path) -> None:
+    """Damage that page one survives, which is the shape bit rot actually takes.
+
+    The test above is damaged from byte sixteen onward, so nothing about it reads --
+    the catalogue query is the first statement and the first failure. A database
+    whose schema page is intact and whose *row* pages are not gets all the way to
+    the read: measured, ``sqlite_master`` returned the table, ``PRAGMA table_info``
+    returned its column, and the ``SELECT`` raised "database disk image is
+    malformed". So this is a second handler rather than the same one again, and
+    without it the run would end on a bare ``sqlite3.DatabaseError``.
+
+    2,000 rows because the damage has to land on a page the schema does not need;
+    at 4 KiB a page, that is a file of about sixty.
+    """
+    path = db(
+        tmp_path / "posts.db",
+        ["CREATE TABLE posts (body TEXT)"],
+        {"posts": [(f"row {number} {'padding ' * 12}",) for number in range(2000)]},
+    )
+    raw = bytearray(path.read_bytes())
+    assert len(raw) > 40 * 4096, "the table has to span pages for this to mean anything"
+    for offset in range(20 * 4096, 20 * 4096 + 600):
+        raw[offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        ingest(path)
+
+    assert "could not be read as a database" in str(caught.value)
+    assert caught.value.details["reason"] == "database disk image is malformed"
+    assert "truncated or damaged" in (caught.value.hint or "")
+
+
+def test_a_database_another_program_holds_open_says_that_is_what_happened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pointing TrainAI at the live database of something that is running.
+
+    The likeliest way a perfectly good database refuses to be read, and the hint
+    promises a specific sentence about it -- so the promise is checked here rather
+    than left to be true by inspection. Read-only is not enough on its own: a reader
+    still takes a shared lock, and an open write transaction excludes it.
+
+    The timeout is lowered because the wait is the thing being skipped, not the thing
+    being tested; at the real two seconds this test would spend them.
+    """
+    monkeypatch.setattr(ingest_module, "_SQLITE_TIMEOUT_SECONDS", 0.05)
+    path = db(tmp_path / "posts.db", ["CREATE TABLE posts (body TEXT)"], {"posts": [("first",)]})
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+
+        with pytest.raises(DatasetFormatError) as caught:
+            ingest(path)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert caught.value.details["reason"] == "database is locked"
+    assert "another program holds a write transaction open" in (caught.value.hint or "")
+    assert "never writes to it" in (caught.value.hint or "")
+
+
 def test_a_walk_reads_a_real_database_and_names_the_one_that_is_not(tmp_path: Path) -> None:
     """The conservative half of the rule: a stray ``Thumbs.db`` must not fail the run.
 
@@ -2740,6 +3754,36 @@ def test_an_absent_codec_does_not_stop_an_uncompressed_corpus(
     assert len(documents) == 1
 
 
+def test_every_compression_the_reader_names_is_wired_to_a_module() -> None:
+    """A codec added to ``Compression`` and nowhere else fails as the wrong thing.
+
+    ``_compression_opener`` reads a ``None`` from ``_codec_module`` as "this
+    interpreter was built without that codec" and raises the message the two tests
+    above assert on -- naming a system library and telling the user to rebuild
+    Python. For a codec that was simply never wired up, that message is a confident
+    claim about the user's machine and it is false.
+
+    Compared against the module global of the same name rather than against a list
+    written out here, so it holds on an interpreter genuinely missing one: both
+    sides are ``None`` then. Read from ``get_args(Compression)`` for the same
+    reason ``BOM_CODECS`` is read from ``_BOMS`` -- adding a member has to fail
+    here rather than be silently untested. ``"none"`` is the one that must map to
+    nothing, which is also the only call that reaches the end of the if-chain.
+    """
+    named = get_args(Compression)
+
+    assert "none" in named, "the absence of compression is one of the values"
+    for compression in named:
+        module = ingest_module._codec_module(compression)
+        if compression == "none":
+            assert module is None, "nothing to decompress is not a missing codec"
+        else:
+            assert module is getattr(ingest_module, compression, "no such global"), (
+                f"{compression!r} is named in Compression, but _codec_module does not "
+                f"return the module named {compression!r}"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Compressed corpora that are corrupt or truncated
 # --------------------------------------------------------------------------- #
@@ -2920,3 +3964,92 @@ def test_max_doc_chars_cuts_exactly_the_kinds_that_say_they_are_cut(
         assert "".join(document.text for document in lowered) == CUTTABLE_TEXT, (
             "cutting must divide the text, not sample it"
         )
+
+
+# --------------------------------------------------------------------------- #
+# The member stream itself
+#
+# Every reader in this module drives _MemberStream through read() or through
+# iteration, so a coverage trace of the suite reports read1 as never having run and
+# the class looks like it has a spare method. It does not. read1 is the one
+# BufferedIOBase leaves unimplemented -- the base class raises
+# io.UnsupportedOperation -- and it is what io.TextIOWrapper calls to read a line.
+# These tests pin the two promises the class makes that nothing else reaches: that a
+# member is usable as a normal buffered stream, and that closing it closes what it
+# was layered on, innermost first.
+# --------------------------------------------------------------------------- #
+def test_a_member_can_be_read_line_by_line_through_a_text_wrapper() -> None:
+    """The reason ``read1`` exists, and why deleting it would look safe.
+
+    ``TextIOWrapper.read()`` goes to ``read()``, so a test that reads a member whole
+    proves nothing about ``read1``. ``readline`` and iteration go to ``read1(8192)``
+    instead, and with ``read1`` removed this raises ``io.UnsupportedOperation: read1``
+    rather than returning short data -- measured, not assumed.
+
+    Nothing in this module wraps a member in a ``TextIOWrapper`` today: ``_read_text``
+    deliberately uses an incremental decoder so that a decode failure keeps its byte
+    offset. That is exactly what makes the method fragile. It is a public promise of
+    the ``BufferedIOBase`` it subclasses, with no caller in the tree to notice if it
+    disappears, which is precisely the shape of thing a dead-code sweep deletes.
+    """
+    stream = _MemberStream(io.BytesIO(b"line one\nline two\n"))
+
+    with io.TextIOWrapper(stream, encoding="utf-8") as text:
+        assert list(text) == ["line one\n", "line two\n"]
+
+
+def test_closing_a_member_closes_what_it_was_layered_on_innermost_first() -> None:
+    """A member whose own name carries a codec is two streams, and both must go.
+
+    ``_open`` builds ``_MemberStream(gzip_over_member, member)`` for something like
+    ``papers.zip/a.jsonl.gz``. If only the outermost is closed the zip member's
+    handle stays open, and the archive it belongs to cannot be replaced on Windows
+    while any member handle is live -- the failure lands on a later run, in a
+    different command, as a permission error on a file this one is finished with.
+
+    The order is the class's other claim: ``_stream``, then the owned layers in
+    reverse of the order given, so a layer is never asked to finish its work through
+    a stream that has already gone. A third recorder is passed because ``_owned`` is
+    variadic and one entry cannot tell ``reversed`` from a no-op -- the call site has
+    one layer today, and the reversal is only a promise if something proves it.
+    """
+    closed: list[str] = []
+
+    class Recorder(io.BytesIO):
+        def __init__(self, label: str) -> None:
+            super().__init__(b"")
+            self._label = label
+
+        def close(self) -> None:
+            closed.append(self._label)
+            super().close()
+
+    codec, member, deeper = Recorder("codec"), Recorder("member"), Recorder("deeper")
+
+    _MemberStream(codec, member, deeper).close()
+
+    assert closed == ["codec", "deeper", "member"]
+
+
+def test_a_member_stream_reports_the_whole_member_for_a_sizeless_read() -> None:
+    """A sizeless read means "the rest", and 40 kB is more than one buffer.
+
+    Several readers here take a fixed block and stop, so a ``read`` or ``read1`` that
+    silently returned one buffer's worth would truncate a document rather than fail.
+    The payload is larger than the 8 kB chunk ``TextIOWrapper`` asks ``read1`` for,
+    which is the size such a mistake would most plausibly be.
+
+    The ``read(None)`` line is documentation, not a gate, and the difference is worth
+    being explicit about: ``io.BufferedIOBase.read`` accepts ``None``, so this class
+    normalises it, but measured against ``gzip.GzipFile``, ``zipfile.ZipExtFile`` and
+    ``tarfile``'s buffered reader -- every stream ``_open`` can wrap -- all three
+    accept ``None`` themselves. Removing the normalisation therefore breaks nothing
+    that can actually reach it, and no test can honestly claim otherwise.
+    """
+    payload = b"x" * 40_000
+
+    assert _MemberStream(io.BytesIO(payload)).read() == payload
+    assert _MemberStream(io.BytesIO(payload)).read1() == payload
+    assert _MemberStream(io.BytesIO(payload)).read(10) == payload[:10]
+    assert _MemberStream(io.BytesIO(payload)).read(None) == payload
+    assert _MemberStream(io.BytesIO(payload)).readable() is True

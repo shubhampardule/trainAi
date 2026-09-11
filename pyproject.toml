@@ -99,10 +99,16 @@ packages = ["src/trainai"]
 # ships a test suite that cannot pass. The corpora in `examples/` are gitignored and
 # hatchling honours that, so this stays small.
 #
-# Verified rather than assumed: the sdist was unpacked into a clean virtualenv with
-# the wheel installed and `pytest -m "not gpu"` run from it -- 1900 passed, 55
-# skipped, and every skip names its own reason (no git checkout, or `transformers`
-# absent). Re-check this after adding a test that reads a file from the repo root.
+# Verified rather than assumed, and no longer only by hand: the sdist is unpacked,
+# the wheel installed alongside it, and `pytest -m "not gpu"` run from the unpacked
+# copy -- on every tag and on every manual dispatch of
+# `.github/workflows/release.yml`. The first run of that job on a hosted runner
+# reported 2354 passed, 62 skipped, 14 deselected, and every skip named its own
+# reason: 46 of them are `git check-ignore` and `git check-attr` being unusable
+# because an unpacked sdist is not a repository, and the rest are the absence of a
+# CUDA device, of `.github/`, and of `transformers`. A check performed once is a
+# claim with a date on it, which is why this stopped being a note asking the next
+# person to redo it.
 include = [
     "src/trainai",
     "tests",

@@ -276,6 +276,154 @@ def test_an_out_of_memory_runtime_error_is_recognised_by_its_text(
     assert result.verdict == "out-of-memory"
 
 
+def test_the_allocators_own_out_of_memory_error_is_recognised_by_its_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA's exhaustion has its own class, and it is caught before the text is read.
+
+    ``torch.cuda.OutOfMemoryError`` is a ``RuntimeError``, so the handler above it in the
+    source has to come first or it never runs -- and the two produce different sentences,
+    the allocator's naming the allocator. The class exists without a GPU, which is what
+    lets this be proved here rather than only on hardware that can really run out.
+    """
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 GiB")
+
+    monkeypatch.setattr("trainai.hardware.benchmark.GPT", explode)
+
+    result = measure_candidate(SMALL, batch_size=1, grad_accum=1, seq_len=32, device=CPU)
+
+    assert result.ok is False
+    assert result.verdict == "out-of-memory"
+    assert result.detail.startswith("The allocator ran out of memory: ")
+    assert "20.00 GiB" in result.detail
+
+
+def test_a_fault_that_is_not_a_runtime_error_still_comes_back_as_a_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last handler, for everything the first two do not name.
+
+    A ``RuntimeError`` is what torch raises; a ``ValueError`` or a ``TypeError`` is what a
+    bug in the model or the shape arithmetic raises, and the search must not abort on
+    either. The class name is in the detail because "error" alone tells the reader
+    nothing about which of those it was.
+    """
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("head_dim 33 is not a multiple of 8")
+
+    monkeypatch.setattr("trainai.hardware.benchmark.GPT", explode)
+
+    result = measure_candidate(SMALL, batch_size=1, grad_accum=1, seq_len=32, device=CPU)
+
+    assert result.ok is False
+    assert result.verdict == VERDICT_ERROR
+    assert result.detail == "ValueError: head_dim 33 is not a multiple of 8"
+    assert result.steps_measured == 0
+
+
+def test_the_fp16_step_goes_through_the_scaler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The four scaler calls, on the one path a CPU never resolves to on its own.
+
+    fp16 needs a loss scaler or the gradients underflow to zero, so the step the benchmark
+    times has to be the scaled one -- ``scale`` before ``backward``, ``unscale_`` before
+    the clip, then ``step`` and ``update`` in place of the optimizer's own step. A
+    benchmark that skipped any of them would time a different step from the one the
+    trainer runs, and the throughput it predicts would be for a run that does not exist.
+
+    ``resolve_precision`` is replaced rather than asked, because on this device it answers
+    fp32 without a scaler and nothing else here can change that. The dtype stays fp32:
+    what is under test is the scaler's four calls, and ``GradScaler`` runs them on the CPU
+    since torch 2.3. ``update`` is pinned through the scale itself -- ``get_scale`` grows
+    after ``growth_interval`` clean steps, and the test runs exactly that many.
+
+    ``unscale_`` is the call the others cannot vouch for. ``step`` unscales on its own if
+    nobody has, so the scale grows and the run succeeds with the call deleted -- the gate
+    found exactly that -- and the only thing that changes is what the clip saw: gradients
+    still multiplied by the scale, clipped to a norm of 1 as though they were real. On
+    this model the real norm is a little over 1; scaled it is a little over 1,000. The
+    norm the clip reports is recorded, and it has to be the small one.
+    """
+    from torch import nn
+    from torch.amp import GradScaler
+
+    monkeypatch.setattr(
+        "trainai.hardware.benchmark.resolve_precision",
+        lambda requested, device: (torch.float32, True, "fp16 (scaled)"),
+    )
+    scalers: list[GradScaler] = []
+    real_scaler = GradScaler
+    init_scale = 1024.0
+
+    def recording(device_type: str) -> GradScaler:
+        # growth_interval of 3: warmup + measure steps below make exactly three updates,
+        # so the scale doubles once -- if and only if `update` ran after every step.
+        scaler = real_scaler(device_type, init_scale=init_scale, growth_interval=3)
+        scalers.append(scaler)
+        return scaler
+
+    monkeypatch.setattr(torch.amp, "GradScaler", recording)
+
+    norms_clipped: list[float] = []
+    real_clip = nn.utils.clip_grad_norm_
+
+    def watching_clip(parameters: Any, max_norm: float, *args: Any, **kwargs: Any) -> Any:
+        total = real_clip(parameters, max_norm, *args, **kwargs)
+        norms_clipped.append(float(total))
+        return total
+
+    monkeypatch.setattr(nn.utils, "clip_grad_norm_", watching_clip)
+
+    result = measure_candidate(
+        SMALL, batch_size=2, grad_accum=2, seq_len=32, device=CPU, warmup_steps=1, measure_steps=2
+    )
+
+    assert result.ok, result.detail
+    assert result.precision == "fp16 (scaled)"
+    assert len(scalers) == 1, "one scaler per candidate"
+    assert scalers[0].get_scale() == 2 * init_scale, "update did not run once per step"
+    assert len(norms_clipped) == 3, "one clip per step, warmup included"
+    assert max(norms_clipped) < init_scale / 10, (
+        f"the clip saw scaled gradients: norms {norms_clipped} against a scale of {init_scale}"
+    )
+
+
+def test_allocator_retries_reject_a_candidate_that_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step finished, the peak was under budget, and the answer is still no.
+
+    ``num_alloc_retries`` counts the times the allocator had to free its cache and ask the
+    driver again. A run that completes only by doing that has no headroom: the first
+    fragmentation, or the first other process on the GPU, and it fails in hour three. The
+    counter is a difference -- what it read after the measured steps minus what it read
+    before them -- so the fake answers a rising sequence, and the rejection has to name
+    the difference, not the raw count.
+
+    Only the count is faked. The steps are real CPU steps, and the result keeps every
+    measured number: a rejection that threw the timing away would leave the planner with
+    a no and nothing to compare it against.
+    """
+    from trainai.hardware.benchmark import VERDICT_ALLOCATOR_PRESSURE
+
+    readings = iter([7, 10])
+    monkeypatch.setattr("trainai.hardware.benchmark._alloc_retries", lambda device: next(readings))
+
+    result = measure_candidate(
+        SMALL, batch_size=2, grad_accum=1, seq_len=32, device=CPU, warmup_steps=1, measure_steps=2
+    )
+
+    assert result.ok is False
+    assert result.verdict == VERDICT_ALLOCATOR_PRESSURE
+    assert result.alloc_retries == 3, "the difference between the two readings, not the raw count"
+    assert "retry 3 time(s) in 2 steps" in result.detail
+    assert "no headroom" in result.detail
+    assert result.tokens_per_second > 0, "the measured numbers are kept alongside the no"
+    assert result.steps_measured == 2
+
+
 def test_measurement_is_repeatable_enough_to_compare_candidates() -> None:
     """Not bitwise -- timings vary. But the same shape must not swing by an order."""
     runs = [

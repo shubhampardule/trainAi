@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +27,7 @@ import torch
 from trainai.data.binarize import TOKENIZER_NAME
 from trainai.data.tokenizer import train_tokenizer
 from trainai.errors import UsageError
-from trainai.infer import InferenceSession, locate_run
+from trainai.infer import Finish, InferenceSession, StreamPiece, locate_run
 from trainai.model.config import ModelConfig
 from trainai.train.config import TrainConfig
 from trainai.train.loop import Trainer
@@ -173,7 +175,8 @@ def test_an_unknown_which_is_refused_before_anything_is_read(trained_run: Path) 
     with pytest.raises(UsageError) as caught:
         locate_run(trained_run, which="worst")
 
-    assert "best" in str(caught.value)
+    assert "worst" in str(caught.value), "the rejected value has to appear, to be searchable"
+    assert "best, latest" in (caught.value.hint or "")
     assert caught.value.details["choices"] == ["best", "latest"]
 
 
@@ -303,6 +306,49 @@ def _with_dataset_root(path: Path, root: str, **kwargs: Any) -> Any:
     return replace(loaded, dataset={**loaded.dataset, "root": root})
 
 
+def test_a_checkpoint_that_will_not_load_is_not_reported_as_recording_no_dataset(
+    trained_run: Path, tmp_path: Path
+) -> None:
+    """The fifth way here, which used to wear the first one's story.
+
+    Looking for a tokenizer means reading the dataset path out of the checkpoint, and
+    that read is allowed to fail without taking the tokenizer report down with it -- a
+    traceback from inside ``locate_run`` would say nothing about either problem. But
+    "this run records no dataset" is a claim about a file nobody could read. A truncated
+    checkpoint almost certainly *does* record one, and the user sent hunting for a
+    tokenizer to pass finds their `--tokenizer` refused a second time, by the same
+    unreadable file, one round trip later than they could have known.
+
+    So it gets its own reason and says what will not help. `load_checkpoint` diagnoses
+    the file properly -- "truncated or damaged, most likely from an interrupted copy" --
+    the moment anything actually tries to use it; this only has to stop guessing.
+
+    ``test_no_tokenizer_names_which_of_the_four_states_this_is`` above covers the four
+    that are genuinely about the dataset, and its ``no_dataset_recorded`` row is the one
+    this used to be indistinguishable from.
+    """
+    broken = tmp_path / "broken"
+    shutil.copytree(trained_run, broken)
+    (broken / TOKENIZER_NAME).unlink()
+    damaged = sorted(broken.rglob("*.pt"))
+    assert damaged, "the fixture run is supposed to have checkpoints on disk"
+    for checkpoint in damaged:
+        checkpoint.write_bytes(b"an interrupted copy of a real checkpoint")
+
+    with pytest.raises(UsageError) as caught:
+        locate_run(broken)
+
+    hint = caught.value.hint or ""
+    resolved = Path(caught.value.details["checkpoint"])
+    assert caught.value.details["reason"] == "checkpoint_unreadable"
+    assert resolved.name in hint, "the file to look at has to be named"
+    assert "could not be read" in hint
+    assert "--tokenizer will not get this run working" in hint
+    assert "records no dataset" not in hint, (
+        "a checkpoint nobody could read is not a checkpoint that recorded nothing"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Opening a session
 # --------------------------------------------------------------------------- #
@@ -327,7 +373,79 @@ def test_the_session_reports_what_it_loaded_and_how(trained_run: Path) -> None:
     assert described["parameters"] > 0
     assert described["context"] == 64
     assert described["layout"]["tokenizer_source"] == "the run directory"
+    assert described["chat_template"] == {}, "a prose run must not claim a chat layout"
     json.dumps(described)  # the report has to survive --json
+
+
+def test_a_gpu_session_autocasts_in_the_precision_its_report_claims(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half of ``autocast`` that a CPU session never reaches -- and got wrong.
+
+    ``autocast`` is public because evaluation runs its own forward passes and has to run
+    them under the session's precision: a loss measured in fp32 while the report says
+    bf16 is a wrong number with a correct-looking label. Every other test in this file
+    opens a CPU session, which takes the disabled branch, so the context that actually
+    turns autocast *on* had never been built -- and it hardcoded bf16 regardless of what
+    the session resolved. ``precision_for`` in ``trainai/train/loop.py`` answers ``auto``
+    with fp16 on every CUDA device that predates bf16, and those devices *reject* a bf16
+    context rather than downgrading, so ``infer`` and ``eval`` raised on exactly the
+    hardware that fallback exists for.
+
+    Recording the call instead of entering a real context, because which dtype torch
+    accepts depends on the card in the machine, and this claim is about what the session
+    asks for, not what a GPU happens to allow: on a bf16-capable box a hardcoded bf16
+    passes every real-context assertion. The CPU rows below do use real torch, since a
+    CPU session is the one case every machine has (compare
+    ``test_metal_gets_fp32_because_this_project_has_never_verified_mps_autocast`` in
+    ``tests/test_train_loop.py``, which pins the resolver end of the same decision).
+    """
+    cpu_session = InferenceSession.open(trained_run, device="cpu", precision="fp32")
+    with cpu_session.autocast():
+        assert not torch.is_autocast_enabled("cpu"), "fp32 on CPU must autocast nothing"
+
+    asked: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> Any:
+        asked.append(kwargs)
+        return nullcontext()
+
+    monkeypatch.setattr(torch, "autocast", record)
+
+    # Half precision off the CPU: the session's own dtype, on the session's own device.
+    for device_type, dtype in (
+        ("cuda", torch.bfloat16),
+        ("cuda", torch.float16),
+        ("xpu", torch.float16),
+    ):
+        asked.clear()
+        session = replace(cpu_session, device=torch.device(device_type), dtype=dtype)
+
+        with session.autocast():
+            pass
+
+        assert asked == [{"device_type": device_type, "dtype": dtype}], (
+            f"a session reporting {dtype} on {device_type} has to autocast in {dtype}"
+        )
+
+    # fp32 is refused the enabled context even off the CPU: autocasting to fp32 is a
+    # contradiction, and the caller asked for full precision.
+    for device_type in ("cuda", "cpu"):
+        asked.clear()
+        full = replace(cpu_session, device=torch.device(device_type), dtype=torch.float32)
+
+        with full.autocast():
+            pass
+
+        assert asked == [{"device_type": device_type, "enabled": False}]
+
+    # ...and so is a CPU session that asked for half precision, which is the other way
+    # into the disabled branch.
+    asked.clear()
+    half_on_cpu = replace(cpu_session, device=torch.device("cpu"), dtype=torch.bfloat16)
+    with half_on_cpu.autocast():
+        pass
+    assert asked == [{"device_type": "cpu", "enabled": False}]
 
 
 def test_best_val_loss_is_named_for_what_the_checkpoint_actually_stores(
@@ -423,6 +541,92 @@ def _without_fingerprint(path: Path, **kwargs: Any) -> Any:
     loaded = real_load(path, **kwargs)
     dataset = {k: v for k, v in loaded.dataset.items() if k != "tokenizer_fingerprint"}
     return replace(loaded, dataset=dataset)
+
+
+# --------------------------------------------------------------------------- #
+# The chat template
+# --------------------------------------------------------------------------- #
+# The prose control for these lives in ``test_the_session_reports_what_it_loaded_and_how``
+# above, which asserts an empty template on the shared prose run -- a session that
+# reported a chat layout for every run would wrap plain text in role labels the model
+# never saw, and that is the failure worth a control rather than a repeat.
+def test_the_chat_template_survives_the_dataset_being_deleted(
+    masked_dataset: Any, tmp_path: Path
+) -> None:
+    """The reason the checkpoint carries the layout at all, stated as a test.
+
+    Datasets are the large thing people delete once a run is done, and a model trained
+    on ``User: ...`` / ``Assistant: `` that is handed a bare question continues the
+    question instead of answering it -- which reads as a bad model, not as a format
+    mismatch. Trained against a *copy* of the fixture, which is then removed: the shared
+    dataset is read-only and every other test in this file needs it.
+    """
+    from trainai.data.binarize import DatasetManifest
+
+    assert masked_dataset.root is not None
+    data = tmp_path / "data"
+    shutil.copytree(masked_dataset.root, data)
+    run = train_a_run(DatasetManifest.load(data), tmp_path / "run", seq_len=32)
+    shutil.rmtree(data)
+
+    session = InferenceSession.open(run, device="cpu")
+
+    assert not data.exists(), "otherwise this test proves nothing about a deleted dataset"
+    assert session.chat_template == masked_dataset.chat
+    assert session.chat_template["version"] == 1
+    described = session.to_dict()
+    assert described["chat_template"]["trained_roles"] == ["assistant"]
+    json.dumps(described)  # the report has to survive --json
+
+
+def test_the_reported_template_is_a_copy(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that edits what it was handed must not edit the loaded checkpoint.
+
+    Shallow, which is all the top level needs: nothing reaches into ``labels`` to change
+    a role name, and a deep copy on every read would be a promise this cannot keep once
+    the block is nested further. Injected rather than trained, because what is under test
+    is one ``dict()`` call and a second real run would only make it slower to find.
+    """
+    monkeypatch.setattr(
+        "trainai.infer.session.load_checkpoint",
+        lambda path, **kw: _with_chat(path, {"version": 1}, **kw),
+    )
+    session = InferenceSession.open(trained_run, device="cpu")
+
+    session.chat_template.pop("version")
+
+    assert session.chat_template["version"] == 1
+
+
+def test_a_chat_block_that_is_not_an_object_reports_no_template(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-edited or third-party checkpoint must not take inference down with it.
+
+    There is nothing useful to do with a ``chat`` block that is not an object, and the
+    alternative to reporting "no template" is an AttributeError raised from inside a
+    generate call, long after the load that could have explained it.
+    """
+    monkeypatch.setattr(
+        "trainai.infer.session.load_checkpoint",
+        lambda path, **kw: _with_chat(path, ["User", "Assistant"], **kw),
+    )
+
+    session = InferenceSession.open(trained_run, device="cpu")
+
+    assert session.chat_template == {}
+    assert session.to_dict()["chat_template"] == {}
+
+
+def _with_chat(path: Path, block: Any, **kwargs: Any) -> Any:
+    from dataclasses import replace
+
+    from trainai.train.checkpoint import load_checkpoint as real_load
+
+    loaded = real_load(path, **kwargs)
+    return replace(loaded, dataset={**loaded.dataset, "chat": block})
 
 
 # --------------------------------------------------------------------------- #
@@ -557,3 +761,385 @@ def test_generation_builds_no_autograd_graph(trained_run: Path) -> None:
         session.complete("The", max_new_tokens=6, temperature=0.0)
 
     assert all(param.grad is None for param in session.model.parameters())
+
+
+# --------------------------------------------------------------------------- #
+# Stopping at text
+# --------------------------------------------------------------------------- #
+# A tiny model will not reliably produce any particular string, so what the model
+# writes is scripted here and the *cutting* is what is under test. One character per
+# token, which is the hard case: every stop string arrives a fraction at a time, so a
+# stream that emits the fraction has already shown the user half a label.
+def scripted(session: Any, monkeypatch: pytest.MonkeyPatch, script: str) -> None:
+    monkeypatch.setattr(session.tokenizer, "decode", lambda ids: script[: len(list(ids))])
+
+
+def chunked(session: Any, monkeypatch: pytest.MonkeyPatch, chunks: list[str]) -> None:
+    """The other hard case: a real token is several characters, not one.
+
+    One step can therefore reveal two stop strings at once, and which of them is cut at
+    stops being a question about time and becomes a question about position.
+    """
+    monkeypatch.setattr(session.tokenizer, "decode", lambda ids: "".join(chunks[: len(list(ids))]))
+
+
+def test_a_stop_string_ends_the_generation_and_is_not_in_the_text(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop string arrives one character per token, so it is not a token either."""
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "Hey!\nUser: and another thing")
+
+    out = session.complete("x", max_new_tokens=40, temperature=0.0, stop=("\nUser:",))
+
+    assert out == "Hey!"
+
+
+def test_the_earliest_stop_string_wins(trained_run: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not the first one listed, not the longest, and not the one that completes first.
+
+    Scripted several characters per token on purpose. With one character per token the
+    two stop strings can never arrive in the same step, so cutting at the *last* match
+    would pass every other test in this section -- and show the user the text between
+    them. A real tokenizer's tokens are several characters, so the step that reveals one
+    label can reveal the next as well.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    chunked(session, monkeypatch, ["one ", "two three"])
+
+    out = session.complete("x", max_new_tokens=40, temperature=0.0, stop=("three", "two"))
+
+    assert out == "one "
+
+
+def test_a_partial_stop_string_is_never_emitted(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test this section exists for: text on a terminal cannot be taken back.
+
+    Checked over every prefix of the stream rather than the final string, because the
+    final string is right even in the implementation that shows ``"\\nUse"`` and then
+    stops -- the damage is on screen, not in the return value.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "Hey!\nUser: hi")
+    stop = "\nUser:"
+
+    shown = ""
+    for piece in session.stream("x", max_new_tokens=40, temperature=0.0, stop=(stop,)):
+        shown += piece
+        for size in range(1, len(stop) + 1):
+            assert not shown.endswith(stop[:size]), f"showed {shown!r}"
+    assert shown == "Hey!"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("Hey!\nUse it well", id="resolved-mid-stream"),
+        pytest.param("Hey!\nUse\n", id="a-fresh-partial-match-begins"),
+        pytest.param("Hey!\nUser", id="the-reply-ends-inside-one"),
+    ],
+)
+def test_text_that_only_looked_like_a_stop_string_is_emitted_after_all(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch, script: str
+) -> None:
+    """The other half of holding back: what is held has to come out if it never matches.
+
+    A stream that drops it truncates the reply at whatever happened to resemble a label,
+    which is worse than the bug the hold-back fixes -- it loses text the model wrote.
+
+    The last two scripts are where that goes wrong quietly. One ends *inside* a partial
+    match, so the only thing that can emit its tail is the flush after the loop; the
+    other starts a new partial match with the same character that resolves the old one,
+    so a stream that marks the whole decoded text as emitted when it flushes part of it
+    drops one newline and nothing else.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, script)
+
+    out = session.complete("x", max_new_tokens=40, temperature=0.0, stop=("\nUser:",))
+
+    assert out == script
+
+
+def test_a_stop_string_does_not_turn_the_stream_into_one_lump(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Holding back too much is as wrong as holding back too little, and it looks fine.
+
+    Every assertion above passes for a stream that emits nothing until the end and then
+    the whole reply at once -- the text and the counts all come out right. What is lost
+    is the only thing streaming is for. None of these ten characters can begin
+    ``"\\nUser:"``, so with one character per token each one is due immediately.
+
+    The stream then ends with the finish piece, which is asserted whole here: it holds no
+    text, repeats the last token count rather than inventing an eleventh token, and says
+    the budget ran out.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "Hey there!")
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=10, temperature=0.0, stop=("\nUser:",)))
+
+    assert [piece.text for piece in pieces[:-1]] == list("Hey there!")
+    assert [piece.tokens for piece in pieces[:-1]] == list(range(1, 11))
+    assert pieces[-1] == StreamPiece("", 10, Finish("length"))
+
+
+def test_a_stop_string_at_the_very_start_produces_nothing(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty reply. A cut at offset zero is falsy, so it is the one a guard drops.
+
+    The model writing the next turn's label immediately is what an under-trained model
+    does, and the honest answer is that it said nothing -- not the label rendered to the
+    user as if it were a reply.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "\nUser: hi")
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=40, temperature=0.0, stop=("\nUser:",)))
+
+    assert "".join(piece.text for piece in pieces) == ""
+    assert pieces[-1].tokens == 6, "the tokens it took to say nothing are still reported"
+
+
+def test_a_generation_cut_short_still_counts_the_tokens_it_cost(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike end-of-text, the tokens spelling a stop string were computed and took time.
+
+    A reported tokens/s that drops them is a wrong number about the machine, which is
+    the same mistake ``StreamPiece`` exists to prevent for held-back characters.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "Hey!\nUser: hi")
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=40, temperature=0.0, stop=("\nUser:",)))
+
+    assert "".join(piece.text for piece in pieces) == "Hey!"
+    # "Hey!" is 4 characters, so the match completes on the tenth token of "Hey!\nUser:".
+    assert pieces[-1].tokens == 10
+    assert [piece.tokens for piece in pieces[:-1]] == list(range(1, 11)), "one piece per token"
+    assert pieces[-1].finish == Finish("stop", "\nUser:"), "then one more, for the finish"
+
+
+def test_the_stream_stops_walking_the_model_once_it_has_matched(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cutting the text but generating the rest anyway would waste the whole budget."""
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "Hey!\nUser: " + "wasted " * 40)
+    steps = 0
+    real_generate = session.model.generate_stream
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        nonlocal steps
+        for token in real_generate(*args, **kwargs):
+            steps += 1
+            yield token
+
+    monkeypatch.setattr(session.model, "generate_stream", counted)
+    session.complete("x", max_new_tokens=200, temperature=0.0, stop=("\nUser:",))
+
+    assert steps == 10, "the token that completed the match, and not one more"
+
+
+def test_no_stop_strings_generates_exactly_what_it_did_before(trained_run: Path) -> None:
+    """The negative control. A hold-back that fires when nothing was asked for would
+    silently shorten every completion in the tool, and the tests above would all pass."""
+    session = InferenceSession.open(trained_run, device="cpu")
+    kwargs: dict[str, Any] = {"max_new_tokens": 16, "temperature": 1.0, "seed": 11}
+
+    assert session.complete("The", **kwargs) == session.complete("The", stop=(), **kwargs)
+
+
+def test_the_labels_a_chat_model_runs_on_are_usable_as_stop_strings(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pairing this is for, checked once so the two halves cannot drift apart.
+
+    A trained model continues past its own reply into the next ``User:``, because it was
+    shown whole conversations. The strings come from :mod:`trainai.data.chat`, next to
+    the renderer that put them in the shards, rather than from a copy kept here.
+    """
+    from trainai.data.chat import TURN_BOUNDARIES
+
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "2 + 2 = 4.\n\nUser: thanks!\nAssistant: any time")
+
+    out = session.complete("x", max_new_tokens=80, temperature=0.0, stop=TURN_BOUNDARIES)
+
+    # One trailing newline is left for the caller to strip: the boundaries hold the
+    # single-newline form, so against a blank line they match at the second newline.
+    assert out == "2 + 2 = 4.\n"
+    assert out.rstrip("\n") == "2 + 2 = 4."
+
+
+def test_an_empty_stop_string_is_refused_before_anything_is_generated(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It matches at position zero, so honouring it ends every generation with nothing.
+
+    Dropping it silently would hide the mistake that computed it -- a caller assembling
+    stop strings from a template with a label missing would see a model that has
+    apparently stopped answering.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+
+    def refuse_to_generate(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("validation must happen before the model is walked")
+
+    monkeypatch.setattr(session.model, "generate_stream", refuse_to_generate)
+
+    with pytest.raises(UsageError) as caught:
+        session.complete("x", max_new_tokens=4, stop=("\nUser:", ""))
+
+    assert "cannot be empty" in str(caught.value)
+    assert caught.value.hint
+    assert caught.value.details["stop"] == ["\nUser:", ""]
+
+
+# --------------------------------------------------------------------------- #
+# Why a generation ended
+# --------------------------------------------------------------------------- #
+# The distinction these pin is invisible in the text: a reply that finished and a reply
+# that ran out of budget are both text that stops. Only one of them is worth continuing,
+# and guessing from the token count is wrong exactly when the model happened to finish on
+# its last allowed token.
+def scripted_tokens(session: Any, monkeypatch: pytest.MonkeyPatch, ids: list[int]) -> None:
+    """Replace the model's walk with a fixed sequence of token ids.
+
+    Needed for end-of-text: a model this small will not reliably emit it, and the
+    behaviour under test is what the *stream* does when it arrives, not whether it does.
+    """
+
+    def fake_generate(prompt: Any, max_new_tokens: int, **kwargs: Any) -> Any:
+        for value in ids[:max_new_tokens]:
+            yield torch.tensor([[value]])
+
+    monkeypatch.setattr(session.model, "generate_stream", fake_generate)
+
+
+def test_a_generation_the_model_ended_reports_end_of_text(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the end-of-text token is still not counted, which is the older promise."""
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted_tokens(session, monkeypatch, [5, 6, session.tokenizer.eot_id, 7])
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=40, temperature=0.0))
+
+    assert pieces[-1].finish == Finish("end-of-text")
+    assert pieces[-1].tokens == 2, "the boundary is not content, so it does not count"
+    assert not pieces[-1].finish.cut, "the model finished; there is nothing to continue"
+
+
+def test_a_generation_that_ran_out_of_budget_reports_the_limit(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason this exists. The model was mid-sentence and the caller's budget ended.
+
+    ``cut`` is the property callers act on, and it is the difference between "the model
+    is done" and "ask for more tokens" -- which the text alone cannot tell them.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    scripted(session, monkeypatch, "a reply that keeps going and going")
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=6, temperature=0.0))
+
+    assert pieces[-1].finish == Finish("length")
+    assert pieces[-1].finish.cut
+    assert pieces[-1].tokens == 6
+
+
+def test_the_stop_string_that_matched_is_named(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The earliest one, not the first one listed -- the same rule the cut follows.
+
+    A caller that assembled the list from a chat template wants to know which label the
+    model started writing. Reporting the first *listed* match would name ``"three"`` here
+    while cutting at ``"two"``, so the reason would contradict the text beside it.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    chunked(session, monkeypatch, ["one ", "two three"])
+
+    pieces = list(
+        session.stream_pieces("x", max_new_tokens=40, temperature=0.0, stop=("three", "two"))
+    )
+
+    assert "".join(piece.text for piece in pieces) == "one "
+    assert pieces[-1].finish == Finish("stop", "two")
+    assert not pieces[-1].finish.cut, "a model writing the next turn has finished this one"
+
+
+@pytest.mark.parametrize(
+    ("stops", "named"),
+    [
+        pytest.param(("\nUser", "\nUser:"), "\nUser", id="shorter-first"),
+        pytest.param(("\nUser:", "\nUser"), "\nUser:", id="longer-first"),
+    ],
+)
+def test_stop_strings_that_begin_at_the_same_place_are_named_in_the_callers_order(
+    trained_run: Path, monkeypatch: pytest.MonkeyPatch, stops: tuple[str, ...], named: str
+) -> None:
+    """One label is a prefix of the other, so both begin at the same character.
+
+    The cut is the same either way, so this is only about which one is *reported*, and
+    the answer has to come from something the caller can see. Their own order is that;
+    the order this happens to iterate in is not, and would make the report an accident of
+    the loop. Chunked rather than one character per token on purpose: with one character
+    the shorter string always completes a step earlier, and the tie never arises.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+    chunked(session, monkeypatch, ["Hey!", "\nUser: hi"])
+
+    pieces = list(session.stream_pieces("x", max_new_tokens=40, temperature=0.0, stop=stops))
+
+    assert "".join(piece.text for piece in pieces) == "Hey!"
+    assert pieces[-1].finish == Finish("stop", named)
+
+
+def test_exactly_one_piece_carries_a_finish_and_it_is_the_last(trained_run: Path) -> None:
+    """The contract callers rely on, checked against a real walk rather than a script.
+
+    A finish on an earlier piece would make ``for piece in ...: finish = piece.finish``
+    report the wrong reason, and one on none of them would report no reason at all.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+
+    pieces = list(session.stream_pieces("The", max_new_tokens=8, temperature=0.0))
+
+    assert [index for index, piece in enumerate(pieces) if piece.finish] == [len(pieces) - 1]
+    assert pieces[-1].tokens == pieces[-2].tokens, "the finish piece is not a token"
+
+
+def test_an_abandoned_stream_reports_no_reason_at_all(trained_run: Path) -> None:
+    """A caller that stops iterating -- Ctrl-C in the playground -- never reaches it.
+
+    Reporting a reason there would be inventing one: nothing ended the generation, the
+    caller stopped asking. ``None`` is what makes "interrupted" and "finished" different
+    in a machine-readable report rather than only in a printed line.
+    """
+    session = InferenceSession.open(trained_run, device="cpu")
+
+    stream = session.stream_pieces("The", max_new_tokens=8, temperature=0.0)
+    first = next(stream)
+    stream.close()
+
+    assert first.finish is None
+
+
+def test_the_reasons_a_caller_acts_on_are_the_ones_it_is_given(trained_run: Path) -> None:
+    """``cut`` is the whole public distinction, so it is asserted on its own.
+
+    Folded into the reasons above it would be asserted three times and pinned nowhere:
+    each of those tests would still pass if ``cut`` were ``True`` for every reason.
+    """
+    assert Finish("length").cut
+    assert not Finish("stop", "\nUser:").cut
+    assert not Finish("end-of-text").cut
+    assert Finish("length").to_dict() == {"reason": "length", "stop": None}
+    assert Finish("stop", "\nUser:").to_dict() == {"reason": "stop", "stop": "\nUser:"}

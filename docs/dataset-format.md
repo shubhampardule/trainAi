@@ -8,12 +8,18 @@ either load in the next one or be rejected with a clear reason.
 Current version: **`trainai-dataset` v1**.
 
 ```
-data/shakespeare/
+data/shake/
   manifest.json      what the shards are, with a sha256 for each
   tokenizer.json     the tokenizer the shards were encoded with
   train_00000.bin    little-endian uint16 (or uint32) token ids, no header
   train_00001.bin    ...continuing the same stream
   val_00000.bin      the held-out split, same format
+```
+
+A dataset prepared from typed conversations has one more file per shard:
+
+```
+  train_00000.mask.bin   loss mask, one uint8 per token
 ```
 
 ## Why a custom format
@@ -46,15 +52,44 @@ is written down here and checksummed on disk.
   manifest. That token is what marks a document boundary; there is no other
   delimiter, and no other place it appears.
 
+### Mask files
+
+Optional, and present either for every shard or for none. A dataset with a mask on
+some shards and not others is **refused**, not read: applying a partial mask would
+train on every token of the shards that lack one without saying so.
+
+- One `uint8` per token, so the file is exactly `tokens` bytes -- half the size of a
+  `uint16` shard and a quarter of a `uint32` one. A bitfield would be eight times
+  smaller and is not worth it: the loader hands the trainer a tensor per step, and
+  unpacking bits per step to save disk that is already a fraction of the tokens
+  trades a real cost for a small one.
+- `1` means the token is a training target, `0` means it is context the model reads
+  but is not scored on.
+- Named after the shard it describes: `train_00000.bin` -> `train_00000.mask.bin`.
+  Derived rather than numbered independently, because a mask paired with the wrong
+  shard has no symptom -- it trains, it converges, it is slightly wrong forever.
+- `mask_name`, `mask_bytes` and `mask_sha256` live in the *same* `shards[]` entry as
+  the tokens they describe, and are present or absent as a group. An entry with a
+  mask name and no checksum is refused by name: a mask nothing can check is a mask
+  that can rot undetected.
+- Written by `data prepare` for a corpus read with `--jsonl-messages-field`, and
+  suppressed by `--no-loss-mask`. See
+  [corpus-formats.md](corpus-formats.md#the-loss-mask-on-disk) for what it selects.
+
+**Training applies the mask.** `trainai train` and `trainai finetune` score only the
+tokens the mask marks as targets when the dataset carries one, and `--no-loss-mask`
+scores every token instead. `trainai eval` follows whatever the run recorded, so its
+perplexity stays comparable to the training curve.
+
 Reading a split without TrainAI needs numpy and nothing else:
 
 ```python
 import json, numpy as np
 
-manifest = json.load(open("data/shakespeare/manifest.json"))
+manifest = json.load(open("data/shake/manifest.json"))
 tokens = np.concatenate(
     [
-        np.memmap(f"data/shakespeare/{shard['name']}", dtype=manifest["dtype"], mode="r")
+        np.memmap(f"data/shake/{shard['name']}", dtype=manifest["dtype"], mode="r")
         for shard in manifest["splits"]["train"]["shards"]
     ]
 )
@@ -81,9 +116,10 @@ Fields worth knowing:
 | `shard_tokens` | Tokens per shard file, from `--shard-tokens` (default 64Mi). **In `content_hash`**, because it decides where the shard boundaries fall and therefore the bytes of every shard. |
 | `documents` | Documents per split. The same numbers appear under `splits.<split>.documents`; this is the flat form, and it is the one `content_hash` covers. |
 | `splits` | One entry per split — `train` and `val`, always both, even when `val` is empty. Each carries `documents`, `tokens` and `shards[]`; `shards[]` is `name`, `tokens`, `bytes`, `sha256` per shard. This is the block a reader actually loads from, and the only place the per-shard checksums live. |
-| `totals` | Documents, tokens, end-of-text tokens, characters, UTF-8 bytes. |
+| `totals` | Documents, tokens, end-of-text tokens, characters, UTF-8 bytes. A masked dataset adds `trained_tokens`, `masked_documents` and `straddling_tokens`; a dataset without a mask has none of the three, so its manifest is byte-identical to one written before masks existed. |
 | `corpus` | The full measurement report from `data inspect`, recorded verbatim. |
 | `validation` | Every warning and note that was raised at preparation time, so they are still visible later. |
+| `chat` | The chat template the documents were rendered in, or **absent/empty** for a plain corpus: `version`, the role `labels`, and `trained_roles`. See [below](#chat). |
 | `ingest` | The options and source files, so the same dataset can be rebuilt. |
 | `created_at`, `created_with` | When and by what. Deliberately **excluded** from `content_hash`. |
 | `content_hash` | sha256 over the reproducible subset of the manifest. |
@@ -94,9 +130,53 @@ Answers exactly one question: *did the same input produce the same bytes?*
 
 It covers the format version, dtype, vocabulary, tokenizer fingerprint, seed,
 validation fraction, shard size, per-split document counts, totals, the full
-shard list including every sha256, and the ingest options. It excludes
+shard list including every sha256 and every mask sha256, and the ingest options. It excludes
 `created_at` and `created_with`, so preparing the same corpus twice with the same
 settings gives the same hash even though the timestamps differ.
+
+It also excludes `chat`, for a different reason. The rendered text is already in the
+shards and every shard's sha256 is in the hash, so the template's effect on the bytes
+is covered twice over; adding the description as well would only make a dataset
+prepared before templates were recorded hash differently from the same corpus prepared
+today. Every `content_hash` printed in this project's docs stays valid.
+
+### `chat`
+
+```json
+"chat": {
+  "version": 1,
+  "labels": {"system": "System", "user": "User", "assistant": "Assistant"},
+  "trained_roles": ["assistant"]
+}
+```
+
+Present when the corpus was read as typed conversations
+(`--jsonl-messages-field`), empty for prose. The text in the shards of such a
+dataset is a **layout**, not just text -- a model trained on
+`User: ...\n\nAssistant: ` has to be prompted in that layout, or it continues the
+question instead of answering it, which reads as a bad model rather than as a
+format mismatch. This block is what says which layout.
+
+Three details worth stating plainly:
+
+- **`version` is the contract.** `labels` holds the bare role names, so the colon,
+  the space after it and the blank line between turns are *not* here; they come from
+  the template at that version. Recording the punctuation but not the separators
+  would invite a reader to treat this block as the format and still get the turn
+  separator wrong. To render exactly, use `trainai.data.chat`.
+- **Independent of the loss mask.** `--no-loss-mask` removes the mask, not the role
+  labels, so a chat dataset with no mask still records its template. The two are
+  reported as separate rows by `data inspect` for the same reason.
+- **Any, not all.** One rendered conversation among prose still records the
+  template: the model saw the layout, so it can be prompted in it. This is the
+  opposite rule to `has_loss_mask`, which is `all` because a mask covering only part
+  of the data is worse than none.
+
+`chat` is the one manifest key that is **optional on read**. Every dataset prepared
+before this release lacks it, and requiring it would refuse an otherwise perfect
+dataset over a field it could not have written; absent is read as "no template",
+which is exactly what those datasets meant. A `chat` that is present but is not an
+object is still refused by name -- the leniency is about presence only.
 
 ## The train/validation split
 
@@ -123,7 +203,10 @@ note in `IngestOptions`.
 
 ## Integrity
 
-`trainai data inspect <dir>` checks that every shard exists at its recorded size.
+`trainai data inspect <dir>` checks that every shard -- and every mask -- exists at
+its recorded size. A mask is one byte per token, so its length is the shard's token
+count exactly, and a mask of the wrong length would silently shift which tokens are
+scored from that point on.
 That is instant and catches truncation -- an interrupted copy, a full disk.
 
 `trainai data inspect <dir> --verify` re-hashes every byte. This is the only way
@@ -159,8 +242,17 @@ the file and the key -- never a traceback:
 The rule is the one [the checkpoint format](checkpoint-format.md#compatibility-promise)
 states, applied to the same reason: **a key the reader does not recognise is
 ignored, and a key it does recognise is required and must hold the right type.**
-Filling one from a default describes a dataset that is not the dataset on disk,
-and how that surfaces depends entirely on which key it was:
+
+[`chat`](#chat) is the single documented exception, and it is one on purpose: it was
+added after datasets started being written, so requiring it would refuse every
+dataset already on disk over a field none of them could have written. Absent is read
+as "no chat template", which is what those datasets meant. Its *type* is still
+enforced. Any future key added to an existing format version has to earn the same
+exception the same way -- the rule holds for every key that was there when the
+version was defined.
+
+Filling a recognised key from a default describes a dataset that is not the dataset
+on disk, and how that surfaces depends entirely on which key it was:
 
 | Key defaulted | What that costs |
 |---|---|

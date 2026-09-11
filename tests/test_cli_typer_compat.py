@@ -121,3 +121,90 @@ def test_click_is_not_declared_as_a_dependency() -> None:
         "click is declared a dependency. Either remove it, or delete "
         "trainai/cli/_click.py and import click directly -- but not both."
     )
+
+
+def test_the_vendored_click_layout_is_preferred_where_present() -> None:
+    """The branch ``_click.py`` falls back to today, and why it must not.
+
+    On a Typer < 0.27 environment there is no ``typer._click`` to import, so the
+    module's ``try`` body runs only far enough to raise ``ModuleNotFoundError`` and
+    the ``except`` always wins -- ``VENDORED_CLICK`` is ``False`` and the four
+    names come from the standalone ``click`` package. That is exactly what this
+    machine has, so every other test in this file exercises only the fallback and
+    the vendored branch (lines 36-39) is never reached.
+
+    That is not merely a coverage gap: when both layouts are importable the shim
+    must prefer the vendored one, because that is the click Typer actually raises
+    -- the original bug was that ``isinstance(exc, click.ClickException)`` was
+    ``False`` for an exception Typer had just raised. A mutation that dropped the
+    vendored import would let this module silently resolve the wrong classes again
+    and only fail on a future Typer, after the ''wrong classes'' bug returned.
+
+    So this test fabricates a ``typer._click`` layout, reloads the shim, and
+    asserts it stayed on the vendored branch; the ``finally`` restores whatever
+    `typer` and ``sys.modules`` really had and reloads once more, so whatever ran
+    afterwards sees the real ``Abort``/``Exit``/etc. ``importlib.reload`` mutates
+    the one module object every test shares in ``sys.modules``, so leaving a fake
+    layout behind would poison the CLI tests.
+    """
+    import importlib
+    import types
+
+    from trainai.cli import _click
+
+    fake_root = types.ModuleType("typer._click")
+    fake_root.__package__ = "typer._click"
+    fake_root.__path__ = []
+
+    fake_core = types.ModuleType("typer._click.core")
+    fake_core.__package__ = "typer._click.core"
+    fake_exc = types.ModuleType("typer._click.exceptions")
+    fake_exc.__package__ = "typer._click.exceptions"
+
+    # The vendored classes are whatever Typer raises, so they are caught by base
+    # class rather than name. The assertions below check identity, not the names.
+    fake_core.Abort = type("Abort", (BaseException,), {})
+    fake_core.Exit = type("Exit", (BaseException,), {"exit_code": 0})
+    fake_exc.ClickException = type("ClickException", (BaseException,), {})
+    fake_exc.UsageError = type("UsageError", (fake_exc.ClickException,), {"exit_code": 2})
+
+    fake_root.core = fake_core
+    fake_root.exceptions = fake_exc
+
+    real_typer = sys.modules["typer"]
+    had_attr = hasattr(real_typer, "_click")
+    if had_attr:
+        saved_click = real_typer._click
+    # Which submodules were already imported, so teardown can put each entry back.
+    saved_modules = {
+        name: sys.modules.get(name)
+        for name in ("typer._click", "typer._click.core", "typer._click.exceptions")
+    }
+
+    sys.modules["typer._click"] = fake_root
+    sys.modules["typer._click.core"] = fake_core
+    sys.modules["typer._click.exceptions"] = fake_exc
+    real_typer._click = fake_root
+
+    try:
+        importlib.reload(_click)
+        assert _click.VENDORED_CLICK is True, "vendored layout must be preferred"
+        assert _click.Exit is fake_core.Exit, "the vendored Exit is the one Typer raises"
+        assert _click.UsageError is fake_exc.UsageError, (
+            "the vendored UsageError is the one Typer raises"
+        )
+        assert _click.UsageError.__bases__ == (fake_exc.ClickException,)
+    finally:
+        for name, original in saved_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+        if had_attr:
+            real_typer._click = saved_click
+        else:
+            delattr(real_typer, "_click")
+        # Reload with the fabrication gone, so the module resolves whatever this
+        # environment's *real* Typer provides, and every later import (the CLI
+        # tests, conftest) sees the classes Typer here actually raises.
+        importlib.reload(_click)

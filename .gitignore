@@ -128,7 +128,7 @@ desktop.ini
 # use to anyone else. Listed here because it was only ever ignored by this
 # machine's *global* excludes file, which no clone and no CI runner has -- so on
 # any other machine it was one `git add .` from being committed.
-.local-agent/
+.claude/
 
 # --- Merge and rebase leftovers --------------------------------------------
 # `git` writes these itself during a conflict. Committing one is how a repository

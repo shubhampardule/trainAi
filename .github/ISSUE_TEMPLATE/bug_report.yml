@@ -1,0 +1,83 @@
+name: Bug report
+description: Something behaved differently from what it said it would.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Paste real output rather than describing it. This project's own first rule
+        is "do not claim something works unless you ran it", and a report is held
+        to the same standard: the traceback, the report, the numbers as they were
+        printed.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `trainai --version`.
+      placeholder: trainai 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Machine
+      description: >-
+        The output of `trainai doctor`. This one command covers the OS, the Python
+        version, the torch build, the GPU and its VRAM - which is most of what any
+        answer will depend on. Use `trainai doctor --json` if you prefer.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The command you ran
+      description: Exactly as typed, including every flag.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: >-
+        The output, verbatim. If it ended in a traceback, all of it. If it
+        succeeded but the numbers were wrong, the numbers.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: corpus
+    attributes:
+      label: The input, if the corpus is involved
+      description: >-
+        The smallest input that still shows the problem. A few kilobytes that
+        reproduces it is worth far more than a description of a large file - and
+        for `data prepare` bugs it is usually the whole diagnosis. Say which
+        format and which reading flags (`--jsonl-field`, `--csv-text-column`,
+        `--db-table`, `--encoding`) you used.
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before filing
+      options:
+        - label: >-
+            I checked README.md's "Known limitations" and this is not one of them.
+          required: true
+        - label: >-
+            This is not a security issue. (Those go through the private advisory
+            link on the previous page, not here.)
+          required: true

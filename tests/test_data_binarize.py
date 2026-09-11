@@ -15,9 +15,11 @@ gone wrong: a flipped bit changes no file size, so only re-hashing finds it.
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import re
+import weakref
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -33,15 +35,21 @@ from trainai.data.binarize import (
     SPLITS,
     TOKENIZER_NAME,
     DatasetManifest,
+    ShardInfo,
+    _attach_masks,
     _empty_val_chance,
     _side,
     _suggested_val_fraction,
     _val_fraction_that_keeps_a_train_document,
     binarize_documents,
+    count_straddling,
     describe_dataset_layout,
+    mask_name_for,
     token_dtype,
+    token_mask,
     verify_dataset,
 )
+from trainai.data.chat import describe_template, render_conversation
 from trainai.data.ingest import CUT_BY_MAX_DOC_CHARS, Document, IngestOptions, Ingestor, Kind
 from trainai.data.loader import (
     MIN_SEQ_LEN,
@@ -590,7 +598,7 @@ def test_every_fraction_the_empty_split_hint_names_writes_a_dataset(
 
 #: A seed that sends every document of :func:`documents_numbering` to validation at
 #: ``HIGHEST_LEGAL_VAL_FRACTION``, for one, two and three documents alike -- found by
-#: enumerating seeds against ``_assign_split``. Hard-coded rather than searched for
+#: enumerating seeds against ``_split_fraction``. Hard-coded rather than searched for
 #: at run time, so that a change to the split hash, which the manifest's
 #: reproducibility guarantee says must not happen, fails these tests loudly.
 EMPTIES_TRAIN_SEED = 8
@@ -608,7 +616,7 @@ def test_a_val_fraction_that_selects_everything_is_refused(
 ) -> None:
     """Regression: there was no empty-*train* guard at all, only an empty-val one.
 
-    ``_assign_split`` is a weighted coin per document rather than a quota, so a legal
+    The split is a weighted coin per document rather than a quota, so a legal
     ``--val-fraction`` can take every document. Measured: one document at 0.49 does
     it for 37 of 60 seeds. The dataset was then written and reported as a success --
     ``data prepare`` exited 0 saying "Wrote ... 601 tokens from 1 documents" with a
@@ -661,6 +669,83 @@ def test_the_empty_train_hint_does_not_advise_an_unchanged_rerun(
     assert "hash" in hints[3]
     assert "unchanged will not help" in hints[3]
     assert "--val-fraction" in hints[3]
+
+
+#: A seed under which *both* documents of ``documents_numbering(2)`` hash below 0.01,
+#: which is what leaves the empty-train hint with no number to name. Rare on purpose:
+#: about one seed in ten thousand does it for two documents, and none of the first
+#: 400,000 does it for three. Enumerated once against ``_split_fraction`` and hard-coded
+#: like ``EMPTIES_TRAIN_SEED`` above, for the same reason -- a change to the split hash
+#: must fail this loudly rather than be searched around.
+NO_NAMEABLE_VAL_FRACTION_SEED = 9102
+
+#: The smallest fraction a person would type, and above both fractions that seed
+#: produces (0.0048 and 0.0049). Any legal value above 0.005 empties the train split
+#: here; this is the one they would reach for.
+SMALLEST_TWO_PLACE_VAL_FRACTION = 0.01
+
+
+def test_an_empty_train_split_with_no_fraction_to_name_says_so_in_words(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The other branch of the same hint, and the one that cannot offer a number.
+
+    ``--val-fraction 0.21 keeps at least one of these 2 documents in training`` is the
+    good advice, and the test above pins it. It can only be given when the largest
+    fraction the corpus produced rounds to 0.01 or more -- below that the number would
+    be ``0.00``, and 0 is a different instruction: it turns validation off rather than
+    shrinking it, which the hint already offers separately and in words.
+
+    ``test_the_lowered_fraction_keeps_the_document_it_was_computed_from`` already pins
+    the ``None`` as a unit, so the helper was never the gap. The gap was the sentence it
+    produces: nothing had reached the empty-train hint on a corpus with nothing to name,
+    which is the mirror of
+    ``test_a_corpus_no_legal_fraction_can_split_is_told_that_instead_of_a_number`` on the
+    empty-*validation* side.
+
+    Both branches run here on the same two documents, which is the only way to say that
+    the condition decides between them rather than one of them being unreachable. The
+    seeds are what differ: under ``EMPTIES_TRAIN_SEED`` the pair straddles 0.01 and a
+    number can be named, under ``NO_NAMEABLE_VAL_FRACTION_SEED`` it does not. Both empty
+    the train split, so the refusal itself is identical and only the advice moves.
+    """
+    with pytest.raises(DatasetError) as caught:
+        prepare(
+            tmp_path / "nothing-to-name",
+            documents_numbering(2),
+            module_tokenizer,
+            seed=NO_NAMEABLE_VAL_FRACTION_SEED,
+            val_fraction=SMALLEST_TWO_PLACE_VAL_FRACTION,
+        )
+
+    hint = caught.value.hint or ""
+
+    assert "training split is empty" in str(caught.value)
+    assert hint.startswith("Lower --val-fraction, or ")
+    assert "keeps at least one" not in hint, "a number was named for a corpus that has none"
+    assert "--val-fraction 0.00" not in hint, "0 is a different instruction, not a smaller one"
+    assert "add more documents" in hint, "the fix that does not depend on a fraction"
+    assert "unchanged will not help" in hint
+    # The reason there is nothing to name, in the details a bug report would carry.
+    assert caught.value.details["highest_split_fraction"] < SMALLEST_TWO_PLACE_VAL_FRACTION
+    assert caught.value.details["documents"] == 2
+
+    with pytest.raises(DatasetError) as nameable:
+        prepare(
+            tmp_path / "nameable",
+            documents_numbering(2),
+            module_tokenizer,
+            seed=EMPTIES_TRAIN_SEED,
+            val_fraction=HIGHEST_LEGAL_VAL_FRACTION,
+        )
+
+    offered = nameable.value.hint or ""
+
+    assert "--val-fraction 0.21 keeps at least one of these 2 documents" in offered
+    assert not offered.startswith("Lower --val-fraction, or "), "the branches are the wrong way up"
+    # The two documents hash to 0.11 and 0.21 under this seed, so this is also what says
+    # the number recorded is the largest fraction seen and not the smallest.
+    assert nameable.value.details["highest_split_fraction"] > 0.2
 
 
 def test_the_advice_for_a_single_document_actually_works(
@@ -1014,7 +1099,7 @@ def test_the_lowering_helper_is_only_ever_asked_about_fractions_below_the_ceilin
 
 #: Sixty documents at the default fraction, and a seed that empties the validation split
 #: anyway -- which happens for about 5% of seeds, so it is an ordinary outcome rather than
-#: a contrived one. Found by enumerating seeds against ``_assign_split``, and hard-coded
+#: a contrived one. Found by enumerating seeds against ``_split_fraction``, and hard-coded
 #: so a change to the split hash fails this loudly.
 UNLUCKY_SEED = 2
 
@@ -1865,6 +1950,165 @@ def test_a_value_error_from_the_map_is_still_a_dataset_error(
     assert "multiple of the data-type size" in caught.value.details["reason"]
 
 
+# --------------------------------------------------------------------------- #
+# loader: the arguments it refuses
+# --------------------------------------------------------------------------- #
+# Five refusals that no command can reach, because every command validates its own
+# flags first. They are the loader's own guards, and each one exists because the
+# alternative is not an exception but a wrong answer: mismatched shard bookkeeping
+# reads another shard's tokens, a negative step indexes an array backwards. So they
+# are called as a library caller would call them -- which, given `open_split` is
+# documented for exactly that, is not a hypothetical caller.
+def test_a_stream_whose_bookkeeping_does_not_match_is_a_trainai_bug(tmp_path: Path) -> None:
+    """Two shards and one token count is not a damaged dataset, it is a broken caller.
+
+    The prefix sums built from the mismatch would put a shard boundary in the wrong
+    place, and every read past it would come back with plausible tokens from the wrong
+    file -- no exception, a quietly wrong training set. The message says TrainAI bug
+    rather than naming a file, because nothing the user did can produce it.
+    """
+    first = write_shard(tmp_path / "train_00000.bin", 100)
+    second = write_shard(tmp_path / "train_00001.bin", 50)
+
+    with pytest.raises(DatasetError) as caught:
+        ShardedTokenStream(paths=[first, second], tokens=[100], dtype=SHARD_DTYPE)
+
+    assert "do not match" in str(caught.value)
+    assert "TrainAI bug" in (caught.value.hint or "")
+    assert caught.value.details == {"paths": 2, "counts": 1}
+
+
+def test_a_read_of_no_tokens_is_an_empty_array_of_the_right_type(tmp_path: Path) -> None:
+    """Zero is a legal count, and the early return is what keeps it legal.
+
+    Without it the loop below would ask ``searchsorted`` for the shard holding a
+    zero-length read at the very end of the stream -- one past the last shard -- and
+    index the map list out of range. The dtype has to be the stream's: an empty array
+    of the wrong width still concatenates, and the result silently reinterprets every
+    byte that follows it.
+    """
+    path = write_shard(tmp_path / "train_00000.bin", 100)
+    stream = ShardedTokenStream(paths=[path], tokens=[100], dtype=SHARD_DTYPE)
+    try:
+        for start in (0, 50, 100):
+            empty = stream.read(start, 0)
+
+            assert empty.size == 0, start
+            assert empty.dtype == SHARD_DTYPE, start
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("seq_len", [1, 0, -1])
+def test_a_sequence_length_below_two_is_refused_with_the_reason(
+    tmp_path: Path, seq_len: int
+) -> None:
+    """One token cannot be both the input and the target it is predicted from.
+
+    ``MIN_SEQ_LEN`` is 2 because a window is ``seq_len + 1`` tokens split into inputs
+    and targets, and at 1 the two would be one token each with nothing shifted. The
+    flag is named in the message because the number came from a flag.
+    """
+    path = write_shard(tmp_path / "train_00000.bin", 100)
+    stream = ShardedTokenStream(paths=[path], tokens=[100], dtype=SHARD_DTYPE)
+
+    with pytest.raises(DatasetError) as caught:
+        TokenBatcher(stream, seq_len=seq_len, batch_size=1)
+
+    assert f"--seq-len must be at least {MIN_SEQ_LEN}" in str(caught.value)
+    assert f"got {seq_len}" in str(caught.value)
+    assert "one input token and one target token" in (caught.value.hint or "")
+    stream.close()
+
+
+def test_the_shortest_legal_sequence_length_is_accepted(tmp_path: Path) -> None:
+    """The other side of the boundary, and the half a set of negative cases cannot see.
+
+    Every case above is below ``MIN_SEQ_LEN``, so all of them pass just as well against
+    a guard that refuses ``MIN_SEQ_LEN`` itself -- the gate turned ``<`` into ``<=`` and
+    nothing noticed. What ``MIN_SEQ_LEN`` claims is that 2 *works*, so it is batched
+    here: one input token, one target, shifted by one.
+    """
+    path = write_shard(tmp_path / "train_00000.bin", 100)
+    stream = ShardedTokenStream(paths=[path], tokens=[100], dtype=SHARD_DTYPE)
+    batcher = TokenBatcher(stream, seq_len=MIN_SEQ_LEN, batch_size=1)
+    try:
+        batch = batcher.batch(0)
+
+        assert batch.inputs.shape == (1, MIN_SEQ_LEN)
+        assert batch.targets.shape == (1, MIN_SEQ_LEN)
+        assert np.array_equal(batch.inputs[:, 1:], batch.targets[:, :-1])
+    finally:
+        batcher.close()
+
+
+def test_a_batch_size_below_one_is_refused_and_points_at_accumulation(
+    tmp_path: Path,
+) -> None:
+    """A batch of no sequences is a step that reads nothing and learns nothing.
+
+    The hint names gradient accumulation because the reason someone types 0 is that 1
+    did not fit, and accumulation is the answer to that -- it reaches a larger
+    effective batch without a larger micro-batch. Asserted, because a hint that only
+    said "use 1" would be telling them to do the thing they already could not.
+    """
+    path = write_shard(tmp_path / "train_00000.bin", 100)
+    stream = ShardedTokenStream(paths=[path], tokens=[100], dtype=SHARD_DTYPE)
+
+    with pytest.raises(DatasetError) as caught:
+        TokenBatcher(stream, seq_len=8, batch_size=0)
+
+    assert "--batch-size must be at least 1, got 0" in str(caught.value)
+    assert "gradient accumulation" in (caught.value.hint or "")
+    stream.close()
+
+
+def test_a_negative_step_is_refused_rather_than_indexing_backwards(tmp_path: Path) -> None:
+    """``batch(step)`` is arithmetic on ``step``, and numpy is happy to go backwards.
+
+    A negative step makes ``base`` negative, and Python's floor division then puts the
+    epoch at -1 and the slice somewhere in the middle of the previous epoch's order --
+    a batch, of real tokens, that no resume should ever produce. Only a caller can do
+    this, so it reports as a bug rather than as a dataset problem.
+    """
+    path = write_shard(tmp_path / "train_00000.bin", 100)
+    stream = ShardedTokenStream(paths=[path], tokens=[100], dtype=SHARD_DTYPE)
+    batcher = TokenBatcher(stream, seq_len=8, batch_size=2)
+    try:
+        assert batcher.batch(0).inputs.shape == (2, 8), "the same call works forwards"
+
+        with pytest.raises(DatasetError) as caught:
+            batcher.batch(-1)
+
+        assert "step must be non-negative, got -1" in str(caught.value)
+        assert "TrainAI bug" in (caught.value.hint or "")
+        assert caught.value.details == {"step": -1}
+    finally:
+        batcher.close()
+
+
+def test_an_unknown_split_lists_the_ones_that_exist(
+    dataset: tuple[DatasetManifest, list[Document], ByteLevelBPE],
+) -> None:
+    """``open_split(manifest, "test")`` -- the name a caller reaches for first.
+
+    There is no test split: the dataset has two, and the refusal lists them rather
+    than saying the name is wrong, because "test" is a reasonable guess and the fix is
+    to know what the alternatives are. Checked before the shards are looked up, so an
+    unknown name cannot be reported as an empty split -- which is a different error,
+    with different advice, for a dataset that is fine.
+    """
+    manifest, _, _ = dataset
+
+    with pytest.raises(DatasetError) as caught:
+        open_split(manifest, "test", seq_len=8, batch_size=1)
+
+    assert "Unknown split 'test'" in str(caught.value)
+    assert "train" in (caught.value.hint or "")
+    assert "val" in (caught.value.hint or "")
+    assert "no test split" not in str(caught.value), "an unknown name is not a missing split"
+
+
 def test_the_loader_and_verify_dataset_agree_word_for_word(
     dataset: tuple[DatasetManifest, list[Document], ByteLevelBPE],
 ) -> None:
@@ -1984,3 +2228,813 @@ def test_a_batch_size_above_the_window_count_suggests_one_that_works(tmp_path: P
     assert batcher.steps_per_epoch >= 1
     assert batcher.batch(0).shape == (suggested, 64)
     stream.close()
+
+
+# --------------------------------------------------------------------------- #
+# The loss mask
+#
+# Two claims, and they need different kinds of test. That the mask *selects the
+# replies* is checked by decoding what it selects back into text and comparing it
+# to the reply that went in -- recomputing the token indices the writer computed
+# would pass whatever the writer did. That the mask is *aligned with its shard* is
+# checked structurally, because a misaligned mask has no symptom at all: it trains,
+# it converges, it is slightly wrong forever.
+# --------------------------------------------------------------------------- #
+REPLY = "the rivers carry what the clocks measure, and the bridges cross them."
+
+
+def conversation_documents(count: int) -> list[Document]:
+    """Typed conversations, rendered by the real template with real spans."""
+    documents = []
+    for index in range(count):
+        conversation = render_conversation(
+            [
+                {"role": "user", "content": f"Question {index} about rivers and clocks?"},
+                {"role": "assistant", "content": f"Answer {index}: {REPLY}"},
+            ]
+        )
+        documents.append(Document(conversation.text, "chat.jsonl", index, 0, conversation.spans))
+    return documents
+
+
+def read_mask(manifest: DatasetManifest, split: str) -> np.ndarray:
+    parts = [np.fromfile(path, dtype=np.uint8) for path in manifest.mask_paths(split)]  # type: ignore[arg-type]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.uint8)
+
+
+def read_tokens(manifest: DatasetManifest, split: str) -> np.ndarray:
+    parts = [np.fromfile(path, dtype=manifest.numpy_dtype) for path in manifest.shard_paths(split)]  # type: ignore[arg-type]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=manifest.numpy_dtype)
+
+
+def test_token_mask_selects_the_span_and_nothing_around_it() -> None:
+    """Literal offsets, literal expectation. No arithmetic shared with the code."""
+    offsets = [(0, 4), (4, 5), (6, 8), (8, 9), (9, 10), (10, 19), (19, 20), (21, 23), (23, 24)]
+
+    assert list(token_mask(offsets, ((21, 24),))) == [0, 0, 0, 0, 0, 0, 0, 1, 1]
+
+
+def test_a_token_is_selected_by_overlap_even_when_it_runs_past_the_span() -> None:
+    """The rule is intersection, and this is the case where the alternatives differ.
+
+    ``(4, 10)`` starts inside the span and ends outside it. Containment would drop it
+    and leave two characters of the reply unscored; intersection keeps it, at the cost
+    of four characters of context, which is what ``count_straddling`` reports. Written
+    as its own case because the offsets above are one where every rule agrees, so they
+    would pass whichever rule the code used.
+    """
+    assert list(token_mask([(0, 4), (4, 10)], ((2, 6),))) == [1, 1]
+    assert list(token_mask([(0, 4), (4, 10)], ((4, 10),))) == [0, 1]
+    assert list(token_mask([(0, 4), (4, 10)], ((10, 14),))) == [0, 0]
+
+
+def test_a_document_with_no_spans_trains_on_every_token() -> None:
+    """The rule that keeps a mixed corpus safe.
+
+    A plain ``.txt`` file beside a chat corpus produces documents with no spans, and
+    they have to mean "train on all of this". The opposite reading -- no spans, no
+    targets -- would silently contribute tokens nothing is scored on.
+    """
+    offsets = [(0, 4), (4, 5), (6, 8)]
+
+    assert list(token_mask(offsets, ())) == [1, 1, 1]
+    assert list(token_mask(offsets, (), trailing=1)) == [1, 1, 1, 1]
+
+
+def test_the_end_of_text_token_is_always_a_target() -> None:
+    """A model never scored on the token that ends a document never learns to stop."""
+    assert list(token_mask([(0, 4)], ((9, 10),), trailing=1)) == [0, 1]
+
+
+def test_a_masked_dataset_writes_one_mask_byte_per_token(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    manifest = prepare(
+        tmp_path / "masked", conversation_documents(40), module_tokenizer, loss_mask=True
+    )
+
+    assert manifest.has_loss_mask
+    assert not manifest.partial_loss_mask
+    for split in SPLITS:
+        for shard in manifest.shards.get(split, ()):
+            assert shard.mask_name == shard.name.removesuffix(".bin") + ".mask.bin"
+            assert shard.mask_bytes == shard.tokens
+            assert (tmp_path / "masked" / shard.mask_name).stat().st_size == shard.tokens
+    assert read_mask(manifest, "train").size == manifest.tokens("train")
+
+
+def test_the_mask_selects_the_assistant_reply_and_the_turn_that_ends_it(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Decoded, not recomputed.
+
+    The assertion is on text: what the mask keeps, run back through the tokenizer,
+    has to be the reply that went in. Comparing token indices against indices the
+    writer derived the same way would pass whatever the writer did.
+    """
+    manifest = prepare(
+        tmp_path / "masked",
+        conversation_documents(40),
+        module_tokenizer,
+        loss_mask=True,
+        val_fraction=0.0,
+    )
+    tokens = read_tokens(manifest, "train")
+    mask = read_mask(manifest, "train")
+    end = int(np.argmax(tokens == manifest.eot_id)) + 1
+
+    kept = module_tokenizer.decode(tokens[:end][mask[:end] == 1].tolist())
+    dropped = module_tokenizer.decode(tokens[:end][mask[:end] == 0].tolist())
+
+    assert kept.strip().startswith("Answer 0:")
+    assert kept.rstrip().endswith("<|endoftext|>")
+    assert "Question 0" not in kept
+    assert dropped.startswith("User: Question 0")
+    assert dropped.rstrip().endswith("Assistant:")
+
+
+def test_a_maskless_dataset_records_nothing_about_masks(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The negative control.
+
+    Documents carrying spans, prepared without ``loss_mask``: no mask file, no mask
+    key, no extra total. This is what keeps a manifest written before masks existed
+    byte-identical to one written now, and therefore keeps its ``content_hash``.
+    """
+    out = tmp_path / "plain"
+    manifest = prepare(out, conversation_documents(40), module_tokenizer, loss_mask=False)
+
+    assert not manifest.has_loss_mask
+    assert not manifest.partial_loss_mask
+    assert manifest.mask_paths("train") == []
+    assert list(out.glob("*.mask.bin")) == []
+    assert "mask" not in (out / MANIFEST_NAME).read_text(encoding="utf-8")
+    assert set(manifest.totals) == {"documents", "tokens", "eot_tokens", "chars", "utf8_bytes"}
+
+
+def test_the_mask_is_covered_by_the_content_hash(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Two datasets differing only in whether a mask was written are not the same dataset."""
+    documents = conversation_documents(40)
+    plain = prepare(tmp_path / "plain", documents, module_tokenizer, loss_mask=False)
+    masked = prepare(tmp_path / "masked", documents, module_tokenizer, loss_mask=True)
+
+    assert plain.content_hash != masked.content_hash
+
+
+def test_preparing_the_same_corpus_twice_writes_the_same_mask(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    documents = conversation_documents(40)
+    first = prepare(tmp_path / "one", documents, module_tokenizer, loss_mask=True, seed=11)
+    second = prepare(tmp_path / "two", documents, module_tokenizer, loss_mask=True, seed=11)
+
+    assert first.content_hash == second.content_hash
+    for split in SPLITS:
+        assert [shard.mask_sha256 for shard in first.shards[split]] == [
+            shard.mask_sha256 for shard in second.shards[split]
+        ]
+
+
+def test_the_mask_follows_the_tokens_across_a_shard_boundary(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """A document split across two shards has its mask split at the same token.
+
+    Checked by totals rather than by eye: the trained tokens counted while writing
+    have to equal the ones on disk, summed over every shard of every split. An
+    off-by-one at a boundary shows up here and nowhere else.
+    """
+    manifest = prepare(
+        tmp_path / "masked",
+        conversation_documents(120),
+        module_tokenizer,
+        loss_mask=True,
+        shard_tokens=1024,
+    )
+
+    assert sum(len(manifest.shards[split]) for split in SPLITS) > 2
+    on_disk = 0
+    for split in SPLITS:
+        for shard, path in zip(manifest.shards[split], manifest.mask_paths(split), strict=True):
+            mask = np.fromfile(path, dtype=np.uint8)
+            assert mask.size == shard.tokens
+            on_disk += int(mask.sum())
+    assert on_disk == manifest.totals["trained_tokens"]
+
+
+def test_rebuilding_without_a_mask_leaves_no_stale_mask_behind(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """A mask left over from a previous run would describe tokens that no longer exist."""
+    out = tmp_path / "prepared"
+    documents = conversation_documents(60)
+    prepare(out, documents, module_tokenizer, loss_mask=True, shard_tokens=1024)
+    assert list(out.glob("*.mask.bin"))
+
+    prepare(out, documents, module_tokenizer, loss_mask=False, shard_tokens=1024)
+
+    assert list(out.glob("*.mask.bin")) == []
+    assert verify_dataset(out, deep=True).has_loss_mask is False
+
+
+@pytest.fixture
+def masked_dataset(tmp_path: Path, module_tokenizer: ByteLevelBPE) -> DatasetManifest:
+    """A small prepared dataset with a loss mask beside every shard."""
+    return prepare(
+        tmp_path / "masked", conversation_documents(60), module_tokenizer, loss_mask=True
+    )
+
+
+def test_deep_verify_catches_a_flipped_mask_byte(masked_dataset: DatasetManifest) -> None:
+    """A flipped mask byte moves one token between target and context, and nothing else.
+
+    No size changes, no token changes, no loss spike -- the run simply scores a token
+    the manifest says it does not. Only the checksum finds it.
+    """
+    path = masked_dataset.mask_paths("train")[0]
+    payload = bytearray(path.read_bytes())
+    payload[3] ^= 0x01
+    path.write_bytes(bytes(payload))
+
+    verify_dataset(masked_dataset.root, deep=False)
+
+    with pytest.raises(DatasetFormatError) as caught:
+        verify_dataset(masked_dataset.root, deep=True)
+    assert "checksum" in str(caught.value)
+    assert caught.value.details["path"].endswith(path.name)
+
+
+def test_a_truncated_mask_is_caught_without_hashing(masked_dataset: DatasetManifest) -> None:
+    path = masked_dataset.mask_paths("train")[0]
+    path.write_bytes(path.read_bytes()[:-8])
+
+    with pytest.raises(DatasetFormatError) as caught:
+        verify_dataset(masked_dataset.root, deep=False)
+
+    assert "one byte per token" in str(caught.value)
+    assert caught.value.details["expected"] == masked_dataset.shards["train"][0].tokens
+
+
+def test_a_missing_mask_names_the_file(masked_dataset: DatasetManifest) -> None:
+    path = masked_dataset.mask_paths("train")[0]
+    path.unlink()
+
+    with pytest.raises(DatasetFormatError) as caught:
+        verify_dataset(masked_dataset.root, deep=False)
+
+    assert path.name in str(caught.value)
+    assert "prepare" in (caught.value.hint or "")
+
+
+def edit_manifest(root: Path, edit: Callable[[dict[str, Any]], None]) -> None:
+    path = root / MANIFEST_NAME
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    edit(raw)
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def test_half_a_mask_entry_is_refused_by_name(masked_dataset: DatasetManifest) -> None:
+    """A mask with no checksum is a mask nothing can check, so it is not a mask."""
+    root = masked_dataset.root
+    assert root is not None
+    edit_manifest(root, lambda raw: raw["splits"]["train"]["shards"][0].pop("mask_sha256"))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        DatasetManifest.load(root)
+
+    assert "mask_sha256" in str(caught.value)
+    assert caught.value.details["field"] == "splits.train.shards[0].mask_sha256"
+
+
+def test_a_dataset_where_only_some_shards_have_a_mask_is_refused(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The reason ``has_loss_mask`` is ``all`` and not ``any``.
+
+    Applying a mask that covers only part of the data would train on every token of
+    the rest without saying so, which is the failure the whole mask exists to avoid.
+    """
+    out = tmp_path / "masked"
+    prepare(
+        out,
+        conversation_documents(120),
+        module_tokenizer,
+        loss_mask=True,
+        shard_tokens=1024,
+    )
+
+    def strip_one(raw: dict[str, Any]) -> None:
+        for key in ("mask_name", "mask_bytes", "mask_sha256"):
+            raw["splits"]["train"]["shards"][-1].pop(key)
+
+    edit_manifest(out, strip_one)
+    manifest = DatasetManifest.load(out)
+
+    assert manifest.partial_loss_mask
+    assert not manifest.has_loss_mask
+    with pytest.raises(DatasetFormatError) as caught:
+        verify_dataset(out, deep=False)
+    assert "some do not" in str(caught.value)
+
+
+def test_a_mask_file_is_named_after_the_shard_it_describes(
+    masked_dataset: DatasetManifest,
+) -> None:
+    """Derived, not numbered independently: a mask cannot drift onto another shard."""
+    assert mask_name_for("train_00007.bin") == "train_00007.mask.bin"
+    for split in SPLITS:
+        for shard in masked_dataset.shards[split]:
+            assert shard.mask_name == mask_name_for(shard.name)
+
+
+def test_a_token_covering_both_sides_of_a_span_edge_is_counted_not_hidden() -> None:
+    """The intersection rule is a measurement, so its cost has to be reported.
+
+    A token half inside a span is trained on text the mask calls context. That is a
+    property of the corpus and the tokenizer, not a bug -- but a corpus where it
+    happens has to be able to say so.
+    """
+    offsets = [(0, 4), (4, 8), (8, 12)]
+
+    assert count_straddling(offsets, ((4, 8),)) == 0
+    assert count_straddling(offsets, ((6, 12),)) == 1
+    assert count_straddling(offsets, ()) == 0
+
+
+def test_the_straddling_count_is_zero_on_the_chat_template(
+    masked_dataset: DatasetManifest,
+) -> None:
+    """Why the template ends its spans on a newline run.
+
+    The pre-tokenizer splits a whitespace run followed by text, and BPE merges only
+    inside a pre-token, so the boundary a span lands on is always a token boundary.
+    Asserted rather than argued, because the argument is about a regex.
+    """
+    assert masked_dataset.totals["straddling_tokens"] == 0
+
+
+# The three checks in _attach_masks guard against a TrainAI bug, not a bad corpus:
+# the two writers are given the same limits and the same element counts, so their
+# boundaries agree by construction. They are tested by calling it directly, because
+# nothing a user can do reaches them -- and because "by construction" is the phrase
+# that precedes a misaligned mask, which has no symptom but a slightly worse loss.
+def shard_info(name: str, tokens: int) -> ShardInfo:
+    return ShardInfo(name=name, tokens=tokens, bytes=tokens * 2, sha256="0" * 64)
+
+
+def test_a_mask_shard_count_that_does_not_match_is_refused_as_a_bug() -> None:
+    tokens = [shard_info("train_00000.bin", 10), shard_info("train_00001.bin", 10)]
+    masks = [shard_info("train_00000.mask.bin", 10)]
+
+    with pytest.raises(DatasetError) as caught:
+        _attach_masks(tokens, masks, "train")
+
+    assert "2 token shards but 1 mask" in str(caught.value)
+    assert "bug in TrainAI" in (caught.value.hint or "")
+
+
+def test_a_mask_paired_with_another_shards_name_is_refused_as_a_bug() -> None:
+    with pytest.raises(DatasetError) as caught:
+        _attach_masks(
+            [shard_info("train_00000.bin", 10)], [shard_info("train_00001.mask.bin", 10)], "train"
+        )
+
+    assert "train_00001.mask.bin" in str(caught.value)
+    assert "train_00000.mask.bin" in str(caught.value)
+
+
+def test_a_mask_covering_a_different_number_of_tokens_is_refused_as_a_bug() -> None:
+    """The check that would catch an off-by-one at a shard boundary."""
+    with pytest.raises(DatasetError) as caught:
+        _attach_masks(
+            [shard_info("train_00000.bin", 10)], [shard_info("train_00000.mask.bin", 9)], "train"
+        )
+
+    assert "covers 9 tokens" in str(caught.value)
+    assert caught.value.details["shard"] == "train_00000.bin"
+
+
+# --------------------------------------------------------------------------- #
+# The loss mask in a batch
+#
+# The mask is read with the same offset arithmetic as the tokens and then shifted
+# one position, because a mask byte describes its own token and the loss at
+# position i scores targets[i]. Off by one in either direction still trains and
+# still converges: it would score the last context token of every prompt and skip
+# the first token of every reply. So the alignment is tested by decoding, and the
+# shift is tested against the raw files rather than against the loader's own
+# arithmetic.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def batchable_masked_dataset(tmp_path: Path, module_tokenizer: ByteLevelBPE) -> DatasetManifest:
+    """Enough conversations that a batch of 4 windows of 32 tokens fits in each split."""
+    return prepare(
+        tmp_path / "batchable", conversation_documents(120), module_tokenizer, loss_mask=True
+    )
+
+
+def test_a_batch_carries_a_mask_shaped_like_its_targets(
+    batchable_masked_dataset: DatasetManifest,
+) -> None:
+    batcher, _ = open_split(batchable_masked_dataset, "train", seq_len=32, batch_size=4, seed=0)
+    try:
+        batch = batcher.batch(0)
+
+        assert batcher.has_loss_mask
+        assert batch.loss_mask is not None
+        assert batch.loss_mask.shape == batch.targets.shape
+        assert batch.loss_mask.dtype == np.uint8
+        assert set(np.unique(batch.loss_mask)) <= {0, 1}
+        assert 0 < batch.trained_tokens < batch.targets.size
+    finally:
+        batcher.close()
+
+
+def test_the_mask_is_shifted_to_line_up_with_the_targets(
+    batchable_masked_dataset: DatasetManifest,
+) -> None:
+    """The claim the whole feature rests on, checked against the files on disk.
+
+    ``sequential_batches`` starts at offset 0 with no permutation, so window ``w``
+    row is exactly ``tokens[w * (seq_len + 1) : ...]``. The mask row for that window
+    has to be the *same slice* of the mask file, minus its first byte -- the byte
+    belonging to the input-only token that has no target position.
+    """
+    tokens = read_tokens(batchable_masked_dataset, "train")
+    mask = read_mask(batchable_masked_dataset, "train")
+    seq_len, window = 32, 33
+
+    batcher, _ = open_split(
+        batchable_masked_dataset, "train", seq_len=seq_len, batch_size=2, seed=0
+    )
+    try:
+        batch = next(iter(batcher.sequential_batches()))
+        assert batch.loss_mask is not None
+        for row in range(2):
+            start = row * window
+            np.testing.assert_array_equal(batch.targets[row], tokens[start + 1 : start + window])
+            np.testing.assert_array_equal(batch.loss_mask[row], mask[start + 1 : start + window])
+    finally:
+        batcher.close()
+
+
+def test_what_the_mask_keeps_decodes_to_the_replies(
+    batchable_masked_dataset: DatasetManifest, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Text, not indices: the same standard the writer's own test is held to.
+
+    Whatever the loader does to the mask on the way to a batch, the tokens it selects
+    have to still be the assistant replies -- and the tokens it drops have to still
+    be the prompts, ending at the label that introduces the reply.
+    """
+    batcher, _ = open_split(batchable_masked_dataset, "train", seq_len=128, batch_size=1, seed=0)
+    try:
+        batch = next(iter(batcher.sequential_batches()))
+        assert batch.loss_mask is not None
+        targets, mask = batch.targets[0], batch.loss_mask[0]
+
+        kept = module_tokenizer.decode(targets[mask == 1].tolist())
+        dropped = module_tokenizer.decode(targets[mask == 0].tolist())
+
+        assert "Answer 0:" in kept
+        assert "Question 0" not in kept
+        assert "Question 1" in dropped
+        assert dropped.rstrip().endswith("Assistant:")
+    finally:
+        batcher.close()
+
+
+def test_a_sampled_batch_pairs_every_target_with_its_own_mask_byte(tmp_path: Path) -> None:
+    """The randomised path, pinned without reaching into the batcher's offset.
+
+    ``batch(step)`` applies a per-epoch permutation and an alignment offset, so the
+    slice a row came from is not knowable from the outside. Instead the mask is made a
+    *function of the token*: byte ``i`` is ``i % 2``, so every target must satisfy
+    ``mask == target % 2`` whatever window it came from. Any shift, on either stream,
+    breaks it -- which is what the sequential test cannot see, because there the shift
+    would have to be checked against an offset the loader chose.
+    """
+    tokens_path = tmp_path / "train_00000.bin"
+    mask_path = tmp_path / "train_00000.mask.bin"
+    count = 4096
+    np.arange(count, dtype=np.uint16).tofile(tokens_path)
+    (np.arange(count, dtype=np.uint8) % 2).tofile(mask_path)
+
+    batcher = TokenBatcher(
+        ShardedTokenStream([tokens_path], [count], np.dtype("<u2")),
+        seq_len=16,
+        batch_size=4,
+        seed=3,
+        mask_stream=ShardedTokenStream([mask_path], [count], np.dtype("u1")),
+    )
+    try:
+        for step in range(8):
+            batch = batcher.batch(step)
+            assert batch.loss_mask is not None
+            np.testing.assert_array_equal(batch.loss_mask, (batch.targets % 2).astype(np.uint8))
+    finally:
+        batcher.close()
+
+
+def test_a_maskless_dataset_yields_batches_with_no_mask(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The unmasked path is unchanged, and ``trained_tokens`` still answers.
+
+    ``None`` rather than a mask of ones, so a caller that forgets the mask exists
+    computes the same loss it always did, and reporting code has one number either
+    way.
+    """
+    manifest = prepare(tmp_path / "plain", conversation_documents(120), module_tokenizer)
+
+    batcher, _ = open_split(manifest, "train", seq_len=32, batch_size=4, seed=0)
+    try:
+        batch = batcher.batch(0)
+
+        assert not batcher.has_loss_mask
+        assert batch.loss_mask is None
+        assert batch.trained_tokens == batch.targets.size
+    finally:
+        batcher.close()
+
+
+def test_the_mask_can_be_turned_off_on_a_dataset_that_has_one(
+    batchable_masked_dataset: DatasetManifest,
+) -> None:
+    """`trainai train --no-loss-mask` on a masked dataset: deliberate, not accidental."""
+    batcher, _ = open_split(
+        batchable_masked_dataset, "train", seq_len=32, batch_size=4, seed=0, loss_mask=False
+    )
+    try:
+        assert not batcher.has_loss_mask
+        assert batcher.batch(0).loss_mask is None
+    finally:
+        batcher.close()
+
+
+def test_the_mask_follows_the_tokens_over_a_shard_boundary_in_a_batch(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """A window that straddles two shards is stitched in both streams or neither."""
+    manifest = prepare(
+        tmp_path / "sharded",
+        conversation_documents(200),
+        module_tokenizer,
+        loss_mask=True,
+        shard_tokens=1024,
+    )
+    assert len(manifest.shards["train"]) > 1
+    mask = read_mask(manifest, "train")
+
+    batcher, _ = open_split(manifest, "train", seq_len=64, batch_size=1, seed=0)
+    try:
+        rows = [batch.loss_mask for batch in batcher.sequential_batches()]
+    finally:
+        batcher.close()
+
+    assert all(row is not None for row in rows)
+    stitched = np.concatenate([row[0] for row in rows if row is not None])
+    # Every window's mask, in order and shifted: the crossing rows are in here, and a
+    # stream that dropped or repeated a byte at a boundary changes this sequence.
+    expected = np.concatenate(
+        [mask[start + 1 : start + 65] for start in range(0, 65 * len(rows), 65)]
+    )
+    np.testing.assert_array_equal(stitched, expected)
+
+
+def test_a_mask_shorter_than_its_tokens_is_refused_before_a_single_read(
+    tmp_path: Path,
+) -> None:
+    """Constructed directly: the two streams are addressed with the same offsets.
+
+    A mask stream one token short does not fail on read, it hands back the next
+    token's byte for every window past the gap. Refused up front, because the symptom
+    is a model that trains fine and is scored on the wrong tokens.
+    """
+    tokens_path = tmp_path / "train_00000.bin"
+    mask_path = tmp_path / "train_00000.mask.bin"
+    np.arange(200, dtype=np.uint16).tofile(tokens_path)
+    np.ones(199, dtype=np.uint8).tofile(mask_path)
+
+    tokens = ShardedTokenStream([tokens_path], [200], np.dtype("<u2"))
+    masks = ShardedTokenStream([mask_path], [199], np.dtype("u1"))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        TokenBatcher(tokens, seq_len=8, batch_size=1, mask_stream=masks)
+
+    assert "200 tokens but its loss mask covers 199" in str(caught.value)
+    assert "data inspect" in (caught.value.hint or "")
+
+
+def mapped_files(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, weakref.ref[Any]]]:
+    """Every file mapped from here on, as weak references, so releasing can be seen.
+
+    Weak rather than strong deliberately: a list holding the maps would keep them
+    alive and the assertion would be about the list. ``np.memmap`` is wrapped rather
+    than subclassed -- an ndarray subclass has its own ``__new__`` and ``__array_finalize__``
+    contract, and none of it is needed to record what was opened.
+    """
+    recorded: list[tuple[Path, weakref.ref[Any]]] = []
+    real_memmap = np.memmap
+
+    def recording(path: Any, *args: Any, **kwargs: Any) -> Any:
+        mapped = real_memmap(path, *args, **kwargs)
+        recorded.append((Path(path), weakref.ref(mapped)))
+        return mapped
+
+    monkeypatch.setattr(np, "memmap", recording)
+    return recorded
+
+
+def test_closing_the_batcher_releases_the_mask_maps(
+    batchable_masked_dataset: DatasetManifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows keeps a lock on a mapped file, so the mask has to be released too.
+
+    Proved twice, because the two proofs hold on different platforms. The map objects
+    are tracked by weak reference and must be dead after ``close()``: that is readable
+    everywhere, and it is the fact ``close()`` actually claims. The rewrite below it is
+    the Windows consequence of the same fact -- with a map still open it raises
+    ``PermissionError`` -- and on Linux rewriting a mapped file is ordinary, so on its
+    own it was an assertion that only bit on half the CI matrix.
+    """
+    mask_paths = {path.resolve() for path in batchable_masked_dataset.mask_paths("train")}
+    recorded = mapped_files(monkeypatch)
+
+    batcher, _ = open_split(batchable_masked_dataset, "train", seq_len=32, batch_size=4, seed=0)
+    batcher.batch(0)
+
+    masks = [ref for path, ref in recorded if path.resolve() in mask_paths]
+    assert masks, "no mask file was mapped, so this test proves nothing"
+    assert any(ref() is not None for ref in masks), "and none was still open to release"
+
+    batcher.close()
+    gc.collect()
+
+    assert [ref for ref in masks if ref() is not None] == [], "a mask map outlived close()"
+    path = batchable_masked_dataset.mask_paths("train")[0]
+    payload = path.read_bytes()
+    path.write_bytes(payload)
+
+
+# --------------------------------------------------------------------------- #
+# The chat template in the manifest
+#
+# The text in the shards of a chat corpus is a *layout*: a model trained on
+# "User: ...\n\nAssistant:" has to be prompted in that layout, or it continues the
+# question instead of answering it. The manifest records which layout so nothing
+# downstream has to guess.
+#
+# Two things here are easy to get wrong and have no symptom. The template is
+# recorded whenever the documents were *rendered* as chat, which is not the same
+# as whenever a mask was *written* -- --no-loss-mask still leaves the labels in the
+# shards -- so the two are tested apart. And the template must stay out of the
+# content hash, which is tested as a manifest with the key removed, because that is
+# exactly what every dataset prepared before this release is.
+# --------------------------------------------------------------------------- #
+def test_a_chat_corpus_records_the_template_it_was_rendered_with(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The values, not just the shape: this is what a reader has to prompt with.
+
+    Written out literally rather than compared to ``describe_template()``, which would
+    pass whatever the template happened to say.
+
+    ``labels`` holds the bare role names, not ``"User: "`` with its punctuation. The
+    contract is ``version``: a reader renders through :mod:`trainai.data.chat` at that
+    version, which is where the colon, the space and the blank line between turns live.
+    Recording the colon but not the separators would invite a reader to treat the
+    summary as the format and get the turn separator wrong instead.
+    """
+    manifest = prepare(
+        tmp_path / "chat", conversation_documents(40), module_tokenizer, loss_mask=True
+    )
+
+    assert manifest.chat["version"] == 1
+    assert manifest.chat["labels"]["user"] == "User"
+    assert manifest.chat["labels"]["assistant"] == "Assistant"
+    assert manifest.chat["trained_roles"] == ["assistant"]
+    assert manifest.chat == describe_template()
+
+
+def test_a_plain_corpus_records_no_template(
+    dataset: tuple[DatasetManifest, list[Document], ByteLevelBPE],
+) -> None:
+    """Absent, not a version number every dataset carries.
+
+    A reader has to be able to tell "rendered as chat" from "prose", and the only
+    honest way to say the second is to say nothing.
+    """
+    manifest, _documents, _tokenizer = dataset
+
+    assert manifest.chat == {}
+    assert manifest.to_dict()["chat"] == {}
+
+
+def test_a_chat_corpus_prepared_without_a_mask_still_records_its_template(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The distinction the ``typed_documents`` counter exists for.
+
+    --no-loss-mask writes no mask and no mask totals, but the shards still hold
+    "User:" and "Assistant:". Counting the template off the mask would lose the
+    layout for exactly the datasets that still need it at prompt time.
+    """
+    manifest = prepare(
+        tmp_path / "unmasked-chat", conversation_documents(40), module_tokenizer, loss_mask=False
+    )
+
+    assert not manifest.has_loss_mask
+    assert "masked_documents" not in manifest.totals
+    assert manifest.chat == describe_template()
+
+
+def test_one_chat_document_among_plain_ones_records_the_template(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Any, not all -- the opposite rule to ``has_loss_mask``, and for the opposite reason.
+
+    A mask that covers only some shards is useless, so that one is ``all``. A layout
+    that appears in only some documents is still a layout the model saw, and a model
+    that saw it can be prompted in it. Reporting a mixed corpus as prose would hide
+    the one fact this key exists to carry.
+    """
+    documents = [
+        *conversation_documents(4),
+        *(
+            Document(f"Plain prose number {index}. " * 20, "prose.txt", index, 0)
+            for index in range(36)
+        ),
+    ]
+
+    manifest = prepare(tmp_path / "mixed", documents, module_tokenizer, loss_mask=True)
+
+    assert manifest.totals["masked_documents"] == 4
+    assert manifest.chat == describe_template()
+
+
+def test_the_template_survives_the_trip_through_disk(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Recorded is only useful if it comes back, so the round trip is asserted."""
+    out = tmp_path / "chat"
+    prepare(out, conversation_documents(40), module_tokenizer, loss_mask=True)
+
+    assert DatasetManifest.load(out).chat == describe_template()
+
+
+def test_a_manifest_written_before_templates_were_recorded_still_loads(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Every dataset on disk today has no ``chat`` key, and none of them may break.
+
+    The key is optional on read, unlike every other key in the manifest, for the same
+    reason ``TrainConfig.loss_mask`` is optional in a checkpoint: requiring it would
+    refuse an otherwise perfect dataset over a field it could not have written.
+    """
+    out = tmp_path / "chat"
+    prepare(out, conversation_documents(40), module_tokenizer, loss_mask=True)
+    edit_manifest(out, lambda raw: raw.pop("chat"))
+
+    assert DatasetManifest.load(out).chat == {}
+    verify_dataset(out, deep=True)
+
+
+def test_recording_the_template_does_not_change_the_content_hash(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """The one thing this field must not do.
+
+    A dataset prepared before the template was recorded and the same corpus prepared
+    today have to report the same hash, or every documented hash in the project reads
+    as a corpus that changed. Tested as the older manifest itself -- the key removed --
+    rather than by asserting the exclusion list, because the exclusion list is the
+    thing under test.
+    """
+    out = tmp_path / "chat"
+    manifest = prepare(out, conversation_documents(40), module_tokenizer, loss_mask=True)
+    assert "chat" not in manifest.reproducible_parts()
+
+    edit_manifest(out, lambda raw: raw.pop("chat"))
+    older = DatasetManifest.load(out)
+
+    assert older.compute_content_hash() == manifest.content_hash
+    assert older.content_hash == manifest.content_hash
+
+
+def test_a_chat_block_that_is_not_an_object_is_refused_by_name(
+    tmp_path: Path, module_tokenizer: ByteLevelBPE
+) -> None:
+    """Lenient about the key being absent, not about it holding nonsense."""
+    out = tmp_path / "chat"
+    prepare(out, conversation_documents(40), module_tokenizer, loss_mask=True)
+    edit_manifest(out, lambda raw: raw.__setitem__("chat", ["Assistant:"]))
+
+    with pytest.raises(DatasetFormatError) as caught:
+        DatasetManifest.load(out)
+
+    assert "chat that is an array" in str(caught.value)
+    assert caught.value.details["subject"] == "chat"

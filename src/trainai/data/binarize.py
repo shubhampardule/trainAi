@@ -48,8 +48,9 @@ import numpy as np
 
 from trainai import __version__
 from trainai.data.analyze import DatasetReport
+from trainai.data.chat import describe_template
 from trainai.data.ingest import CUT_BY_MAX_DOC_CHARS, Document, IngestOptions
-from trainai.data.tokenizer import ByteLevelBPE
+from trainai.data.tokenizer import ByteLevelBPE, Encoded
 from trainai.data.validate import ValidationResult
 from trainai.errors import DatasetError, DatasetFormatError, json_literal, json_type_name
 
@@ -57,14 +58,19 @@ __all__ = [
     "DEFAULT_SHARD_TOKENS",
     "DEFAULT_VAL_FRACTION",
     "MANIFEST_NAME",
+    "MASK_DTYPE",
+    "MASK_SUFFIX",
     "SPLITS",
     "TOKENIZER_NAME",
     "DatasetManifest",
     "ShardInfo",
     "Split",
     "binarize_documents",
+    "count_straddling",
     "describe_dataset_layout",
+    "mask_name_for",
     "token_dtype",
+    "token_mask",
     "verify_dataset",
 ]
 
@@ -100,6 +106,94 @@ ProgressCallback = Callable[[int, int], None]
 """Called with ``(documents_done, tokens_written)``. Kept as a plain callable so
 this module never imports a UI library."""
 
+# One byte per token for the loss mask: 1 means the token is a training target, 0
+# means it is context the model reads but is not scored on. A bitfield would be
+# eight times smaller and is not worth it -- the loader has to hand the trainer a
+# tensor per batch, and unpacking bits per step to save 7 bytes in 8 of a file that
+# is half the size of the token shard beside it trades a real cost for a small one.
+MASK_DTYPE = np.dtype("u1")
+
+# The mask shard sitting beside train_00000.bin is train_00000.mask.bin. Derived
+# from the token shard's name rather than numbered on its own, so a mask file can
+# never be paired with the wrong shard.
+MASK_SUFFIX = ".mask.bin"
+
+
+def mask_name_for(shard_name: str) -> str:
+    """The mask file that belongs to token shard ``shard_name``."""
+    return shard_name.removesuffix(".bin") + MASK_SUFFIX
+
+
+def token_mask(
+    offsets: list[tuple[int, int]], spans: tuple[tuple[int, int], ...], *, trailing: int = 0
+) -> np.ndarray:
+    """One byte per token: 1 where the token falls inside a trained span.
+
+    ``offsets`` are the character ranges :meth:`ByteLevelBPE.encode_batch_with_offsets`
+    reported, ``spans`` the character ranges
+    :attr:`trainai.data.ingest.Document.trained_spans` marked, and ``trailing`` counts
+    tokens appended after the text -- the end-of-text marker -- which are always
+    trained: a model that is never scored on the token that ends a document never
+    learns to stop.
+
+    **A token is selected by intersection**, not by being contained in a span. It has
+    to be: ``trim_offsets`` leaves the space before a word outside that word's range,
+    so the token that emits ``" Hey"`` at the start of a reply reports only ``"Hey"``,
+    and a codepoint outside ASCII is several tokens all reporting the same range.
+    Containment either way would drop or add whole tokens at every boundary.
+
+    Intersection can in principle select a token that straddles a boundary and so
+    trains a character the mask says is context. Measured on the 20,000-conversation
+    corpus this repo ships: zero such tokens, and that is not luck. The byte-level
+    pre-tokenizer splits a whitespace run that is followed by text into single
+    characters, and BPE merges only inside a pre-token, so the ``"\\n\\n"`` a span ends
+    on can never merge with the ``"User"`` that follows it. A span boundary is
+    therefore always a token boundary in this template. The count is reported rather
+    than assumed -- see ``straddling`` in the mask totals.
+
+    ``spans`` being empty means the document has no opinion, which in a masked dataset
+    means every token is trained. It cannot mean the opposite: a document that
+    contributed tokens nothing is scored on is a document that made the run slower and
+    the model no better, silently.
+    """
+    total = len(offsets) + trailing
+    if not spans:
+        return np.ones(total, dtype=MASK_DTYPE)
+    mask = np.zeros(total, dtype=MASK_DTYPE)
+    if trailing:
+        mask[len(offsets) :] = 1
+    # Spans are sorted and disjoint (render_conversation guarantees it, and the
+    # reader re-checks), so one pass over each in step is enough.
+    index = 0
+    for start, end in spans:
+        while index < len(offsets) and offsets[index][1] <= start:
+            index += 1
+        cursor = index
+        while cursor < len(offsets) and offsets[cursor][0] < end:
+            mask[cursor] = 1
+            cursor += 1
+    return mask
+
+
+def count_straddling(offsets: list[tuple[int, int]], spans: tuple[tuple[int, int], ...]) -> int:
+    """Tokens that cover characters on both sides of a span edge.
+
+    Reported so that the intersection rule in :func:`token_mask` is a measurement
+    rather than a claim. Anything above zero means some tokens are scored on text the
+    mask calls context, which is a property of the corpus and the tokenizer, not a
+    bug -- but it must be visible.
+    """
+    if not spans:
+        return 0
+    straddling = 0
+    for start, end in offsets:
+        if start >= end:
+            continue
+        inside = sum(max(0, min(end, hi) - max(start, lo)) for lo, hi in spans)
+        if 0 < inside < end - start:
+            straddling += 1
+    return straddling
+
 
 def token_dtype(vocab_size: int) -> np.dtype:
     """Smallest little-endian unsigned type that can hold every token id.
@@ -118,20 +212,44 @@ def token_dtype(vocab_size: int) -> np.dtype:
 
 @dataclass(frozen=True)
 class ShardInfo:
-    """One shard file. ``sha256`` covers the raw bytes on disk."""
+    """One shard file. ``sha256`` covers the raw bytes on disk.
+
+    The loss mask lives in the *same* entry as the tokens it describes rather than in
+    a list of its own. A parallel list could be a different length, or be reordered,
+    and a mask paired with the wrong shard is not an error that surfaces -- it is a
+    run that scores the wrong tokens and converges slightly worse. Making the pairing
+    unrepresentable is cheaper than checking it.
+
+    The three mask fields are ``None`` together on a dataset without a mask, and
+    :meth:`to_dict` omits them entirely in that case, so preparing a corpus that has
+    no conversations in it produces byte-identical manifest and content hash to the
+    release before masks existed.
+    """
 
     name: str
     tokens: int
     bytes: int
     sha256: str
+    mask_name: str | None = None
+    mask_bytes: int | None = None
+    mask_sha256: str | None = None
+
+    @property
+    def has_mask(self) -> bool:
+        return self.mask_name is not None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        entry: dict[str, Any] = {
             "name": self.name,
             "tokens": self.tokens,
             "bytes": self.bytes,
             "sha256": self.sha256,
         }
+        if self.mask_name is not None:
+            entry["mask_name"] = self.mask_name
+            entry["mask_bytes"] = self.mask_bytes
+            entry["mask_sha256"] = self.mask_sha256
+        return entry
 
 
 #: What each key the manifest reader uses must hold. Every one of these is written by
@@ -169,7 +287,17 @@ _SHARD_TYPES: dict[str, tuple[type, ...]] = {
     "tokens": (int,),
     "bytes": (int,),
     "sha256": (str,),
+    "mask_name": (str,),
+    "mask_bytes": (int,),
+    "mask_sha256": (str,),
 }
+
+#: The mask keys are optional as a group, and required as a group. Optional because a
+#: manifest written before masks existed has none of them and describes a complete
+#: dataset; required as a group because two of the three are what ``verify_dataset``
+#: checks the file with, and a mask file no checksum covers is a mask that can rot
+#: without anything noticing.
+_SHARD_MASK_KEYS: tuple[str, ...] = ("mask_name", "mask_bytes", "mask_sha256")
 
 #: What each accepted type tuple is called in a refusal.
 _TYPE_NAMES: dict[tuple[type, ...], str] = {
@@ -270,11 +398,25 @@ class _ManifestReader:
         """
         subject = f"splits.{split}.shards[{index}]."
         entry = self.object_at(raw, subject.rstrip("."))
+        present = [key for key in _SHARD_MASK_KEYS if key in entry]
+        if present and len(present) != len(_SHARD_MASK_KEYS):
+            missing = [key for key in _SHARD_MASK_KEYS if key not in entry]
+            raise self.refuse(
+                f"has {subject}{present[0]} but not {subject}{missing[0]}: a loss mask "
+                "described by only part of its entry cannot be checked.",
+                field=f"{subject}{missing[0]}",
+                present=present,
+            )
         return ShardInfo(
             name=self.value(entry, "name", _SHARD_TYPES, subject),
             tokens=self.value(entry, "tokens", _SHARD_TYPES, subject),
             bytes=self.value(entry, "bytes", _SHARD_TYPES, subject),
             sha256=self.value(entry, "sha256", _SHARD_TYPES, subject),
+            mask_name=self.value(entry, "mask_name", _SHARD_TYPES, subject) if present else None,
+            mask_bytes=self.value(entry, "mask_bytes", _SHARD_TYPES, subject) if present else None,
+            mask_sha256=(
+                self.value(entry, "mask_sha256", _SHARD_TYPES, subject) if present else None
+            ),
         )
 
 
@@ -296,6 +438,14 @@ class DatasetManifest:
     corpus: dict[str, Any] = field(default_factory=dict)
     validation: dict[str, Any] = field(default_factory=dict)
     tokenizer: dict[str, Any] = field(default_factory=dict)
+    #: The chat template the documents were rendered with, or empty for a plain corpus.
+    #: What :func:`~trainai.data.chat.describe_template` returns: the version, the role
+    #: labels, and which roles are trained on. Recorded because the text in the shards
+    #: is a *layout*, and a model trained on one has to be prompted in the same one --
+    #: a run given a bare question when it only ever saw ``User: ...\n\nAssistant:``
+    #: continues the question instead of answering it, which reads as a bad model
+    #: rather than as a format mismatch.
+    chat: dict[str, Any] = field(default_factory=dict)
     created_with: str = f"trainai {__version__}"
     created_at: str = ""
     format: str = FORMAT_NAME
@@ -320,6 +470,35 @@ class DatasetManifest:
         base = self.root or Path()
         return [base / shard.name for shard in self.shards.get(split, ())]
 
+    @property
+    def has_loss_mask(self) -> bool:
+        """Whether every shard in this dataset has a mask beside it.
+
+        ``all`` rather than ``any``, and the difference is the point: a dataset where
+        some shards carry a mask and some do not is not a partly masked dataset, it is
+        one whose mask cannot be applied without silently scoring every token of the
+        shards that lack one. :func:`binarize_documents` writes masks for all shards or
+        none, so a mix means the manifest was edited or a write was lost.
+        """
+        shards = [shard for split in SPLITS for shard in self.shards.get(split, ())]
+        return bool(shards) and all(shard.has_mask for shard in shards)
+
+    @property
+    def partial_loss_mask(self) -> bool:
+        """Whether *some* but not all shards carry a mask. Always a defect."""
+        shards = [shard for split in SPLITS for shard in self.shards.get(split, ())]
+        masked = [shard for shard in shards if shard.has_mask]
+        return bool(masked) and len(masked) != len(shards)
+
+    def mask_paths(self, split: Split) -> list[Path]:
+        """Mask files for ``split``, in shard order. Empty if this dataset has none."""
+        base = self.root or Path()
+        return [
+            base / shard.mask_name
+            for shard in self.shards.get(split, ())
+            if shard.mask_name is not None
+        ]
+
     # -- serialisation ----------------------------------------------------- #
 
     def reproducible_parts(self) -> dict[str, Any]:
@@ -328,6 +507,12 @@ class DatasetManifest:
         Deliberately excludes ``created_at``, ``created_with`` and the corpus
         report's timing-free-but-noisy extras, so that the content hash answers
         exactly one question: did the same input produce the same bytes?
+
+        ``chat`` is excluded for a different reason. The rendered text is already in the
+        shards and the shards' checksums are here, so the template's effect on the bytes
+        is covered; including the description as well would only make every dataset
+        prepared before it was recorded hash differently, which is the one thing this
+        value must not do.
         """
         return {
             "format": self.format,
@@ -383,6 +568,7 @@ class DatasetManifest:
             "ingest": self.ingest,
             "corpus": self.corpus,
             "validation": self.validation,
+            "chat": self.chat,
         }
 
     def write(self, directory: str | Path) -> Path:
@@ -494,6 +680,14 @@ class DatasetManifest:
             corpus=key("corpus"),
             validation=key("validation"),
             tokenizer=key("tokenizer"),
+            # Optional, unlike every key above it, and for the same reason
+            # ``TrainConfig.loss_mask`` is: it is the first key added since datasets
+            # started being written, and requiring it would refuse every dataset
+            # prepared before this release with an error blaming an incomplete
+            # manifest. Absent means "no chat template", which is what those datasets
+            # recorded by not having the key. ``object_at`` still refuses one of the
+            # wrong type, so the leniency is about presence only.
+            chat=reader.object_at(top.get("chat", {}), "chat"),
             created_with=key("created_with"),
             created_at=key("created_at"),
             format_version=version,
@@ -514,11 +708,20 @@ class DatasetManifest:
 class _ShardWriter:
     """Appends token arrays to numbered shard files, hashing as it goes."""
 
-    def __init__(self, directory: Path, prefix: str, dtype: np.dtype, shard_tokens: int) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        prefix: str,
+        dtype: np.dtype,
+        shard_tokens: int,
+        *,
+        suffix: str = ".bin",
+    ) -> None:
         self._directory = directory
         self._prefix = prefix
         self._dtype = dtype
         self._limit = shard_tokens
+        self._suffix = suffix
         self._shards: list[ShardInfo] = []
         self._handle: BinaryIO | None = None
         self._digest = hashlib.sha256()
@@ -576,7 +779,53 @@ class _ShardWriter:
         self._index += 1
 
     def _current_path(self) -> Path:
-        return self._directory / f"{self._prefix}_{self._index:05d}.bin"
+        return self._directory / f"{self._prefix}_{self._index:05d}{self._suffix}"
+
+
+def _attach_masks(tokens: list[ShardInfo], masks: list[ShardInfo], split: str) -> list[ShardInfo]:
+    """Fold the mask writer's shards into the token writer's entries.
+
+    Both writers were given the same per-shard token limit and the same element counts
+    in the same order, so their shard boundaries are the same by construction. This
+    checks that anyway, because "by construction" is the phrase that precedes a
+    misaligned mask, and a mask off by one shard scores the wrong tokens for the rest
+    of the run without any symptom but a slightly worse loss.
+    """
+    if len(tokens) != len(masks):
+        raise DatasetError(
+            f"The {split} split wrote {len(tokens)} token shards but {len(masks)} mask "
+            "shards. Refusing to record a dataset whose mask cannot be aligned.",
+            hint="This is a bug in TrainAI, not a problem with your corpus. Please report it.",
+            details={"split": split, "token_shards": len(tokens), "mask_shards": len(masks)},
+        )
+    merged = []
+    for shard, mask in zip(tokens, masks, strict=True):
+        if mask.name != mask_name_for(shard.name):
+            raise DatasetError(
+                f"Mask {mask.name} was paired with shard {shard.name}, whose mask is "
+                f"{mask_name_for(shard.name)}.",
+                hint="This is a bug in TrainAI, not a problem with your corpus. Please report it.",
+                details={"shard": shard.name, "mask": mask.name},
+            )
+        if mask.tokens != shard.tokens:
+            raise DatasetError(
+                f"Mask {mask.name} covers {mask.tokens} tokens but shard {shard.name} "
+                f"holds {shard.tokens}.",
+                hint="This is a bug in TrainAI, not a problem with your corpus. Please report it.",
+                details={"shard": shard.name, "mask": mask.name},
+            )
+        merged.append(
+            ShardInfo(
+                name=shard.name,
+                tokens=shard.tokens,
+                bytes=shard.bytes,
+                sha256=shard.sha256,
+                mask_name=mask.name,
+                mask_bytes=mask.bytes,
+                mask_sha256=mask.sha256,
+            )
+        )
+    return merged
 
 
 def binarize_documents(
@@ -593,6 +842,7 @@ def binarize_documents(
     ingest_options: IngestOptions | None = None,
     sources: list[dict[str, Any]] | None = None,
     progress: ProgressCallback | None = None,
+    loss_mask: bool = False,
 ) -> DatasetManifest:
     """Tokenize ``documents`` into shards under ``out_dir`` and write the manifest.
 
@@ -615,6 +865,11 @@ def binarize_documents(
         ingest_options: Ingest settings, recorded so the run can be reproduced.
         sources: Source-file records from :meth:`Ingestor.discover`.
         progress: Called with ``(documents_done, tokens_written)`` as work proceeds.
+        loss_mask: Write a mask shard beside every token shard, marking which tokens
+            are training targets. A parameter rather than something inferred from the
+            first document that carries spans, because the decision has to be made
+            before the first byte is written and cannot be revised halfway: the caller
+            knows, from the ingest options, whether this corpus is a typed one.
 
     Raises:
         DatasetError: If ``val_fraction`` is out of range, no documents arrived, or
@@ -648,9 +903,28 @@ def binarize_documents(
         "train": _ShardWriter(out_dir, "train", dtype, shard_tokens),
         "val": _ShardWriter(out_dir, "val", dtype, shard_tokens),
     }
+    # Same directory, same limit, same order of writes, one byte per token instead of
+    # two: the mask writer's shard boundaries land in the same places as the token
+    # writer's, which is what makes train_00000.mask.bin describe train_00000.bin.
+    mask_writers = (
+        {
+            "train": _ShardWriter(out_dir, "train", MASK_DTYPE, shard_tokens, suffix=MASK_SUFFIX),
+            "val": _ShardWriter(out_dir, "val", MASK_DTYPE, shard_tokens, suffix=MASK_SUFFIX),
+        }
+        if loss_mask
+        else {}
+    )
     counts = {"train": 0, "val": 0}
     tokens_written = 0
     documents_done = 0
+    trained_tokens = 0
+    straddling_tokens = 0
+    masked_documents = 0
+    # Counted whether or not a mask is being written, which ``masked_documents`` is
+    # not: a chat corpus prepared with --no-loss-mask still has User:/Assistant: text
+    # in its shards, so it still has to record the template a model trained on it must
+    # be prompted with. Spans reach a document from nowhere but the chat template.
+    typed_documents = 0
     eot = tokenizer.eot_id
     # The extremes of the split hash, kept so the two empty-split refusals below can name
     # the fraction that would have worked instead of one that probably would. Sentinels
@@ -661,12 +935,23 @@ def binarize_documents(
 
     try:
         for batch in _batched(documents, batch_documents):
-            encoded = tokenizer.encode_batch([document.text for document in batch])
+            texts = [document.text for document in batch]
+            # Offsets are only asked for when a mask is being written: the tokenizer
+            # returns them either way, but building the Python tuples for every token
+            # of a corpus that has no spans in it is work with no output.
+            offsets_batch: list[list[tuple[int, int]]] | None = None
+            if loss_mask:
+                with_offsets: list[Encoded] = tokenizer.encode_batch_with_offsets(texts)
+                encoded = [item.ids for item in with_offsets]
+                offsets_batch = [item.offsets for item in with_offsets]
+            else:
+                encoded = tokenizer.encode_batch(texts)
             # Group by split first so each split gets one array per batch rather
             # than one per document; concatenating 512 tiny arrays costs more than
             # the tokenization did.
             grouped: dict[Split, list[list[int]]] = {"train": [], "val": []}
-            for document, ids in zip(batch, encoded, strict=True):
+            grouped_masks: dict[Split, list[np.ndarray]] = {"train": [], "val": []}
+            for position, (document, ids) in enumerate(zip(batch, encoded, strict=True)):
                 if val_fraction <= 0.0:
                     # No hash is computed when validation is off, so the extremes stay at
                     # their sentinels -- and neither refusal that reads them can fire,
@@ -679,6 +964,19 @@ def binarize_documents(
                     split = _side(fraction, val_fraction)
                 grouped[split].append([*ids, eot])
                 counts[split] += 1
+                if document.trained_spans:
+                    typed_documents += 1
+                if offsets_batch is not None:
+                    offsets = offsets_batch[position]
+                    spans = document.trained_spans
+                    # The end-of-text token is appended above and is always a target,
+                    # which `trailing=1` covers.
+                    mask = token_mask(offsets, spans, trailing=1)
+                    grouped_masks[split].append(mask)
+                    trained_tokens += int(mask.sum())
+                    if spans:
+                        masked_documents += 1
+                        straddling_tokens += count_straddling(offsets, spans)
             for split, groups in grouped.items():
                 if not groups:
                     continue
@@ -689,15 +987,22 @@ def binarize_documents(
                 )
                 writers[split].write(flat)
                 tokens_written += int(flat.size)
+                if mask_writers:
+                    mask_writers[split].write(np.concatenate(grouped_masks[split]))
             documents_done += len(batch)
             if progress is not None:
                 progress(documents_done, tokens_written)
 
         shards = {split: list(writer.close()) for split, writer in writers.items()}
+        if mask_writers:
+            shards = {
+                split: _attach_masks(shards[split], list(mask_writers[split].close()), split)
+                for split in writers
+            }
     except BaseException:
         # A partially written dataset with no manifest is worse than nothing: the
         # next run would find stale shards. Close handles, then remove them.
-        for writer in writers.values():
+        for writer in (*writers.values(), *mask_writers.values()):
             with suppress(Exception):
                 writer.close()
         _remove_shards(out_dir)
@@ -783,7 +1088,7 @@ def binarize_documents(
 
     if counts["train"] == 0:
         _remove_shards(out_dir)
-        # The mirror of the check above, and it was missing. `_assign_split` hashes
+        # The mirror of the check above, and it was missing. `_split_fraction` hashes
         # each document independently, so it is a weighted coin per document and not a
         # quota: with few documents it can send *every* one of them to validation.
         # Measured, one document at --val-fraction 0.49 does it for 37 of 60 seeds.
@@ -829,6 +1134,19 @@ def binarize_documents(
         )
 
     tokenizer.save(out_dir / TOKENIZER_NAME)
+    totals: dict[str, int] = {
+        "documents": documents_done,
+        "tokens": tokens_written,
+        "eot_tokens": documents_done,
+        "chars": report.total_chars if report else 0,
+        "utf8_bytes": report.total_utf8_bytes if report else 0,
+    }
+    if loss_mask:
+        # Only written when there is a mask, so a dataset without one keeps the totals
+        # block -- and therefore the content hash -- it had before masks existed.
+        totals["trained_tokens"] = trained_tokens
+        totals["masked_documents"] = masked_documents
+        totals["straddling_tokens"] = straddling_tokens
     manifest = DatasetManifest(
         dtype=dtype.str,
         vocab_size=tokenizer.vocab_size,
@@ -839,13 +1157,7 @@ def binarize_documents(
         shard_tokens=shard_tokens,
         shards=shards,
         documents=dict(counts),
-        totals={
-            "documents": documents_done,
-            "tokens": tokens_written,
-            "eot_tokens": documents_done,
-            "chars": report.total_chars if report else 0,
-            "utf8_bytes": report.total_utf8_bytes if report else 0,
-        },
+        totals=totals,
         ingest={
             "options": ingest_options.to_dict() if ingest_options else {},
             "sources": sources or [],
@@ -853,6 +1165,10 @@ def binarize_documents(
         corpus=report.to_dict() if report else {},
         validation=validation.to_dict() if validation else {},
         tokenizer=tokenizer.to_dict(),
+        # Empty for a plain corpus rather than a template nobody used: a reader has to
+        # be able to tell "rendered as chat" from "prose", and the honest way is the
+        # absence of a template, not a version number every dataset carries.
+        chat=describe_template() if typed_documents else {},
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     manifest.write(out_dir)
@@ -870,6 +1186,21 @@ def verify_dataset(directory: str | Path, *, deep: bool = True) -> DatasetManife
     manifest = DatasetManifest.load(directory)
     root = manifest.root or Path(directory)
     itemsize = manifest.numpy_dtype.itemsize
+
+    if manifest.partial_loss_mask:
+        raise DatasetFormatError(
+            "Some shards have a loss mask and some do not, so the mask cannot be "
+            "applied without silently training on every token of the rest.",
+            hint=_REBUILD_HINT,
+            details={
+                "masked": [
+                    shard.name
+                    for split in SPLITS
+                    for shard in manifest.shards.get(split, ())
+                    if shard.has_mask
+                ]
+            },
+        )
 
     for split in SPLITS:
         for shard in manifest.shards.get(split, ()):
@@ -905,8 +1236,49 @@ def verify_dataset(directory: str | Path, *, deep: bool = True) -> DatasetManife
                     ),
                     details={"path": str(path), "expected_sha256": shard.sha256},
                 )
+            if shard.mask_name is not None:
+                _verify_mask(root, shard, split, deep=deep)
 
     return manifest
+
+
+def _verify_mask(root: Path, shard: ShardInfo, split: str, *, deep: bool) -> None:
+    """The same three checks as a token shard, against the mask that describes it.
+
+    A separate function only so the shard loop stays readable. The size check is the
+    one that matters most here: a mask is one byte per token, so its length is the
+    shard's token count exactly, and a mask of the wrong length is a mask that
+    silently shifts which tokens are scored from that point on.
+    """
+    assert shard.mask_name is not None  # only called when there is one
+    path = root / shard.mask_name
+    if not path.exists():
+        raise DatasetFormatError(
+            f"Loss mask {shard.mask_name} is listed in the manifest but missing.",
+            hint=(
+                "Re-run `trainai data prepare` to rebuild the dataset. Do not move or "
+                "rename files inside a prepared dataset directory."
+            ),
+            details={"path": str(path), "split": split, "shard": shard.name},
+        )
+    size = path.stat().st_size
+    if size != shard.tokens:
+        raise DatasetFormatError(
+            f"Loss mask {shard.mask_name} is {size} bytes; shard {shard.name} holds "
+            f"{shard.tokens} tokens, and the mask is one byte per token.",
+            hint=("The file was truncated or partly overwritten. Re-run `trainai data prepare`."),
+            details={"path": str(path), "size": size, "expected": shard.tokens},
+        )
+    if deep and _sha256_file(path) != shard.mask_sha256:
+        raise DatasetFormatError(
+            f"Loss mask {shard.mask_name} does not match its recorded checksum.",
+            hint=(
+                "The file's contents changed since preparation. Training on it would "
+                "score tokens the manifest does not describe. Re-run "
+                "`trainai data prepare`."
+            ),
+            details={"path": str(path), "expected_sha256": shard.mask_sha256},
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,7 +1401,7 @@ def _how_to_get_more_documents(sources: list[dict[str, Any]] | None) -> str:
 def _split_fraction(text: str, seed_key: bytes) -> float:
     """Where this document falls in ``[0, 1)``, from its content and the seed alone.
 
-    Factored out of :func:`_assign_split` so the empty-split hints can name the exact
+    Kept apart from :func:`_side` so the empty-split hints can name the exact
     threshold this corpus needs rather than a probability. The caller keeps the smallest
     and largest value it sees -- two floats, no per-document storage -- which is all the
     advice needs, because the boundary is a comparison against one number.
@@ -1048,15 +1420,13 @@ def _side(fraction: float, val_fraction: float) -> Split:
     return "val" if fraction < val_fraction else "train"
 
 
-def _assign_split(text: str, seed_key: bytes, val_fraction: float) -> Split:
-    """Deterministic content-hash split.
-
-    blake2b keyed with the seed, taken as a 64-bit fraction. Identical text always
-    lands on the same side for a given seed, on any platform, in any order.
-    """
-    if val_fraction <= 0.0:
-        return "train"
-    return _side(_split_fraction(text, seed_key), val_fraction)
+# An ``_assign_split(text, seed_key, val_fraction)`` used to sit here, combining the
+# two functions above into the whole decision for one document. Nothing called it: the
+# writing loop inlines the same three lines instead, because it also has to keep the
+# lowest and highest fraction it sees -- the two numbers the empty-split hints are
+# computed from -- and a helper returning only the side would throw them away. So the
+# two halves are separate functions and the loop is the only caller of each, which is
+# what lets ``_side`` be the single place the boundary is decided.
 
 
 def _batched(items: Iterable[Document], size: int) -> Iterator[list[Document]]:
@@ -1109,4 +1479,6 @@ def describe_dataset_layout() -> str:
         "  val_00000.bin    the held-out split, same format\n"
         "\nEach document is followed by the end-of-text token, so the shards form "
         "one continuous token stream."
+        "\n\nA dataset prepared from typed conversations also holds, for each shard:\n"
+        "  train_00000.mask.bin  one uint8 per token: 1 to train on it, 0 for context"
     )

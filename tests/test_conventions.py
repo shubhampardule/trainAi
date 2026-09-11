@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import itertools
 import re
 import subprocess
 import sys
@@ -154,7 +155,7 @@ def test_every_source_file_is_tracked_by_git() -> None:
 #:
 #: The third column is the pattern that has to be the one deciding, and it is not
 #: decoration. Two mutations survived a version of this test that only asserted the
-#: verdict. Deleting the ``.local-agent/`` line changed nothing, because one developer's
+#: verdict. Deleting the ``.claude/`` line changed nothing, because one developer's
 #: *global* excludes file still covered it -- so the test was measuring that machine
 #: rather than this repository. And anchoring ``__pycache__/`` changed nothing,
 #: because ``*.py[cod]`` caught the same file for an unrelated reason.
@@ -187,7 +188,7 @@ IGNORE_RULES: list[tuple[str, bool, str]] = [
     (".env.example", False, ""),
     # Per-machine agent settings, which were ignored only by one developer's *global*
     # excludes file -- something no clone and no CI runner has.
-    (".local-agent/settings.local.json", True, ".local-agent/"),
+    (".claude/settings.local.json", True, ".claude/"),
     # Corpus extensions this project reads. `.log` is the sharp one: it is a text
     # alias in `trainai.data.ingest`, so a tidy-looking `*.log` rule would ignore
     # input the tool is documented as accepting.
@@ -1040,11 +1041,45 @@ def test_help_does_not_import_torch_or_the_tokenizer() -> None:
 #: module would hide a real TrainAI flag typo anywhere in the same file.
 PIP_FLAGS = frozenset({"--upgrade", "--force-reinstall", "--index-url"})
 
+#: The same problem one surface over: long options the *documents* name that belong to
+#: another tool. The README quotes the pip command ``setup`` prints, and the development
+#: and contributing sections quote the commands a contributor runs.
+#:
+#: Keyed by the owning tool, not exempted by spelling alone as :data:`PIP_FLAGS` is, and
+#: a flag here is only excused on a line that names its tool. The difference is worth the
+#: extra dictionary because these spellings are generic: ``--check`` waved through
+#: everywhere would also wave through ``trainai data validate --check``, which is the
+#: mistake the check exists to catch. Line-scoping works here and did not for source
+#: strings -- a documented command is one line and names the tool it runs, where
+#: ``_install_command`` builds its command from two literals and the half holding
+#: ``--index-url`` never mentions pip.
+FOREIGN_FLAGS_IN_DOCS = {
+    "pip": frozenset({"--upgrade", "--force-reinstall"}),
+    "pytest": frozenset({"--cov", "--cov-report"}),
+    "ruff": frozenset({"--check"}),
+    # `CONTRIBUTING.md`'s release section documents two commands that are not the CLI: the
+    # pre-tag check in `tools/`, and the `twine check --strict` the release workflow runs
+    # on the built artifacts. Only flags a document actually names may be listed here --
+    # `test_the_document_flag_exemption_is_still_earned` refuses an entry nothing uses.
+    "release_check.py": frozenset({"--tag"}),
+    "twine": frozenset({"--strict"}),
+}
+
 FLAG_IN_TEXT = re.compile(r"--[a-z][a-z0-9-]+")
 
 #: A backticked ``trainai ...`` invocation. Stops at a backtick, and the capture keeps
 #: placeholders like ``<corpus>`` out by matching only lowercase words and flags.
 COMMAND_IN_TEXT = re.compile(r"`trainai ((?:[a-z][a-z0-9-]*\s*)*)")
+
+#: The opening or closing line of a fenced code block, indented or not.
+FENCE_LINE = re.compile(r"^\s*```")
+
+#: The same invocation *inside* a fenced block, where no backtick marks it up because the
+#: whole block is one. Anchored on a word boundary instead, which has to include ``/``:
+#: a block showing ``.venv/bin/trainai doctor`` is still showing a command, and a class of
+#: only whitespace would skip it silently. It also tolerates a leading ``$`` prompt and an
+#: opening parenthesis. Same capture as above, for the same reason.
+INVOCATION_IN_BLOCK = re.compile(r"(?:^|[\s(/])trainai ((?:[a-z][a-z0-9-]*\s*)*)")
 
 
 def strings_in(path: Path) -> list[tuple[int, str]]:
@@ -1089,6 +1124,110 @@ def test_every_flag_the_code_names_exists_on_some_command() -> None:
         f"{sorted(set(unknown))}. Either the spelling is wrong or the flag was "
         "removed; a message may not name an option the CLI does not have."
     )
+
+
+def foreign_flag(flag: str, line: str) -> bool:
+    """Whether ``flag`` on this line is another tool's rather than TrainAI's.
+
+    Both halves have to hold. A pip flag on a line about pip is fine; the same spelling
+    on a line about ``trainai`` is the typo :data:`FOREIGN_FLAGS_IN_DOCS` explains.
+    """
+    return any(flag in flags and tool in line for tool, flags in FOREIGN_FLAGS_IN_DOCS.items())
+
+
+def unknown_flags_in(text: str, known: set[str]) -> list[tuple[int, str]]:
+    """Every long option in ``text`` that no TrainAI command accepts, with its line.
+
+    A helper rather than a loop inside the test below, so the judgement it makes can be
+    stated directly on lines chosen for the purpose -- the shape :func:`no_such_command`
+    already uses. A scan of real documents only proves what today's documents happen to
+    contain; the cases that matter are the ones no page holds yet.
+    """
+    return [
+        (lineno, named)
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        for named in FLAG_IN_TEXT.findall(line)
+        if named not in known and not foreign_flag(named, line)
+    ]
+
+
+def test_every_flag_the_documents_name_exists_on_some_command() -> None:
+    """The same rule as above on the surface most readers reach first.
+
+    The source check cannot see a document, and prose is where a flag typo survives
+    longest: nothing imports it, so a renamed flag stays right on every page that quoted
+    the old spelling until a reader types it and it fails. That is worse than a bad
+    message, because the reader has no reason to doubt the page.
+
+    Scoped to :func:`prose_documents`, so ``CHANGELOG.md`` is out for the reason given
+    there -- a released entry names the flag that existed when it was written, and the
+    right response to a rename is a new entry, never an edit to an old one.
+
+    It checks existence, not attribution, exactly as the source-side check does -- a
+    document naming ``--vocab-size`` on the wrong command still passes. Only one
+    documented invocation is actually executed anywhere
+    (:func:`test_the_dry_run_output_the_readme_quotes_is_what_the_code_prints`); the
+    walkthrough transcript is recorded by hand. So this is a spelling net, and the gap
+    above it is known.
+    """
+    known = set(cli_flag_owners())
+    documented: set[str] = set()
+    unknown: list[str] = []
+    for path in prose_documents():
+        text = path.read_text(encoding="utf-8")
+        documented.update(FLAG_IN_TEXT.findall(text))
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        unknown += [
+            f"{relative}:{lineno}: {named}" for lineno, named in unknown_flags_in(text, known)
+        ]
+
+    assert not unknown, (
+        f"these flags are named in the documents but no command accepts them: "
+        f"{sorted(set(unknown))}. Either the spelling is wrong or the flag was removed; "
+        "a page may not tell a reader to pass an option the CLI does not have."
+    )
+
+    # Second, because a genuine typo above is the more useful failure. A lower bound
+    # rather than a count, so documenting another flag does not fail this -- but an empty
+    # document glob, or a regex that stops matching, does.
+    assert len(documented) > 40, (
+        f"only {len(documented)} distinct flags found across {len(prose_documents())} "
+        "documents, so this check is passing without looking at anything"
+    )
+
+
+@pytest.mark.parametrize(
+    ("line", "reported"),
+    [
+        # The commands a contributor runs, which name their own tool and are not ours.
+        ("ruff check . && ruff format --check .", False),
+        ('pytest -m "not gpu" --cov=trainai --cov-report=xml', False),
+        ("pip install --upgrade --force-reinstall torch", False),
+        # The same generic spellings on a TrainAI line, which is the hole that scoping
+        # the exemption to a tool closes. None of these appears in any document, so the
+        # scan above would keep passing if the scoping were lost.
+        ("trainai data validate corpus --check", True),
+        ("trainai train corpus --out runs/m4 --upgrade", True),
+        ("trainai train corpus --cov", True),
+        # An ordinary real flag, and the typo a rename leaves behind.
+        ("trainai chat runs/m4 --tokens 120 --seed 7", False),
+        ("trainai chat runs/m4 --tokenz 120", True),
+        # A typo beside an exempt tool, so naming a tool cannot excuse the whole line.
+        ('pip install -e ".[dev]" && trainai doctor --verbse', True),
+        # A flag on a line naming a tool we do not exempt at all.
+        ("python -m mypy --strict src", True),
+    ],
+)
+def test_a_documented_flag_is_judged_by_the_tool_on_its_line(line: str, reported: bool) -> None:
+    """The cases the check above turns on, stated rather than left to today's documents.
+
+    ``--check`` is the one that matters. It is ruff's, it is generic, and exempting the
+    spelling everywhere -- the obvious way to write this -- would wave through
+    ``trainai data validate --check`` as well, which is exactly the advice-nobody-can-take
+    mistake this section exists to catch.
+    """
+    found = unknown_flags_in(line, set(cli_flag_owners()))
+    assert bool(found) is reported, f"{line!r} reported {found}"
 
 
 def no_such_command(words: list[str], known: set[str], groups: set[str]) -> str | None:
@@ -1145,6 +1284,593 @@ def test_every_command_the_code_names_can_be_run() -> None:
     )
 
 
+def documented_invocations(text: str) -> list[tuple[int, str]]:
+    """Every ``trainai ...`` a reader of one document could run, with its line number.
+
+    Fence-aware because the two surfaces need opposite rules. Inside a fenced block every
+    line is a command, so requiring a backtick -- which is what the source-side scan does
+    -- finds none of them: that is how the most-copied surface in the project stayed
+    unchecked while nine tenths of a page went past the checker. Outside a block the
+    backtick is the only thing separating an invocation from a sentence that happens to
+    contain the word, and "the trainai package" would otherwise resolve as a command.
+    """
+    found: list[tuple[int, str]] = []
+    inside = False
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if FENCE_LINE.match(line):
+            inside = not inside
+            continue
+        pattern = INVOCATION_IN_BLOCK if inside else COMMAND_IN_TEXT
+        found += [(lineno, phrase.strip()) for phrase in pattern.findall(line) if phrase.strip()]
+    return found
+
+
+def open_fences(text: str) -> int:
+    """How many ``` lines a document has. Odd means one was never closed.
+
+    Counted line by line rather than with ``FENCE_LINE.findall``, which was the first
+    version and always returned 0 or 1: the pattern is anchored with ``^`` and the module
+    does not compile it ``MULTILINE``, so it only ever looked at the first line of the
+    file. The balance guard was passing on every document including a broken one.
+    """
+    return sum(1 for line in text.splitlines() if FENCE_LINE.match(line))
+
+
+def has_unclosed_fence(text: str) -> bool:
+    """Whether a document leaves a code block open, which makes the scan lie.
+
+    Its own predicate rather than a ``% 2`` inline in the test, because the parity is the
+    load-bearing part and an inline one is checked by nothing: loosened to ``% 1`` it still
+    reads like a guard, still passes, and every block past the unmatched fence is then
+    scanned as prose -- which is to say not scanned at all.
+    """
+    return open_fences(text) % 2 == 1
+
+
+def undocumented_commands(text: str, known: set[str], groups: set[str]) -> list[tuple[int, str]]:
+    """Every ``trainai ...`` in one document that would not run, with why.
+
+    A helper rather than a loop in the test, so the judgement can be stated on documents
+    written for the purpose. :func:`no_such_command` is already pinned that way; this is
+    the layer above it, which is where the fence tracking and the reporting live.
+    """
+    return [
+        (lineno, f"trainai {phrase} ({reason})")
+        for lineno, phrase in documented_invocations(text)
+        if (reason := no_such_command(phrase.split(), known, groups)) is not None
+    ]
+
+
+def test_every_command_the_documents_show_would_actually_run() -> None:
+    """The commands a reader copies, checked the way the ones the code prints are.
+
+    A page is a worse place for this mistake than a message. The tool's own hint is
+    printed beside an error the reader already distrusts; a fenced block in the
+    walkthrough is the thing they paste, and "No such command" from step two of a
+    tutorial reads as the tool being broken.
+
+    Existence only, as with the flags: whether the *arguments* are right is not something
+    a static scan can say, and only one documented block is actually executed anywhere.
+    """
+    known, groups = cli_command_paths(), cli_group_paths()
+    seen: set[str] = set()
+    unknown: list[str] = []
+    for path in prose_documents():
+        text = path.read_text(encoding="utf-8")
+        assert not has_unclosed_fence(text), (
+            f"{path.name} has an odd number of ``` fences, so every block after the "
+            "unmatched one is read as prose and goes unchecked"
+        )
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        seen.update(phrase for _, phrase in documented_invocations(text))
+        unknown += [
+            f"{relative}:{lineno}: {problem}"
+            for lineno, problem in undocumented_commands(text, known, groups)
+        ]
+
+    assert not unknown, (
+        f"these commands are shown in the documents but do not exist: {sorted(set(unknown))}"
+    )
+    # A floor, for the same reason the flag check carries one: an empty document glob or a
+    # regex that stops matching would otherwise pass this silently.
+    assert len(seen) > 12, f"only {len(seen)} distinct invocations found in the documents: {seen}"
+
+
+@pytest.mark.parametrize(
+    ("document", "found"),
+    [
+        # Inside a block, with and without a shell prompt, and with the fence indented
+        # under a list item.
+        ("```bash\ntrainai data prepare corpus\n```", ["data prepare corpus"]),
+        ("```\n$ trainai doctor\n```", ["doctor"]),
+        ("- step one:\n  ```bash\n  trainai plan corpus\n  ```", ["plan corpus"]),
+        # Outside one, the backtick is what makes it an invocation rather than a sentence.
+        ("Run `trainai doctor` first.", ["doctor"]),
+        ("The trainai package is not on PyPI.", []),
+        ("A trainai run writes into runs/.", []),
+        # A block showing the entry point by path is still showing a command, and a word
+        # merely ending in `trainai` is not one.
+        ("```bash\n.venv/bin/trainai doctor\n```", ["doctor"]),
+        ("```bash\nmytrainai doctor\n```", []),
+        # The fence has to close, or prose below it would be scanned as shell.
+        ("```bash\ntrainai doctor\n```\nInstalling trainai first is required.", ["doctor"]),
+        # Two blocks, so the toggle has to survive more than one.
+        (
+            "```bash\ntrainai setup\n```\ntext\n```bash\ntrainai doctor\n```",
+            ["setup", "doctor"],
+        ),
+    ],
+)
+def test_a_documented_invocation_is_found_by_where_it_is_written(
+    document: str, found: list[str]
+) -> None:
+    """Fence tracking, stated on documents written for the purpose.
+
+    The scan above only proves what today's pages contain, and the case that matters is
+    the one no page has: an unbackticked ``trainai`` in a sentence. Read as a command it
+    resolves to "not a command" and fails the check on correct prose, so a fence tracker
+    that drifts does not merely miss things -- it invents findings.
+    """
+    assert [phrase for _, phrase in documented_invocations(document)] == found
+
+
+@pytest.mark.parametrize(
+    ("document", "reported"),
+    [
+        ("```bash\ntrainai data prepare corpus --out data/tiny\n```", False),
+        ("```bash\ntrainai data prepair corpus\n```", True),
+        ("```bash\ntrainai prepare corpus\n```", True),
+        ("Run `trainai doctr` to check.", True),
+        # The typo has to be found in a block that is not the first one on the page.
+        ("```\ntrainai setup\n```\nthen\n```\ntrainai dcotor\n```", True),
+    ],
+)
+def test_a_command_a_document_shows_is_reported_when_it_would_not_run(
+    document: str, reported: bool
+) -> None:
+    """That the scan above turns a resolver verdict into a finding, not just computes one.
+
+    Written against whole documents rather than word lists because that is the seam where
+    the two halves meet: :func:`no_such_command` is pinned on phrases below, and this is
+    the only place proving a phrase found in a fenced block reaches it at all.
+    """
+    found = undocumented_commands(document, cli_command_paths(), cli_group_paths())
+    assert bool(found) is reported, f"{document!r} reported {found}"
+
+
+@pytest.mark.parametrize(
+    ("document", "fences"),
+    [
+        ("```bash\ntrainai doctor\n```", 2),
+        ("no code here", 0),
+        ("```bash\ntrainai doctor", 1),  # never closed
+        ("- item:\n  ```bash\n  trainai doctor\n  ```", 2),  # indented under a list
+        ("```\na\n```\nb\n```\nc\n```", 4),
+    ],
+)
+def test_the_fence_counter_sees_every_line_not_just_the_first(document: str, fences: int) -> None:
+    """The guard above is only a guard if it counts more than one line.
+
+    ``FENCE_LINE.findall(text)`` was the first version and could never return more than
+    one, because the pattern is ``^``-anchored and nothing compiles it ``MULTILINE``. The
+    balance assertion was therefore always true, which a mutation planting an unclosed
+    fence in the walkthrough is what revealed.
+    """
+    assert open_fences(document) == fences
+
+
+@pytest.mark.parametrize(
+    ("document", "unclosed"),
+    [
+        ("```bash\ntrainai doctor\n```", False),
+        ("no code here", False),
+        ("```bash\ntrainai doctor", True),
+        ("```\na\n```\nb\n```\nc", True),
+        ("```\na\n```\nb\n```\nc\n```", False),
+    ],
+)
+def test_an_unclosed_fence_is_recognised_as_one(document: str, unclosed: bool) -> None:
+    """The parity, stated separately from the count it is derived from.
+
+    Both halves can fail on their own: a counter that sees one line and a parity loosened
+    to ``% 1`` produce the same always-passing guard by different routes, and only one of
+    them looks wrong when read.
+    """
+    assert has_unclosed_fence(document) is unclosed
+
+
+def joined_block_lines(text: str, language: str | None = None) -> list[tuple[int, str]]:
+    """Fenced lines, with ``\\`` continuations folded into the line that opened them.
+
+    Needed because the walkthrough's longest invocations wrap, and half a command is not
+    one: the second physical line of ``trainai train ... \\`` carries flags with no verb
+    in front of them, so anything reading lines as written attributes them to nothing.
+    Reported against the line the command *started* on, which is the one a reader edits.
+
+    ``language`` restricts the result to blocks whose opening fence names it, which is how
+    a command a reader types is told from a transcript of what one printed. Left off by
+    default, because a transcript that quotes a command -- ``plan`` prints the ``train``
+    line it recommends -- is showing a command someone will paste, and a flag wrong there
+    is wrong in the code rather than the page.
+    """
+    joined: list[tuple[int, str]] = []
+    inside, pending, start = False, "", 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if FENCE_LINE.match(line):
+            if inside:
+                inside = False
+            else:
+                inside = language is None or line.strip().strip("`").strip() == language
+            continue
+        if not inside:
+            continue
+        stripped = line.rstrip()
+        if pending:
+            pending += " " + stripped.lstrip()
+        else:
+            pending, start = stripped, lineno
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        if pending:
+            joined.append((start, pending))
+        pending = ""
+    if pending:
+        joined.append((start, pending))
+    return joined
+
+
+def command_on_line(line: str, known: set[str]) -> str | None:
+    """The ``trainai`` command a shell line invokes, or ``None`` if it invokes none.
+
+    The longest prefix of the captured words that is a real command path, so
+    ``trainai chat runs/m4`` is ``chat`` rather than the unknown ``chat runs``. Longest
+    rather than shortest because ``data prepare`` and ``data`` are both real and only the
+    longer one owns ``--csv-text-column``.
+    """
+    match = INVOCATION_IN_BLOCK.search(line)
+    if match is None:
+        return None
+    words = match[1].split()
+    for count in range(len(words), 0, -1):
+        if (candidate := " ".join(words[:count])) in known:
+            return candidate
+    return None
+
+
+def misattributed_flags(
+    text: str, owners: dict[str, set[str]], known: set[str]
+) -> list[tuple[int, str]]:
+    """Flags shown on a command that does not accept them, with the line they are on.
+
+    The question neither existence check asks. ``--allow-tabular`` is a real flag and
+    ``trainai train`` is a real command, so a block telling a reader to combine them
+    passes both and still fails the moment they run it -- and that misattribution is the
+    mistake actually made, three times in one function, when it happened in source
+    strings.
+
+    Fenced blocks only. In prose a backticked flag and a backticked command are separate
+    spans that a line-based reading would pair by accident, and inventing a finding on
+    correct documentation is worse than missing one.
+    """
+    found: list[tuple[int, str]] = []
+    for lineno, line in joined_block_lines(text):
+        command = command_on_line(line, known)
+        if command is None:
+            continue
+        for flag in FLAG_IN_TEXT.findall(line):
+            if foreign_flag(flag, line):
+                continue
+            accepted = owners.get(flag, set())
+            # "" is the root group's own flags, which every invocation may carry.
+            if command not in accepted and "" not in accepted:
+                found.append(
+                    (
+                        lineno,
+                        f"trainai {command} does not accept {flag} "
+                        f"(accepted by: {sorted(accepted) or 'nothing'})",
+                    )
+                )
+    return found
+
+
+def test_no_document_shows_a_flag_on_a_command_that_rejects_it() -> None:
+    """Existence is not enough: the flag has to be on the command that takes it.
+
+    This is the check the source side does *not* have -- a static scan cannot tell which
+    command printed a string, so `test_data_analyze` had to cover it one finding at a
+    time. A document does not have that problem. The command is written at the start of
+    the line and its flags follow, so the pairing is right there to be read, and the
+    walkthrough's wrapped invocations are folded first so the flags on a continuation line
+    are attributed to the verb that opened it.
+    """
+    owners, known = cli_flag_owners(), cli_command_paths()
+    wrong: list[str] = []
+    pairs = 0
+    for path in prose_documents():
+        text = path.read_text(encoding="utf-8")
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        pairs += sum(
+            1
+            for _, line in joined_block_lines(text)
+            if command_on_line(line, known) is not None
+            for flag in FLAG_IN_TEXT.findall(line)
+            if not foreign_flag(flag, line)
+        )
+        wrong += [
+            f"{relative}:{lineno}: {problem}"
+            for lineno, problem in misattributed_flags(text, owners, known)
+        ]
+
+    assert not wrong, (
+        f"these documented invocations pass a flag their command rejects: {sorted(wrong)}. "
+        "A reader following the page gets a usage error."
+    )
+    assert pairs > 60, f"only {pairs} flag/command pairs found in fenced blocks"
+
+
+@pytest.mark.parametrize(
+    ("document", "reported"),
+    [
+        # Real pairings, one per command that owns a distinctive flag.
+        ("```bash\ntrainai data prepare corpus --out data/tiny --vocab-size 512\n```", False),
+        ("```bash\ntrainai train --data data/tiny --out runs/m4 --steps 50\n```", False),
+        ("```bash\ntrainai chat runs/m4 --tokens 120 --seed 7\n```", False),
+        # A real flag on the wrong real command, which both existence checks accept.
+        ("```bash\ntrainai train --data data/tiny --vocab-size 512\n```", True),
+        ("```bash\ntrainai data prepare corpus --steps 50\n```", True),
+        # A wrapped invocation: the flags on the continuation line are still the verb's.
+        ("```bash\ntrainai train --data data/tiny \\\n  --out runs/m4 --steps 50\n```", False),
+        ("```bash\ntrainai train --data data/tiny \\\n  --vocab-size 512\n```", True),
+        # Another tool's flag on its own line is not ours to judge.
+        ("```bash\nruff format --check .\n```", False),
+        # Prose is out of scope: the flag and the command are separate spans.
+        ("Pass `--vocab-size` to `trainai train` if you like.", False),
+    ],
+)
+def test_a_flag_is_judged_against_the_command_that_opens_its_line(
+    document: str, reported: bool
+) -> None:
+    """The pairings that matter, including the two that a line-based reading gets wrong.
+
+    The wrapped cases are the point. Folding continuations is what makes the flags on the
+    second physical line answerable at all, and getting it backwards -- attributing them
+    to nothing, or to whatever command came before -- is silent in both directions.
+    """
+    found = misattributed_flags(document, cli_flag_owners(), cli_command_paths())
+    assert bool(found) is reported, f"{document!r} reported {found}"
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        # One command, reported against its own line.
+        ("```bash\ntrainai doctor\n```", [(2, "trainai doctor")]),
+        # A continuation folds into the line that opened it, keeping *that* number.
+        ("```bash\ntrainai train \\\n  --steps 5\n```", [(2, "trainai train --steps 5")]),
+        ("```bash\na \\\n b \\\n c\n```", [(2, "a b c")]),
+        # Only fenced lines count, and the count survives the prose around them.
+        ("before\n```\nls\n```\nafter", [(3, "ls")]),
+        # A blank line ends a command without becoming one, and does not shift the next.
+        ("```bash\nls\n\ntrainai doctor\n```", [(2, "ls"), (4, "trainai doctor")]),
+        # Two blocks, each numbered where it sits.
+        ("```\na\n```\ntext\n```\nb\n```", [(2, "a"), (6, "b")]),
+    ],
+)
+def test_a_wrapped_shell_line_is_folded_onto_the_line_it_started_on(
+    document: str, expected: list[tuple[int, str]]
+) -> None:
+    """Both halves of the fold are asserted: the joined text, and the line reported.
+
+    The number matters as much as the text. Everything above only ever formats it into a
+    failure message, so a fold that reported every finding against line 0 -- or against
+    the last physical line rather than the first -- would read as correct forever while
+    sending a reader to the wrong place in the page.
+    """
+    assert joined_block_lines(document) == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "command"),
+    [
+        ("trainai doctor", "doctor"),
+        # The longest real prefix wins, or the leaf's own flags look like the group's.
+        ("trainai data prepare corpus --out data/tiny", "data prepare"),
+        # A group is invocable too, and stops there when the next word is a path.
+        ("trainai data", "data"),
+        ("trainai chat runs/m4", "chat"),
+        # A shell prompt, a wrapper path and a parenthesis all still leave a command.
+        ("$ trainai doctor", "doctor"),
+        (".venv/bin/trainai doctor", "doctor"),
+        # No command: a typo, a bare mention, and a word that merely ends in "trainai".
+        ("trainai frobnicate", None),
+        ("pip install trainai --upgrade", None),
+        ("mytrainai doctor", None),
+    ],
+)
+def test_the_command_a_shell_line_invokes_is_the_longest_real_prefix(
+    line: str, command: str | None
+) -> None:
+    """Which command owns the flags on a line, stated case by case.
+
+    ``trainai data prepare`` resolving to ``data`` is the failure that matters: the group
+    accepts almost nothing, so every flag on every prepare line in the documentation would
+    be reported as misattributed, and a check that cries wolf on correct pages gets
+    deleted rather than fixed.
+    """
+    assert command_on_line(line, cli_command_paths()) == command
+
+
+#: Documents that are recipes rather than references: every command is one a reader runs,
+#: in order, so a directory one step writes is the directory a later step reads.
+#:
+#: Stated as a list rather than inferred, because being a recipe is a claim a page makes
+#: about itself -- the walkthrough's opening says "Nothing here is an illustration" -- and
+#: a reference page's standalone snippets legitimately name paths nothing on the page
+#: built. `plan-format.md` shows the ``plan --data data/mine`` that produced the JSON it
+#: documents, and demanding that page prepare ``data/mine`` first would be noise.
+SEQUENTIAL_DOCUMENTS = ("docs/walkthrough.md",)
+
+#: Commands whose first positional argument is a directory an earlier step must have
+#: written. Deliberately not ``data inspect``, which accepts either a prepared dataset or
+#: a raw corpus and so cannot say which it was handed, and not ``data prepare``, whose
+#: argument is the corpus the reader brought.
+READS_A_DIRECTORY = frozenset({"eval", "chat", "export", "finetune"})
+
+
+def as_written(path: str) -> str:
+    """One spelling for one directory, so ``./x`` and ``x/`` are not two paths."""
+    return path.removeprefix("./").rstrip("/")
+
+
+def directory_flow(text: str, known: set[str]) -> tuple[dict[str, int], list[tuple[int, str]]]:
+    """What a recipe's shell blocks write, and what they read, in document order.
+
+    Returns the line each directory is first written on, and every read as
+    ``(line, path)``. Only ``bash`` blocks count: a transcript's paths are whatever the
+    machine that recorded it happened to use, and holding a recording to the recipe's
+    naming would mean editing recorded output to satisfy a test.
+
+    Directories only. ``plan`` writes ``plan.json`` and ``train --plan`` reads it, which is
+    the same class of mistake, but no ``--out`` on the page names that file -- it is the
+    command's default -- so catching it needs the default, not this scan.
+    """
+    produced: dict[str, int] = {}
+    consumed: list[tuple[int, str]] = []
+    for lineno, line in joined_block_lines(text, language="bash"):
+        command = command_on_line(line, known)
+        if command is None:
+            continue
+        words = line.split()
+        for flag, value in itertools.pairwise(words):
+            if flag == "--out":
+                produced.setdefault(as_written(value), lineno)
+            elif flag == "--data":
+                consumed.append((lineno, as_written(value)))
+        if command in READS_A_DIRECTORY:
+            positional = next(
+                (word for word in arguments_after(line, command) if not word.startswith("-")),
+                None,
+            )
+            if positional is not None:
+                consumed.append((lineno, as_written(positional)))
+    return produced, consumed
+
+
+def arguments_after(line: str, command: str) -> list[str]:
+    """The words a shell line passes to ``command``, the command's own words removed.
+
+    Sliced from where the pattern started capturing -- just past ``trainai`` -- rather than
+    from where it stopped: the capture is greedy over bare lowercase words, so
+    ``chat runs/m4`` ends the match inside the argument, at ``runs``.
+    """
+    match = INVOCATION_IN_BLOCK.search(line)
+    if match is None:
+        return []
+    return line[match.start(1) :].split()[len(command.split()) :]
+
+
+def dangling_reads(text: str, known: set[str]) -> list[tuple[int, str]]:
+    """Directories a recipe reads that no earlier step in it wrote.
+
+    A path missing from ``produced`` sorts as written infinitely late, so "never written"
+    and "written further down" are one comparison and both are reported.
+    """
+    produced, consumed = directory_flow(text, known)
+    return [
+        (lineno, path) for lineno, path in consumed if lineno <= produced.get(path, sys.maxsize)
+    ]
+
+
+def test_a_walkthrough_reads_the_directories_it_wrote() -> None:
+    """A recipe is a sequence, so the path one step writes is the path the next reads.
+
+    This is the drift no flag or command check can see, because both paths are just
+    strings: `data prepare --out data/shakespeare` followed by `plan --data data/shake` is
+    two real commands with two real flags, and it was what this page said. A reader
+    following it got `No manifest.json in data/shake` at the fourth step, which reads like
+    their own mistake rather than the page's.
+
+    Line order is part of it. Reading a directory before the step that writes it is the
+    same broken recipe, so a step moved above the one it depends on fails here too.
+    """
+    known = cli_command_paths()
+    broken: list[str] = []
+    steps = 0
+    for name in SEQUENTIAL_DOCUMENTS:
+        path = REPO_ROOT / name
+        text = path.read_text(encoding="utf-8")
+        produced, consumed = directory_flow(text, known)
+        steps += len(produced) + len(consumed)
+        broken += [
+            f"{name}:{lineno}: reads {directory}, which "
+            + (
+                f"is not written until line {produced[directory]}"
+                if directory in produced
+                else "no step on this page writes"
+            )
+            for lineno, directory in dangling_reads(text, known)
+        ]
+
+    assert not broken, (
+        f"a reader following the page in order hits a missing directory: {sorted(broken)}"
+    )
+    assert steps > 8, f"only {steps} directory reads and writes found; the scan found nothing"
+
+
+@pytest.mark.parametrize(
+    ("document", "broken"),
+    [
+        # Written then read, which is the recipe working.
+        (
+            "```bash\ntrainai data prepare c --out data/d\n```\n```bash\ntrainai plan --data data/d\n```",
+            False,
+        ),
+        # The drift this was written for: one name written, a different one read.
+        (
+            "```bash\ntrainai data prepare c --out data/dd\n```\n```bash\ntrainai plan --data data/d\n```",
+            True,
+        ),
+        # Read with nothing writing it at all.
+        ("```bash\ntrainai plan --data data/d\n```", True),
+        # Right names, wrong order.
+        ("```bash\ntrainai plan --data data/d\ntrainai data prepare c --out data/d\n```", True),
+        # A run directory reached positionally, which is how the second half of the page works.
+        (
+            "```bash\ntrainai train --data d --out runs/m\ntrainai chat runs/m --tokens 20\n```",
+            True,
+        ),
+        (
+            "```bash\ntrainai data prepare c --out d\ntrainai train --data d --out runs/m\ntrainai chat runs/m\n```",
+            False,
+        ),
+        # One directory, two spellings.
+        (
+            "```bash\ntrainai data prepare c --out ./data/d/\n```\n```bash\ntrainai plan --data data/d\n```",
+            False,
+        ),
+        # A transcript is a recording, not a step: its paths are the recording machine's.
+        (
+            "```bash\ntrainai data prepare c --out data/d\n```\n```\ntrainai plan --data data/other\n```",
+            False,
+        ),
+        # `data inspect` takes a corpus or a dataset, so its argument proves nothing.
+        ("```bash\ntrainai data inspect ./my-corpus\n```", False),
+    ],
+)
+def test_a_recipe_step_that_reads_an_unwritten_directory_is_reported(
+    document: str, broken: bool
+) -> None:
+    """The recipe rules, stated one at a time rather than left to one real page.
+
+    The order case and the transcript case are the two that a plausible implementation
+    gets wrong in opposite directions: ignoring line numbers accepts a recipe that cannot
+    be followed, and reading transcripts as steps reports a page that is correct.
+    """
+    found = dangling_reads(document, cli_command_paths())
+    assert bool(found) is broken, f"{document!r} reported {found}"
+
+
 @pytest.mark.parametrize(
     ("phrase", "runs"),
     [
@@ -1172,11 +1898,12 @@ def test_the_command_resolver_stops_descending_at_the_first_leaf(phrase: str, ru
 
 
 def test_the_advice_checks_are_actually_looking_at_something() -> None:
-    """Both checks above pass trivially if the scan finds no strings.
+    """The source-side checks above pass trivially if the scan finds no strings.
 
     The counts are lower bounds rather than exact numbers, so adding a hint does not
     fail this -- but a regex that stops matching, or a source glob that goes empty,
-    does.
+    does. The documents check carries the same floor inside itself, since it is the one
+    that would otherwise pass on an empty glob.
     """
     flags: set[str] = set()
     commands: set[str] = set()
@@ -1209,6 +1936,38 @@ def test_the_pip_flag_exemption_is_still_earned() -> None:
     assert not taken, (
         f"TrainAI now has these flags itself: {taken}. Remove them from PIP_FLAGS so "
         "messages naming them are checked like any other."
+    )
+
+
+def test_the_document_flag_exemption_is_still_earned() -> None:
+    """The same two ways to go bad, plus one the tool-scoping adds.
+
+    A pair no document uses any more is exempting nothing. A spelling TrainAI has since
+    adopted is worse, for the reason above. And because these are scoped to a tool, the
+    pairing itself can rot: if the pip command moves to a line that no longer says
+    ``pip``, the exemption stops applying and the check starts failing on a correct
+    document -- so this asserts the pairing, not just the spelling.
+    """
+    lines = [
+        line for path in prose_documents() for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    unpaired = sorted(
+        f"{tool} {flag}"
+        for tool, flags in FOREIGN_FLAGS_IN_DOCS.items()
+        for flag in flags
+        if not any(tool in line and flag in line for line in lines)
+    )
+    assert not unpaired, (
+        f"these flags are exempted as another tool's but no document names them beside "
+        f"that tool: {unpaired}. Drop the pair, or fix the line that drifted apart."
+    )
+
+    exempt = set().union(*FOREIGN_FLAGS_IN_DOCS.values())
+    taken = sorted(exempt & set(cli_flag_owners()))
+    assert not taken, (
+        f"TrainAI now has these flags itself: {taken}. Remove them from "
+        "FOREIGN_FLAGS_IN_DOCS so the documents naming them are checked like any other."
     )
 
 
@@ -2174,6 +2933,13 @@ def test_every_command_the_user_is_meant_to_copy_is_printed_unwrapped() -> None:
 # --------------------------------------------------------------------------- #
 #: Phrasings of "CI has never executed", which stopped being true the first time it did.
 #: Matched case-insensitively against the prose of every tracked Markdown file.
+#:
+#: The list grows when a phrasing gets past it. ``docs/hardware-support.md`` said "the
+#: repository has no remote, so no CI run has ever executed" for as long as this net has
+#: existed, and every entry above the last two missed it: they are all built around the
+#: word "never" following "CI", and that sentence puts "never" before it and "no" in
+#: front. A net over wordings is only ever as good as the wordings someone thought of,
+#: which is the argument for keeping it *and* for treating every escape as an entry.
 NEVER_RAN_CLAIMS = (
     "ci has never",
     "ci had never",
@@ -2181,7 +2947,43 @@ NEVER_RAN_CLAIMS = (
     "never having executed",
     "never having run",
     "has never been run by ci",
+    "no ci run has ever",
+    "ci has not yet run",
 )
+
+#: The sentence that got past the first six, kept as the thing the seventh has to catch.
+#: A phrasing added to the tuple without the sentence that earned it is a guess, and this
+#: is the one place a guess would look identical to a check.
+#:
+#: It lives here rather than in the CHANGELOG entry that describes it, and that is not a
+#: preference: :func:`test_no_document_says_ci_has_never_run` scans every tracked Markdown
+#: file, ``CHANGELOG.md`` included, so quoting the sentence there fails this repository's
+#: own gate. A Python string is the one place the record can be exact.
+NEVER_RAN_ESCAPE = (
+    "Be aware that this has not happened yet: the repository has no remote, so no CI "
+    "run has ever executed, and the local runs were on a machine that does have a CUDA "
+    "device."
+)
+
+
+def test_the_never_ran_phrasings_are_matchable() -> None:
+    """Two ways this net can be present and dead, both of them silent.
+
+    An entry with a capital letter matches nothing, because the search lowercases the
+    document and not the needle -- it would sit in the tuple looking like coverage. And
+    the tuple is only worth what its wordings are worth, so the sentence that escaped it
+    is pinned here: whichever entry catches that one has to keep catching it.
+    """
+    wrong_case = [claim for claim in NEVER_RAN_CLAIMS if claim != claim.lower()]
+    assert wrong_case == [], (
+        f"these are compared against lowercased prose and can never match: {wrong_case}"
+    )
+
+    lowered = NEVER_RAN_ESCAPE.lower()
+    assert [claim for claim in NEVER_RAN_CLAIMS if claim in lowered], (
+        "no phrasing catches the sentence that got past this net once already: "
+        f"{NEVER_RAN_ESCAPE!r}"
+    )
 
 
 def test_no_document_says_ci_has_never_run() -> None:
@@ -2192,6 +2994,10 @@ def test_no_document_says_ci_has_never_run() -> None:
     the top of the same file, still pointed a reader *at* that bullet for the same dead
     claim. One phrasing being fixed is no evidence about the others, which is the whole
     reason to assert over the documents rather than over one line of one of them.
+
+    Nor was that the end of it: `docs/hardware-support.md` went on saying the repository
+    had no remote and so no run had ever happened, in a wording none of the original six
+    phrasings matched. See :data:`NEVER_RAN_CLAIMS`.
 
     Guarded by the existence of the workflow, so a repository that genuinely has no CI is
     free to say so -- the test is about the two facts disagreeing, not about the wording.
@@ -2223,4 +3029,341 @@ def test_no_document_says_ci_has_never_run() -> None:
     assert not offenders, (
         "these documents say CI has never run, and .github/workflows/ci.yml exists:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The GitHub templates, and where they point
+# --------------------------------------------------------------------------- #
+#: Everything under ``.github/`` a contributor is shown before they have a checkout:
+#: the issue forms, their ``config.yml``, and the pull-request template.
+def github_templates() -> list[Path]:
+    directory = REPO_ROOT / ".github"
+    return sorted(p for p in directory.rglob("*") if p.is_file() and p.suffix in {".yml", ".md"})
+
+
+def require_github_directory() -> None:
+    """Skip when ``.github/`` is absent, which means this is not a checkout.
+
+    The sdist deliberately does not ship ``.github``: issue forms and workflow files are
+    how this project is developed on GitHub, not part of what it distributes, and shipping
+    workflow YAML inside a downloadable tarball is confusing weight for no reader's
+    benefit. ``.github/workflows/release.yml`` runs the suite from the *unpacked sdist* --
+    which is the only way to catch a file the tests read going missing from it -- so these
+    checks have to say "not here" there rather than fail.
+
+    Note that ``rglob`` on a missing directory returns nothing rather than raising, so
+    without this the walk would quietly find zero templates and the loops below would be
+    vacuously true. :func:`test_there_are_github_templates_to_check` is the floor that
+    makes that a failure in a checkout; this is what keeps it from being a failure where
+    the directory is legitimately absent.
+    """
+    if not (REPO_ROOT / ".github").is_dir():
+        pytest.skip(".github/ is absent, so this is an unpacked sdist rather than a checkout")
+
+
+#: A link back into this repository, in the only shape one can take from an issue form.
+#: The forms are YAML rather than Markdown, so a relative path in one resolves against
+#: nothing -- every link has to be absolute, which means every link is a hard-coded
+#: repository name, a hard-coded branch and a hard-coded path, all three able to rot.
+#:
+#: Deliberately split into the repository and *everything after it*, rather than making
+#: the path and the anchor optional groups in one pattern. Optional groups fail open: the
+#: first draft of this pattern read
+#: ``https://github.com/OWNER/REPO/security/advisories/new`` as the bare repository with
+#: no path, and cheerfully checked it against ``README.md``. A tail this test does not
+#: recognise has to be reported, not skipped.
+SELF_LINK = re.compile(
+    r"https://github\.com/(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+)(?P<tail>[^\s)\"']*)"
+)
+
+#: The tails that are not a file: the repository root, an anchor on the README, and the
+#: private advisory form SECURITY.md and ``config.yml`` both send reporters to. The last
+#: one is GitHub's own route rather than a path in the tree, so there is nothing in a
+#: checkout to resolve it against; it is listed so that a *misspelling* of it still fails.
+NON_FILE_TAILS = frozenset({"", "/", "/security/advisories/new"})
+
+#: ``/blob/<ref>/<path>``, the only file link GitHub serves that this test will accept.
+BLOB_TAIL = re.compile(r"^/blob/(?P<ref>[\w.-]+)/(?P<path>[^#]+)(?:#(?P<anchor>[\w-]+))?$")
+
+
+def heading_anchors(text: str) -> set[str]:
+    """The fragment identifiers a Markdown document offers, as GitHub derives them.
+
+    Lowercase, punctuation dropped, spaces to hyphens. Close enough for headings made of
+    words, which is all of them here, and it does not have to be a general HTML slugifier
+    to catch ``#roadmap`` on a document whose heading says "Status".
+    """
+    anchors = set()
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            continue
+        title = line.lstrip("#").strip()
+        slug = re.sub(r"[^\w\s-]", "", title.lower())
+        anchors.add(re.sub(r"\s+", "-", slug.strip()))
+    return anchors
+
+
+def test_there_are_github_templates_to_check() -> None:
+    """The floor under the two checks below, which are loops over a directory walk.
+
+    A walk that returns nothing turns "every link resolves" into a truth about no links,
+    so the links are counted too: the forms exist to point people somewhere, and a set of
+    forms that point nowhere would satisfy a check that only counted files.
+    """
+    require_github_directory()
+    found = {path.relative_to(REPO_ROOT).as_posix() for path in github_templates()}
+    for required in (
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/workflows/ci.yml",
+    ):
+        assert required in found, f"{required} is missing; found {sorted(found)}"
+
+    links = [match for _path, match in self_links()]
+    assert len(links) >= 4, f"the template walk found only {len(links)} links into this repo"
+
+
+def self_links() -> list[tuple[str, re.Match[str]]]:
+    """Every link into this repository from a ``.github/`` template, with its file."""
+    return [
+        (path.relative_to(REPO_ROOT).as_posix(), match)
+        for path in github_templates()
+        for match in SELF_LINK.finditer(path.read_text(encoding="utf-8"))
+    ]
+
+
+def test_every_link_out_of_a_github_template_resolves() -> None:
+    """An issue form's links are absolute, and nothing in a checkout resolves them.
+
+    This is the one place in the repository where a link cannot be a relative path, so it
+    is the one place where renaming a file or a heading breaks a link that no Markdown
+    tooling will ever look at. It has already happened once, in the first draft of these
+    templates: ``#roadmap`` on a README whose heading says "Status", pointing a reader at
+    the top of the page instead of the table -- silently, because a bad fragment is not an
+    error to a browser.
+
+    The repository name is read from ``pyproject.toml`` rather than typed here, so a move
+    fails this test in one place instead of drifting in five.
+    """
+    require_github_directory()
+    homepage = _project_table()["urls"]["Homepage"].rstrip("/")
+
+    problems: list[str] = []
+    for relative, match in self_links():
+        base = f"https://github.com/{match['owner']}/{match['repo']}"
+        if base.lower() != homepage.lower():
+            continue  # another project's repository, not ours to check
+
+        tail = match["tail"]
+        if tail in NON_FILE_TAILS:
+            continue
+
+        if tail.startswith("#"):
+            target, anchor = REPO_ROOT / "README.md", tail[1:]
+        else:
+            blob = BLOB_TAIL.match(tail)
+            if blob is None:
+                problems.append(
+                    f"{relative}: {base}{tail} is not a shape this test can resolve. "
+                    "Use /blob/main/<path>, an #anchor, or add it to NON_FILE_TAILS."
+                )
+                continue
+            if blob["ref"] != "main":
+                problems.append(f"{relative}: links at ref {blob['ref']!r}, not main")
+            target, anchor = REPO_ROOT / blob["path"], blob["anchor"]
+
+        if not target.exists():
+            problems.append(f"{relative}: links to {base}{tail}, which does not exist")
+            continue
+
+        if anchor and target.suffix == ".md":
+            available = heading_anchors(target.read_text(encoding="utf-8"))
+            if anchor not in available:
+                problems.append(
+                    f"{relative}: links to #{anchor} in "
+                    f"{target.relative_to(REPO_ROOT).as_posix()}, which has no such heading"
+                )
+
+    assert problems == [], "these links do not resolve:\n  " + "\n  ".join(problems)
+
+
+def test_the_anchor_deriver_agrees_with_github_on_this_repository() -> None:
+    """The helper above is a guess at GitHub's slug rule, so pin it to real headings.
+
+    Without this, a deriver that mangled every heading would make the link check pass by
+    rejecting nothing -- or fail on every link at once, which is the same defect wearing
+    the opposite sign.
+    """
+    anchors = heading_anchors((REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+    assert {"install", "status", "known-limitations", "what-has-never-been-run"} <= anchors, (
+        f"the deriver produced {sorted(anchors)}"
+    )
+    assert "roadmap" not in anchors, "the README has no Roadmap heading; its table is Status"
+
+
+# --------------------------------------------------------------------------- #
+# The package does not ask for the unpickler that runs the file
+# --------------------------------------------------------------------------- #
+#: ``torch.load``'s default flipped to ``weights_only=True`` in a later torch than this
+#: project's ``torch>=2.2`` floor -- so on a supported install the default may still be
+#: the unsafe one, and passing the argument explicitly is the only way the outcome does
+#: not depend on which torch the user happens to have. There is a second reason, read
+#: out of torch 2.10's ``serialization.py`` rather than assumed: the environment variable
+#: ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD`` forces the unsafe loader *only* when the call
+#: site did not set the argument. An explicit ``True`` is therefore also what puts the
+#: choice beyond the reach of a variable somebody exported for another library.
+UNPICKLE_GUARD = "weights_only"
+
+
+def torch_load_calls() -> list[tuple[str, int, ast.Call]]:
+    """Every ``torch.load(...)`` in the installed package, with where it is."""
+    found: list[tuple[str, int, ast.Call]] = []
+    for path in library_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "load":
+                continue
+            owner = node.func.value
+            if isinstance(owner, ast.Name) and owner.id == "torch":
+                found.append((path.relative_to(REPO_ROOT).as_posix(), node.lineno, node))
+    return found
+
+
+def test_every_checkpoint_read_refuses_to_run_the_file() -> None:
+    """`SECURITY.md` says there is one `torch.load` and a test fails if it changes.
+
+    This is that test, and it is a source scan rather than a behavioural one because the
+    property is about code that does not exist yet: a second `torch.load` added anywhere
+    in the package, by someone who has no reason to know why the first one is careful.
+    On this project's `torch>=2.2` floor the default may be `weights_only=False`, so such
+    a call is unsafe by omission, and there is no input that makes a *missing* call site
+    fail a behavioural test.
+
+    Both halves are load-bearing. Checking the argument without counting the calls lets a
+    new unguarded reader in beside the guarded one; counting without checking the argument
+    passes a single call that trusts the file. The count is exactly one rather than a
+    ceiling because the honest way to add a second checkpoint reader is to route it
+    through `load_checkpoint`, which is where the refusal messages live.
+    """
+    calls = torch_load_calls()
+    where = [f"{path}:{line}" for path, line, _ in calls]
+
+    assert len(calls) == 1, (
+        f"the package has {len(calls)} torch.load calls ({where}), and this check expects "
+        "one. A checkpoint reader belongs behind trainai.train.checkpoint.load_checkpoint, "
+        "which refuses a file by name instead of importing what it asks for."
+    )
+
+    path, line, call = calls[0]
+    guard = next((kw for kw in call.keywords if kw.arg == UNPICKLE_GUARD), None)
+    assert guard is not None, (
+        f"{path}:{line} calls torch.load without {UNPICKLE_GUARD}=True. On torch 2.2 the "
+        "default is False, which imports and calls whatever the file names."
+    )
+    assert isinstance(guard.value, ast.Constant) and guard.value.value is True, (
+        f"{path}:{line} passes {UNPICKLE_GUARD}={ast.unparse(guard.value)}. It has to be "
+        "the literal True: anything computed can evaluate to False on someone's machine, "
+        "and a fallback to the unrestricted unpickler triggers on exactly the files that "
+        "should be refused. See docs/checkpoint-format.md."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The interpreters CI runs are the interpreters the package claims
+# --------------------------------------------------------------------------- #
+#: ``requires-python`` is a promise a wheel enforces at install time: pip refuses on an
+#: interpreter below it, and installs on every one at or above. The only thing that makes
+#: the promise true is a job that runs the suite there. Nothing compared the two until a
+#: release check that needs ``tomllib`` landed and CI went red on 3.10 alone for two
+#: commits -- green locally, because the development machine has one interpreter and it is
+#: not that one. This is the cheap half of the lesson: the floor, the classifiers and the
+#: matrix are three hand-edited lists of the same fact.
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+#: ``python-version: ["3.10", "3.11", ...]`` from the test job's matrix. Read with a regex
+#: rather than a YAML parser because PyYAML is not a dependency and will not become one for
+#: a test; the shape being matched is one line this repository writes and CI would reject if
+#: it were malformed.
+MATRIX = re.compile(r"^\s*python-version:\s*\[(?P<versions>[^\]]+)\]\s*$", re.MULTILINE)
+
+#: ``Programming Language :: Python :: 3.10`` and friends. The bare ``:: 3`` is excluded by
+#: requiring a minor number.
+CLASSIFIER = re.compile(r"Programming Language :: Python :: (?P<version>3\.\d+)")
+
+
+def _as_version(text: str) -> tuple[int, int]:
+    major, minor = text.strip().strip("\"'").split(".")
+    return int(major), int(minor)
+
+
+def matrix_versions() -> list[tuple[int, int]]:
+    """Every Python the test matrix runs, oldest first.
+
+    Skips when the workflow is absent, for the reason :func:`require_github_directory`
+    gives at length: the sdist does not ship ``.github``, and ``release.yml`` runs this
+    suite from the *unpacked sdist*. Without the guard both callers below raised
+    ``FileNotFoundError`` there -- found by running that unpacking for real, which is
+    also the only place it could have been found, since a checkout always has the file.
+
+    Deleting ``ci.yml`` in a checkout does not quietly disable the two checks below:
+    :func:`test_there_are_github_templates_to_check` names that path outright.
+    """
+    if not CI_WORKFLOW.is_file():
+        pytest.skip(".github/ is absent, so this is an unpacked sdist rather than a checkout")
+
+    found = MATRIX.search(CI_WORKFLOW.read_text(encoding="utf-8"))
+    assert found is not None, f"no python-version matrix found in {CI_WORKFLOW.name}"
+    return sorted(_as_version(part) for part in found.group("versions").split(","))
+
+
+def test_ci_runs_the_oldest_python_the_package_says_it_supports() -> None:
+    """The floor in `pyproject.toml`, the classifiers, and the CI matrix, compared.
+
+    Three ways this drifts, all of them quiet. Raising `requires-python` without pruning
+    the matrix wastes two jobs and leaves skips behind that can never run again. Dropping
+    the oldest version from the matrix to make CI faster leaves the wheel installing
+    somewhere nothing is tested -- the failure then belongs to a user, on an interpreter
+    the maintainer does not have. And a classifier is what PyPI's sidebar shows, so a
+    version listed there and untested is a claim made to people who never read this file.
+
+    Only the floor is compared against the matrix, not the ceiling: a new Python appearing
+    while the classifiers lag is a normal state to be in for a few weeks, and the classifier
+    check below covers the direction that misleads.
+    """
+    floor = _project_table()["requires-python"]
+    assert floor.startswith(">="), (
+        f"requires-python is {floor!r}; this check assumes a '>=x.y' floor. If the "
+        "constraint has grown an upper bound, teach it the new shape rather than deleting "
+        "it -- an untested supported interpreter is the failure it exists to catch."
+    )
+
+    declared = _as_version(floor[2:])
+    tested = matrix_versions()
+
+    assert declared == tested[0], (
+        f"pyproject.toml supports Python {declared[0]}.{declared[1]} and up, and the "
+        f"oldest interpreter in the CI matrix is {tested[0][0]}.{tested[0][1]}. Those have "
+        "to be the same version: the floor is what pip enforces, and the matrix is the "
+        "only thing that makes it true. Change both in the same commit, and check what "
+        "skips -- tests/test_release_check.py and four readers in this file skip below "
+        "3.11 for tomllib, and those skips are sized against this matrix."
+    )
+
+
+def test_every_python_the_classifiers_advertise_is_one_ci_runs() -> None:
+    """A classifier is the version list PyPI shows, so an untested one is a public claim."""
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    advertised = sorted({_as_version(m.group("version")) for m in CLASSIFIER.finditer(text)})
+    tested = matrix_versions()
+
+    assert advertised, "no 'Programming Language :: Python :: 3.x' classifiers found"
+    untested = [f"{major}.{minor}" for major, minor in advertised if (major, minor) not in tested]
+    assert not untested, (
+        f"pyproject.toml advertises Python {', '.join(untested)} to anyone reading the "
+        f"PyPI page, and the CI matrix is {['.'.join(map(str, v)) for v in tested]}. Either "
+        "add the job or drop the classifier."
     )

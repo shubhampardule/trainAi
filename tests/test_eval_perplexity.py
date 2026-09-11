@@ -232,6 +232,123 @@ def test_it_agrees_with_the_trainers_own_validation_number(
 
 
 # --------------------------------------------------------------------------- #
+# The loss mask
+#
+# ``trainai eval`` exists to recompute a number comparable with the training curve, so
+# it does not get to choose whether to apply the mask: it reads the decision out of the
+# checkpoint's own train config. There is deliberately no flag. The two runs below are
+# the same dataset and the same steps, differing only in ``loss_mask``, which is what
+# makes the losses comparable to each other and the counts not.
+# --------------------------------------------------------------------------- #
+MASKED_SEQ_LEN = 32
+
+
+def _masked_run(root: Path, dataset: Any, *, loss_mask: bool | None) -> Path:
+    run_dir = root / "run"
+    Trainer(
+        dataset=dataset,
+        model_config=ModelConfig(
+            vocab_size=dataset.vocab_size,
+            n_layer=2,
+            n_head=4,
+            d_model=64,
+            seq_len=MASKED_SEQ_LEN,
+        ),
+        train_config=TrainConfig(
+            steps=4,
+            batch_size=4,
+            seq_len=MASKED_SEQ_LEN,
+            lr=1e-3,
+            warmup_steps=1,
+            eval_every=2,
+            eval_batches=2,
+            checkpoint_every=2,
+            log_every=4,
+            seed=7,
+            device="cpu",
+            loss_mask=loss_mask,
+        ),
+        run_dir=run_dir,
+        quiet=True,
+    ).run()
+    return run_dir
+
+
+@pytest.fixture(scope="module")
+def masked_session(tmp_path_factory: pytest.TempPathFactory, masked_dataset: Any) -> Any:
+    run = _masked_run(tmp_path_factory.mktemp("eval_masked"), masked_dataset, loss_mask=None)
+    return InferenceSession.open(run, device="cpu", precision="fp32")
+
+
+@pytest.fixture(scope="module")
+def unmasked_session(tmp_path_factory: pytest.TempPathFactory, masked_dataset: Any) -> Any:
+    run = _masked_run(tmp_path_factory.mktemp("eval_plain"), masked_dataset, loss_mask=False)
+    return InferenceSession.open(run, device="cpu", precision="fp32")
+
+
+def test_it_agrees_with_the_trainers_masked_validation_number(
+    masked_session: InferenceSession, masked_dataset: Any
+) -> None:
+    """The same guarantee as the unmasked case, on the split where it can break.
+
+    If ``evaluate_split`` scored every token here it would still return a plausible
+    number, a little different from the curve's -- which is the failure this pins.
+    """
+    config = masked_session.train_config
+    recomputed = evaluate_split(
+        masked_session,
+        masked_dataset,
+        "val",
+        batch_size=config.batch_size,
+        max_batches=config.eval_batches,
+    )
+
+    assert masked_session.best_val_loss is not None
+    assert recomputed.loss_mask is True
+    assert recomputed.loss == pytest.approx(masked_session.best_val_loss, abs=1e-9)
+
+
+def test_a_masked_evaluation_says_what_share_of_the_positions_it_scored(
+    masked_session: InferenceSession, masked_dataset: Any
+) -> None:
+    """A perplexity over 40% of the positions is a different measurement, and only
+    the two counts together say which one it is."""
+    result = evaluate_split(masked_session, masked_dataset, "val")
+
+    assert 0 < result.tokens_scored < result.positions_seen
+    assert result.to_dict()["positions_seen"] == result.positions_seen
+
+
+def test_a_run_trained_with_no_loss_mask_is_evaluated_the_same_way(
+    unmasked_session: InferenceSession, masked_session: InferenceSession, masked_dataset: Any
+) -> None:
+    """The control. Same dataset, same shape, opposite recorded decision.
+
+    Both numbers are legitimate; reading one as the other is not, and the losses
+    differing is what says the mask reached the measurement rather than only the flag.
+    """
+    plain = evaluate_split(unmasked_session, masked_dataset, "val")
+    masked = evaluate_split(masked_session, masked_dataset, "val")
+
+    assert plain.loss_mask is False
+    assert plain.tokens_scored == plain.positions_seen
+    assert plain.positions_seen == masked.positions_seen, "the same windows were walked"
+    assert plain.loss != pytest.approx(masked.loss, abs=1e-3)
+
+
+def test_the_report_says_the_number_covers_the_replies_only(
+    masked_session: InferenceSession, masked_dataset: Any
+) -> None:
+    """The note is the only place a reader learns which number they are holding."""
+    report = evaluate(masked_session, masked_dataset, splits=("val",))
+    note = next(n for n in report.notes if "loss mask" in n)
+
+    assert "assistant's replies" in note
+    assert "--no-loss-mask" in note
+    assert f"{report.results[0].positions_seen:,} predicted positions" in note
+
+
+# --------------------------------------------------------------------------- #
 # What it says about its own coverage
 # --------------------------------------------------------------------------- #
 def test_coverage_is_counted_in_windows_not_tokens(
@@ -301,6 +418,108 @@ def test_an_early_stop_note_does_not_blame_the_tail(
 
     assert "--max-batches stopped it early" in notes
     assert "do not fill a sequence" not in notes
+
+
+@pytest.fixture(scope="module")
+def long_prompt_dataset(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """A masked dataset whose leading windows hold no target at all.
+
+    The shared ``masked_dataset`` cannot produce this: its questions are one line long,
+    so every window of 32 tokens catches part of a reply -- measured, its first twelve
+    windows score 21, 20, 20, 20, 20, 20, 20, 20, 23, 24, 24, 24 target positions. Here
+    the question fills more than a window on its own and the answer is three words, so
+    the same measurement reads 0, 0, 5, 0, 5, 0, 5, 0, 2, 2, 0, 5 -- which is what a
+    corpus of long prompts and short completions actually looks like.
+    """
+    from trainai.data import IngestOptions, Ingestor, binarize_documents, train_tokenizer
+    from trainai.data.chat import render_conversation
+    from trainai.data.ingest import Document
+
+    documents = []
+    for index in range(240):
+        conversation = render_conversation(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question {index} about rivers and clocks and bridges and "
+                        "lanterns, asked at such length that the question alone fills "
+                        "more than one window of thirty-two tokens before any reply "
+                        "begins, with harbours and gantries and kettles recurring so "
+                        "the tokenizer has pairs to merge and the prompt keeps going "
+                        "well past where a short context would have to stop reading?"
+                    ),
+                },
+                {"role": "assistant", "content": f"Yes, {index}."},
+            ]
+        )
+        documents.append(Document(conversation.text, "chat.jsonl", index, 0, conversation.spans))
+    tokenizer = train_tokenizer((d.text for d in documents), vocab_size=512)
+    manifest = binarize_documents(
+        documents,
+        tmp_path_factory.mktemp("eval_long_prompt") / "prepared",
+        tokenizer,
+        seed=1234,
+        val_fraction=0.1,
+        loss_mask=True,
+        ingest_options=Ingestor(IngestOptions(jsonl_messages_field="messages")).options,
+    )
+    assert manifest.has_loss_mask
+    return manifest
+
+
+@pytest.fixture(scope="module")
+def long_prompt_session(
+    tmp_path_factory: pytest.TempPathFactory, long_prompt_dataset: Any
+) -> InferenceSession:
+    run = _masked_run(
+        tmp_path_factory.mktemp("eval_long_prompt_run"), long_prompt_dataset, loss_mask=None
+    )
+    return InferenceSession.open(run, device="cpu", precision="fp32")
+
+
+def test_an_early_stop_that_saw_only_prompts_says_so_and_not_that_the_split_is_small(
+    long_prompt_session: InferenceSession, long_prompt_dataset: Any
+) -> None:
+    """Zero scored positions has two causes, and they need different advice.
+
+    ``test_a_batcher_that_yields_nothing_is_reported_not_divided_by`` covers the other
+    one, which is unreachable and has to be forced with a monkeypatched batcher. This
+    one is real: under a loss mask only the reply tokens are targets, so ``--max-batches``
+    stopping over a stretch of prompts walks windows that score nothing while the split
+    itself is large and perfectly evaluable. Reporting that as "the split produced no
+    batches, it needs at least N tokens" would send the user to enlarge a split that is
+    already big enough, so the two messages are told apart here rather than sharing one.
+
+    The full pass below is the control that makes the refusal mean something: the same
+    split, the same mask, no cut -- and a number comes out.
+    """
+    with pytest.raises(UsageError) as caught:
+        evaluate_split(long_prompt_session, long_prompt_dataset, "val", batch_size=2, max_batches=1)
+
+    message = str(caught.value)
+    hint = caught.value.hint or ""
+    assert "the loss mask marks as a target" in message
+    assert "2 sequences scored" in message, "it has to say how much it looked at"
+    assert "Raise --max-batches" in hint, "the direction is the whole advice"
+    assert "--no-loss-mask" in hint
+    assert caught.value.details["loss_mask"] is True
+    assert caught.value.details["windows_scored"] == 2
+    assert caught.value.details["positions_seen"] == 2 * MASKED_SEQ_LEN
+    assert "produced no batches" not in message, (
+        "a split walked over prompts is not a split too small to walk"
+    )
+    assert "at least" not in hint, "nothing here is fixed by enlarging the split"
+
+    whole = evaluate_split(long_prompt_session, long_prompt_dataset, "val", batch_size=2)
+    assert whole.tokens_scored > 0
+    assert whole.loss_mask, "the control has to be masked too, or it proves nothing"
+    # The windows that scored nothing are skipped, not averaged in as zero: a mean over
+    # this split that included them would be pulled towards 0 nats.
+    assert math.isfinite(whole.loss)
+    assert whole.tokens_scored < whole.positions_seen, (
+        "if every position were a target this split would not be exercising the mask"
+    )
 
 
 def test_the_same_corpus_resplit_is_flagged_as_not_held_out(
@@ -404,6 +623,37 @@ def test_the_report_carries_what_makes_the_number_comparable(
     assert data["step"] == session.step
     assert data["which"] == session.layout.which
     json.dumps(data)  # it has to survive --json
+
+
+def test_a_number_measured_under_reduced_precision_says_so(
+    session: InferenceSession, prepared_dataset: Any
+) -> None:
+    """Two perplexities are only comparable if they were measured the same way.
+
+    ``resolve_precision`` answers fp32 on every device this suite can run on -- CPU, and
+    Metal too (``test_metal_gets_fp32_because_this_project_has_never_verified_mps_autocast``
+    in ``tests/test_train_loop.py``) -- so the note that reduced precision was used had
+    never been produced by anything. The session is edited to report a half precision
+    rather than resolved into one, which is also why this asserts on the note and not on
+    the loss: on CPU ``autocast`` is disabled whatever the dtype says, so the number
+    below is a real fp32 number and only the report is being tested.
+
+    The fp32 pass is the control. Without it, a note appended unconditionally would pass
+    every assertion here.
+    """
+    plain = evaluate(session, prepared_dataset, splits=("val",))
+    assert not any("Measured under" in note for note in plain.notes)
+    assert session.dtype == torch.float32
+
+    note = "bf16 (supported by this cuda device)"
+    reduced = dataclasses.replace(session, dtype=torch.bfloat16, precision_note=note)
+    report = evaluate(reduced, prepared_dataset, splits=("val",))
+
+    measured = [n for n in report.notes if "Measured under" in n]
+    assert len(measured) == 1, "one note, naming the precision the report already carries"
+    assert note in measured[0], "the note has to name what the report says, not a guess"
+    assert "--precision fp32" in measured[0], "and how to get a number that is pinned"
+    assert report.to_dict()["precision"] == note
 
 
 def test_progress_is_reported_per_batch(session: InferenceSession, prepared_dataset: Any) -> None:
@@ -724,3 +974,47 @@ def test_a_dataset_the_model_was_not_trained_on_is_refused(
         caught.value.details["dataset_tokenizer_fingerprint"]
         != caught.value.details["model_tokenizer_fingerprint"]
     )
+
+
+def test_a_checkpoint_with_no_fingerprint_is_still_caught_by_the_vocabulary(
+    session: InferenceSession, prepared_dataset: Any, masked_dataset: Any
+) -> None:
+    """The second half of the same guard, for checkpoints written before the first.
+
+    The fingerprint check above it is the strong one, and on any run this version wrote
+    it fires first -- which is why the width check below it had never run. It is not
+    redundant: ``tokenizer_fingerprint`` is read with ``.get`` and skipped when absent,
+    so a checkpoint from before that field existed reaches the width comparison as its
+    only defence. Without it a dataset of a different width would be scored, and the
+    first id past the model's output layer is an index error rather than a wrong number
+    -- or, worse, is in range and silently means something else.
+
+    The two real fixture datasets differ in width on their own (435 against 512), so
+    nothing here fakes a vocabulary; only the recorded fingerprint is dropped, which is
+    exactly what the older checkpoint is missing.
+    """
+    forgetful = dataclasses.replace(
+        session,
+        checkpoint=dataclasses.replace(
+            session.checkpoint,
+            dataset={
+                key: value
+                for key, value in session.checkpoint.dataset.items()
+                if key != "tokenizer_fingerprint"
+            },
+        ),
+    )
+    assert forgetful.model_config.vocab_size != masked_dataset.vocab_size
+
+    with pytest.raises(UsageError) as caught:
+        evaluate(forgetful, masked_dataset, splits=("val",))
+
+    message = str(caught.value)
+    assert "tokenized differently" not in message, "that check was skipped, not passed"
+    assert f"output layer of {forgetful.model_config.vocab_size} tokens" in message
+    assert f"vocabulary of {masked_dataset.vocab_size}" in message
+    assert caught.value.details["model_vocab_size"] == forgetful.model_config.vocab_size
+    assert caught.value.details["dataset_vocab_size"] == masked_dataset.vocab_size
+
+    # The dataset it *was* trained on still evaluates, fingerprint or no fingerprint.
+    assert evaluate(forgetful, prepared_dataset, splits=("val",)).results

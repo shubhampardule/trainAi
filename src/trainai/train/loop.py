@@ -47,12 +47,15 @@ from torch import nn
 
 from trainai.console import fmt_bytes, fmt_count, fmt_int
 from trainai.data.binarize import TOKENIZER_NAME, DatasetManifest
-from trainai.data.loader import TokenBatcher, open_split, windows_available
+from trainai.data.loader import Batch, TokenBatcher, open_split, windows_available
 from trainai.errors import (
+    CheckpointIncompatibleError,
     DatasetError,
     DatasetFormatError,
     TrainingDivergedError,
     TrainingError,
+    UsageError,
+    check_choice,
 )
 from trainai.model.config import ModelConfig
 from trainai.model.gpt import GPT
@@ -64,7 +67,7 @@ from trainai.train.checkpoint import (
     restore_rng,
     save_checkpoint,
 )
-from trainai.train.config import Precision, TrainConfig
+from trainai.train.config import PRECISION_CHOICES, Precision, TrainConfig
 from trainai.train.metrics import (
     MetricsWriter,
     ThroughputMeter,
@@ -75,12 +78,19 @@ from trainai.train.metrics import (
 from trainai.train.schedule import LearningRateSchedule
 
 __all__ = [
+    "DEVICE_CHOICES",
     "TrainResult",
     "Trainer",
     "precision_for",
     "resolve_device",
     "resolve_precision",
 ]
+
+#: The device names this project supports, as ``--device`` accepts them. Not
+#: ``torch``'s own list: :func:`torch.device` accepts twenty-odd backends, including
+#: ``opengl``, ``fpga`` and ``lazy``, and TrainAI has a training path for five of them.
+#: An index may follow any of the real ones -- ``cuda:1`` picks the second GPU.
+DEVICE_CHOICES: tuple[str, ...] = ("auto", "cuda", "cpu", "mps", "xpu")
 
 #: Settings whose value changes what the remaining steps of a resumed run do,
 #: rather than only how many are left. ``steps`` belongs here because the
@@ -140,6 +150,11 @@ def resolve_device(requested: str = "auto") -> torch.device:
     """Pick a device, preferring CUDA. Never silently falls back from an explicit ask.
 
     Raises:
+        UsageError: If ``requested`` does not name a device this project supports.
+            :func:`torch.device` would answer for itself, but it answers with its own
+            twenty-odd backends -- ``mkldnn``, ``opengl``, ``ideep``, ``fpga`` -- as a
+            bare ``RuntimeError`` that reaches the user as a traceback. ``--device gpu``
+            deserves the five names that work.
         TrainingError: If a specific device was requested and is unavailable.
             Falling back to CPU from an explicit ``--device cuda`` would turn a
             twenty-minute run into a twelve-hour one without saying so.
@@ -150,6 +165,19 @@ def resolve_device(requested: str = "auto") -> torch.device:
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+
+    name, separator, index = requested.partition(":")
+    check_choice(name, DEVICE_CHOICES, "--device")
+    if separator and (not index.isdigit() or name == "auto"):
+        raise UsageError(
+            f"--device {requested!r} does not name a device.",
+            hint=(
+                "auto takes no device number; write cuda:0 to pick a particular GPU."
+                if name == "auto"
+                else f"Write {name} for the default one, or {name}:0 for the first."
+            ),
+            details={"given": requested, "index": index},
+        )
 
     device = torch.device(requested)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -195,8 +223,15 @@ def precision_for(
     between bf16 and fp16 shows up as stability rather than as an error message.
 
     Raises:
+        UsageError: If ``requested`` is not one of :data:`PRECISION_CHOICES`. Checked
+            here rather than at the CLI because every caller funnels through this
+            function, and because the cost of not checking was invisible: no branch
+            below matches an unknown value, so it fell through to ``auto`` and the run
+            reported the precision it picked as though that had been the ask.
         TrainingError: If bf16 was requested explicitly and is unavailable.
     """
+    check_choice(requested, PRECISION_CHOICES, "--precision")
+
     if backend in ("cpu", "mps"):
         # MPS autocast exists but this project has never verified it, so fp32 it is:
         # a wrong dtype on an untested backend produces silently bad training, and
@@ -346,6 +381,61 @@ def check_configs_agree(
         )
 
 
+def check_finetune_compatible(dataset: DatasetManifest, checkpoint: Checkpoint) -> None:
+    """Refuse a base model whose vocabulary is not this dataset's vocabulary.
+
+    A different ``content_hash`` is the point of fine-tuning and is deliberately not
+    checked here -- :func:`load_checkpoint` is called without ``expect_dataset`` for
+    exactly that reason. A different tokenizer is the opposite: token ids are row
+    indices into the embedding matrix, so the same id read through a different
+    tokenizer selects a vector trained for some other piece of text. Nothing raises,
+    the loss curve looks entirely ordinary, and the model learns nothing usable.
+
+    Module level rather than a :class:`Trainer` method so that a caller can apply it
+    *before* building anything -- ``trainai finetune`` checks it before creating the
+    run directory, because a refused fine-tune should not leave one behind.
+
+    Raises:
+        CheckpointIncompatibleError: The tokenizer or the vocabulary size differs.
+    """
+    for key, label, why in (
+        (
+            "tokenizer_fingerprint",
+            "tokenizer",
+            "Every token id in this dataset would index a row of the embedding "
+            "matrix that was trained for a different piece of text.",
+        ),
+        (
+            "vocab_size",
+            "vocabulary size",
+            "The embedding matrix has one row per token, so the shapes cannot "
+            "even be made to line up.",
+        ),
+    ):
+        have = checkpoint.dataset.get(key)
+        want = {
+            "tokenizer_fingerprint": dataset.tokenizer_fingerprint,
+            "vocab_size": dataset.vocab_size,
+        }.get(key)
+        if have is None or want is None or have == want:
+            continue
+        raise CheckpointIncompatibleError(
+            f"The base model was trained with a different {label}.",
+            hint=(
+                f"{why} Fine-tune against a dataset prepared with the same "
+                "tokenizer as the base model -- `trainai data prepare "
+                "--tokenizer <the base run's tokenizer.json>` reuses it instead "
+                "of training a new one."
+            ),
+            details={
+                "path": str(checkpoint.path) if checkpoint.path else None,
+                "field": key,
+                "base_model": have,
+                "dataset": want,
+            },
+        )
+
+
 @dataclass(frozen=True)
 class ValidationSkipped:
     """Why a run measured no held-out loss.
@@ -370,6 +460,23 @@ class ValidationSkipped:
         return {"reason": self.reason, "hint": self.hint}
 
 
+@dataclass(frozen=True)
+class StepOutcome:
+    """What one optimizer step produced.
+
+    A tuple of ``(loss, grad_norm)`` was enough until the loss mask arrived. With a
+    mask, a step can legitimately score *nothing* -- every window it drew lay inside a
+    prompt -- and the mean loss over zero positions is not a number. Returning 0.0
+    would put a fake minimum in the loss curve and returning NaN would be read as
+    divergence, so the count comes back with the loss and the caller decides.
+    """
+
+    loss: float
+    grad_norm: float | None
+    scored_tokens: int
+    applied: bool
+
+
 @dataclass
 class TrainResult:
     """What a finished run produced. Every field is measured, not projected."""
@@ -390,6 +497,16 @@ class TrainResult:
     diverged: bool = False
     validation_skipped: ValidationSkipped | None = None
     summary: dict[str, Any] = None  # type: ignore[assignment]
+    #: Whether the loss was computed on the tokens a masked dataset marks as targets.
+    loss_mask: bool = False
+    #: Positions the loss actually covered. Equal to ``tokens_seen`` without a mask,
+    #: and below it with one -- which is the number that explains a loss curve sitting
+    #: where an unmasked run's would not.
+    scored_tokens: int = 0
+    #: Steps whose every window was context, so nothing was applied. Always 0 without
+    #: a mask, and worth seeing with one: a run of them means the corpus has documents
+    #: longer than the context with no reply inside a window.
+    unscored_steps: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -410,6 +527,9 @@ class TrainResult:
             "precision": self.precision,
             "device": self.device,
             "diverged": self.diverged,
+            "loss_mask": self.loss_mask,
+            "scored_tokens": self.scored_tokens,
+            "unscored_steps": self.unscored_steps,
             "validation_skipped": (
                 self.validation_skipped.to_dict() if self.validation_skipped else None
             ),
@@ -436,6 +556,7 @@ class Trainer:
         device: torch.device | None = None,
         quiet: bool = False,
         write_metrics: bool = True,
+        finetune: bool = False,
     ) -> None:
         self.dataset = dataset
         self.train_config = train_config
@@ -473,6 +594,8 @@ class Trainer:
         self.best_val_loss: float | None = None
         self.best_val_step: int | None = None
         self._resumed_from: Path | None = None
+        self._finetuned_from: Path | None = None
+        self._parent: dict[str, Any] | None = None
         self.config_changes: dict[str, tuple[Any, Any]] = {}
         self.budget = DataBudget(
             train_tokens=dataset.tokens("train"),
@@ -481,6 +604,7 @@ class Trainer:
             non_embedding_parameters=model_config.non_embedding_parameter_count,
             tokens_per_step=train_config.tokens_per_step,
             steps=train_config.steps,
+            finetune=finetune,
         )
 
     # -- resume ------------------------------------------------------------- #
@@ -516,6 +640,84 @@ class Trainer:
         self.config_changes = self._compare_configs(checkpoint.train_config)
         return checkpoint
 
+    # -- fine-tune ---------------------------------------------------------- #
+
+    def initialise_from(self, source: str | Path | Checkpoint) -> Checkpoint:
+        """Take the weights from a checkpoint and start a *new* run from them.
+
+        This is the fine-tuning entry point, and it is deliberately not
+        :meth:`resume`. Resuming continues one run: same data, same schedule, the
+        optimizer's moments and the RNG streams restored so that step 601 is the step
+        601 that would have happened anyway. Fine-tuning is the opposite claim -- new
+        data, new schedule -- so only the weights come across:
+
+        * **Optimizer state is not loaded.** AdamW's moments are an average over the
+          gradients of the *previous* corpus. Carrying them into a different one
+          applies a stale preconditioner to the first steps, which is exactly when
+          the run is most fragile. Fresh moments plus this run's own warmup is the
+          honest start.
+        * **The RNG is not restored.** The data order belongs to this dataset.
+        * **:attr:`step` stays at 0**, so the learning-rate schedule warms up from
+          the beginning rather than resuming somewhere down a cosine decay that was
+          computed for a different number of total steps.
+
+        What it *does* check is the tokenizer. :func:`load_checkpoint` is called
+        without ``expect_dataset``, because a different ``content_hash`` is the whole
+        point -- but the two halves of that check mean different things and only one
+        of them is negotiable. Token ids are row indices into the embedding matrix,
+        so the same id read through a different tokenizer selects a vector trained
+        for some other piece of text. The loss curve looks entirely ordinary and the
+        model learns nothing usable, which is the failure this project refuses to
+        let happen quietly.
+
+        The model shape is checked by :meth:`Checkpoint.apply_to`; callers are
+        expected to have built ``model_config`` *from* the checkpoint rather than
+        from flags, because there is no useful sense in which a fine-tune chooses its
+        own layer count.
+
+        Args:
+            source: A checkpoint file, a directory to take the latest from, or an
+                already-loaded :class:`Checkpoint`. The last is what ``trainai
+                finetune`` passes: it has to read the checkpoint before this call to
+                get the model shape to build the model *from*, and reading a
+                multi-gigabyte file twice to learn the same thing is not free.
+
+        Raises:
+            CheckpointIncompatibleError: If the checkpoint's tokenizer or vocabulary
+                differs from this dataset's, or its model shape differs from this
+                model's.
+        """
+        checkpoint = (
+            source
+            if isinstance(source, Checkpoint)
+            else load_checkpoint(source, map_location=self.device, expect_dataset=None)
+        )
+        check_finetune_compatible(self.dataset, checkpoint)
+        checkpoint.apply_to(self.model)
+        self._finetuned_from = checkpoint.path
+        self._parent = self._describe_parent(checkpoint)
+        return checkpoint
+
+    def _describe_parent(self, checkpoint: Checkpoint) -> dict[str, Any]:
+        """Lineage for the run record: which model this one started from.
+
+        A fine-tuned checkpoint is not reproducible from its own run directory alone
+        -- it is a function of a base checkpoint that lives somewhere else -- so the
+        identity of that parent is recorded rather than left to the file path, which
+        the user is free to move.
+        """
+        return {
+            "path": str(checkpoint.path) if checkpoint.path else None,
+            "step": checkpoint.step,
+            "created_with": checkpoint.created_with,
+            "model": checkpoint.model_config.to_dict(),
+            "dataset": {
+                key: checkpoint.dataset.get(key)
+                for key in ("content_hash", "tokenizer_fingerprint", "vocab_size")
+            },
+            "val_loss": checkpoint.metrics.get("best_val_loss"),
+        }
+
     def _compare_configs(self, previous: TrainConfig) -> dict[str, tuple[Any, Any]]:
         """Settings that differ between the checkpoint's config and this one."""
         was, now = previous.to_dict(), self.train_config.to_dict()
@@ -534,6 +736,13 @@ class Trainer:
             "train_tokens": self.dataset.tokens("train"),
             "val_tokens": self.dataset.tokens("val"),
             "root": str(self.dataset.root) if self.dataset.root else None,
+            # Copied in rather than looked up later, for the reason the tokenizer is
+            # copied into the run directory: a run has to stay usable after its dataset
+            # is deleted, and datasets are the large thing people delete once training
+            # is done. Empty for a plain corpus. Not part of the resume check -- only
+            # the fingerprint and the content hash are -- so a checkpoint from before
+            # this release resumes unchanged.
+            "chat": dict(self.dataset.chat),
         }
 
     def _copy_tokenizer(self) -> str | None:
@@ -580,18 +789,21 @@ class Trainer:
         checkpoint_dir = self.run_dir / "checkpoints"
         tokenizer_warning = self._copy_tokenizer()
 
-        train_batcher, train_stream = open_split(
+        train_batcher, _train_stream = open_split(
             self.dataset,
             "train",
             seq_len=config.seq_len,
             batch_size=config.batch_size,
             seed=config.seed,
+            loss_mask=self._use_loss_mask(config),
         )
-        val_batcher, val_stream, val_skipped = self._open_validation(config)
+        val_batcher, _val_stream, val_skipped = self._open_validation(config)
 
         metrics = MetricsWriter(self.run_dir / "metrics.jsonl", enabled=self._write_metrics)
         meter = ThroughputMeter()
         last_loss = float("nan")
+        unscored_steps = 0
+        scored_tokens = 0
         diverged = False
         final_val_loss: float | None = None
         latest_checkpoint: Path | None = None
@@ -609,6 +821,8 @@ class Trainer:
             device=str(self.device),
             precision=self.precision_note,
             resumed_from=str(self._resumed_from) if self._resumed_from else None,
+            finetuned_from=str(self._finetuned_from) if self._finetuned_from else None,
+            parent=self._parent,
             config_changes={k: list(v) for k, v in self.config_changes.items()},
             validation_skipped=val_skipped.to_dict() if val_skipped else None,
         )
@@ -626,6 +840,13 @@ class Trainer:
                             f"{was} -> {now}. The remaining steps follow the new value, "
                             "so this is not a continuation of the original schedule."
                         )
+                if self._finetuned_from is not None and self._parent is not None:
+                    display.log(
+                        f"[green]Fine-tuning[/] the weights from step "
+                        f"{fmt_int(self._parent['step'])} of {self._finetuned_from.name}. "
+                        "Optimizer state and RNG were not carried over, so this run warms "
+                        "up and schedules on its own from step 0."
+                    )
                 display.log(
                     f"[dim]{self.model_config.describe()}  {fmt_count(self.model.parameter_count())}"
                     f" params  {self.precision_note} on {self.device}[/]"
@@ -644,15 +865,41 @@ class Trainer:
 
                 while self.step < config.steps:
                     started = time.perf_counter()
-                    loss_value, grad_norm = self._optimizer_step(train_batcher, config)
+                    outcome = self._optimizer_step(train_batcher, config)
+                    loss_value, grad_norm = outcome.loss, outcome.grad_norm
                     synchronize(self.device)
                     elapsed = time.perf_counter() - started
 
                     self.step += 1
-                    last_loss = loss_value
                     meter.record(config.tokens_per_step, elapsed)
+                    unscored = outcome.scored_tokens == 0
+                    if unscored:
+                        # Every window this step drew fell inside a prompt, so nothing
+                        # was applied and there is no loss. metrics.jsonl gets an
+                        # "unscored" record with a null loss and no "train" record at
+                        # all: a zero there would be a fake minimum in the curve, and
+                        # the mean over no positions is not a number. Validation and
+                        # checkpointing still happen on schedule -- the step counted,
+                        # it just taught nothing.
+                        unscored_steps += 1
+                        metrics.write(
+                            "unscored",
+                            self.step,
+                            loss=None,
+                            lr=self.schedule(self.step - 1),
+                            reason="no token of this step's windows is a training target",
+                        )
+                        if unscored_steps == 1:
+                            display.log(
+                                f"[yellow]note:[/] Step {fmt_int(self.step)} scored no "
+                                "tokens: every sequence it drew is context under the loss "
+                                "mask, so the step was not applied."
+                            )
+                    else:
+                        last_loss = loss_value
+                        scored_tokens += outcome.scored_tokens
 
-                    if not math.isfinite(loss_value):
+                    if not unscored and not math.isfinite(loss_value):
                         diverged = True
                         gradients_overflowed = grad_norm is not None and not math.isfinite(
                             grad_norm
@@ -696,13 +943,18 @@ class Trainer:
                     lr = self.schedule(self.step - 1)
                     display.update(
                         self.step,
-                        loss=loss_value,
+                        # The progress line carries the last loss there was on an
+                        # unscored step. The record of what each step produced is
+                        # metrics.jsonl, which says "unscored" with a null loss.
+                        loss=last_loss,
                         lr=lr,
                         tokens_per_second=meter.tokens_per_second,
                         grad_norm=grad_norm,
                     )
 
-                    if self.step % config.log_every == 0 or self.step == config.steps:
+                    if not unscored and (
+                        self.step % config.log_every == 0 or self.step == config.steps
+                    ):
                         metrics.write(
                             "train",
                             self.step,
@@ -727,13 +979,13 @@ class Trainer:
                         if improved:
                             self.best_val_loss = final_val_loss
                             self.best_val_step = self.step
-                        display.log_eval(self.step, val_loss=final_val_loss, train_loss=loss_value)
+                        display.log_eval(self.step, val_loss=final_val_loss, train_loss=last_loss)
                         metrics.write(
                             "eval",
                             self.step,
                             val_loss=final_val_loss,
                             val_perplexity=perplexity(final_val_loss),
-                            train_loss=loss_value,
+                            train_loss=last_loss,
                             improved=improved,
                             batches=config.eval_batches,
                         )
@@ -750,9 +1002,9 @@ class Trainer:
                     checkpoint_dir, metrics, is_best=self.best_val_step == self.step
                 )
         finally:
-            train_stream.close()
-            if val_stream is not None:
-                val_stream.close()
+            train_batcher.close()
+            if val_batcher is not None:
+                val_batcher.close()
 
             peak = self._peak_vram()
             metrics.write(
@@ -766,6 +1018,9 @@ class Trainer:
                 peak_vram_bytes=peak,
                 diverged=diverged,
                 validation_skipped=val_skipped.to_dict() if val_skipped else None,
+                loss_mask=train_batcher.has_loss_mask,
+                scored_tokens=scored_tokens,
+                unscored_steps=unscored_steps,
             )
             records = metrics.read_all()
             summary = summarise_run(records)
@@ -793,17 +1048,18 @@ class Trainer:
             diverged=diverged,
             validation_skipped=val_skipped,
             summary=summary,
+            loss_mask=train_batcher.has_loss_mask,
+            scored_tokens=scored_tokens,
+            unscored_steps=unscored_steps,
         )
 
-    def _optimizer_step(
-        self, batcher: TokenBatcher, config: TrainConfig
-    ) -> tuple[float, float | None]:
+    def _optimizer_step(self, batcher: TokenBatcher, config: TrainConfig) -> StepOutcome:
         """One optimizer step: ``grad_accum`` micro-batches, then apply.
 
-        Returns the mean loss over the micro-batches and the pre-clip gradient
-        norm. The gradient norm is worth reporting: a run whose loss looks fine
-        while its gradient norm climbs is about to diverge, and that is visible one
-        or two hundred steps before the loss shows it.
+        Returns the mean loss over the scored positions, the pre-clip gradient norm,
+        and how many positions that mean covers. The gradient norm is worth reporting:
+        a run whose loss looks fine while its gradient norm climbs is about to diverge,
+        and that is visible one or two hundred steps before the loss shows it.
 
         A non-finite loss returns early without applying the step, so the weights
         in memory stay at the last good value.
@@ -814,36 +1070,57 @@ class Trainer:
             group["lr"] = lr
 
         self.optimizer.zero_grad(set_to_none=True)
-        total = 0.0
-        for micro in range(config.grad_accum):
+        # The whole step's data is read before the first backward pass. Without a mask
+        # every micro-batch scores the same number of positions and its share of the
+        # effective batch is 1/grad_accum; with one, the shares differ, and a
+        # micro-batch's share is not knowable until every micro-batch has been read.
+        # Averaging the means instead would weight a micro-batch that scored 3 tokens
+        # the same as one that scored 300. The reads are memmap slices -- the same data
+        # the loop read one batch at a time, held for the length of one step.
+        batches = [
             # Each micro-batch of a step gets its own slice of the epoch order, so
             # the effective batch is grad_accum distinct batches rather than the
             # same one summed.
-            batch = batcher.batch(self.step * config.grad_accum + micro)
+            batcher.batch(self.step * config.grad_accum + micro)
+            for micro in range(config.grad_accum)
+        ]
+        scored = sum(batch.trained_tokens for batch in batches)
+        if scored == 0:
+            # Every window this step drew lies inside a prompt. There is nothing to
+            # learn from, so nothing is applied and the caller is told, rather than
+            # reporting a loss of 0 for a step that scored no token.
+            return StepOutcome(loss=float("nan"), grad_norm=None, scored_tokens=0, applied=False)
+
+        total = 0.0
+        for batch in batches:
             inputs = torch.from_numpy(batch.inputs).to(self.device, non_blocking=True).long()
             targets = torch.from_numpy(batch.targets).to(self.device, non_blocking=True).long()
+            mask = self._mask_tensor(batch)
 
             with self._autocast():
-                _, loss, _ = self.model(inputs, targets)
+                _, loss, _ = self.model(inputs, targets, loss_mask=mask)
             assert loss is not None
-            # Divide before backward so the accumulated gradient is the mean over
-            # the effective batch, not the sum. Summing would multiply the
-            # effective learning rate by grad_accum.
-            scaled = loss / config.grad_accum
+            # Weight before backward so the accumulated gradient is the mean over the
+            # effective batch, not the sum. Summing would multiply the effective
+            # learning rate by grad_accum. The weight is the micro-batch's share of
+            # the step's scored positions, which is 1/grad_accum exactly when every
+            # micro-batch scored the same count -- the unmasked case, unchanged.
+            count = batch.trained_tokens
+            scaled = loss * (count / scored)
             if self.scaler is not None:
                 self.scaler.scale(scaled).backward()
             else:
                 scaled.backward()
-            total += float(loss.detach())
+            total += float(loss.detach()) * count
 
-        mean_loss = total / config.grad_accum
+        mean_loss = total / scored
         if not math.isfinite(mean_loss):
             # Return without stepping. The gradients are already polluted, but the
             # weights are not: this leaves the model, and therefore any checkpoint
             # written from here, holding the last good state. Applying the step
             # first would put NaN into every parameter and make the checkpoint on
             # disk worthless as well as the run.
-            return mean_loss, None
+            return StepOutcome(loss=mean_loss, grad_norm=None, scored_tokens=scored, applied=False)
 
         grad_norm: float | None = None
         if self.scaler is not None:
@@ -862,14 +1139,48 @@ class Trainer:
             # GradScaler discovers its scale is too high: it happens routinely in
             # the first few steps, the scaler skips the step itself, and treating
             # it as divergence would abort every fp16 run at step one.
-            return float("nan"), grad_norm
+            return StepOutcome(
+                loss=float("nan"), grad_norm=grad_norm, scored_tokens=scored, applied=False
+            )
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
 
-        return mean_loss, grad_norm
+        return StepOutcome(loss=mean_loss, grad_norm=grad_norm, scored_tokens=scored, applied=True)
+
+    def _use_loss_mask(self, config: TrainConfig) -> bool:
+        """Whether this run scores only the tokens the dataset marks as targets.
+
+        ``None`` means "apply it if there is one", which is what makes a chat corpus
+        and a plain-text corpus both do the right thing unasked. ``True`` on a dataset
+        without a mask is a usage error rather than a run that trains on everything:
+        someone who asked for it in writing should not get the opposite silently. The
+        same three-state rule as ``data prepare --loss-mask``, deliberately.
+        """
+        if config.loss_mask is True and not self.dataset.has_loss_mask:
+            raise DatasetError(
+                "--loss-mask was given, but this dataset has no loss mask.",
+                hint=(
+                    "Re-run `trainai data prepare` with --jsonl-messages-field <field> "
+                    "to prepare a chat corpus with a mask, or drop --loss-mask to train "
+                    "on every token."
+                ),
+                details={"dataset": str(self.dataset.root)},
+            )
+        return config.loss_mask is not False
+
+    def _mask_tensor(self, batch: Batch) -> torch.Tensor | None:
+        """The batch's loss mask on the device, or ``None`` when it has none.
+
+        ``uint8`` on the wire and left as ``uint8`` here: the model casts it to the
+        logits' dtype, so widening it twice would move four times the bytes for a
+        tensor that is only ever multiplied by.
+        """
+        if batch.loss_mask is None:
+            return None
+        return torch.from_numpy(batch.loss_mask).to(self.device, non_blocking=True)
 
     def _autocast(self) -> Any:
         if self.dtype == torch.float32:
@@ -893,6 +1204,11 @@ class Trainer:
         checkpoint is chosen on this value, could pick a different checkpoint than the
         data supports. It is also the value ``trainai eval`` recomputes, and the two
         agreeing is the point.
+
+        On a masked dataset the positions counted are the *scored* ones, so validation
+        measures the same thing training optimises. Scoring every token here while
+        training only the replies would compare the model against a distribution it was
+        never trained on, and the number would move for reasons the run cannot act on.
         """
         self.model.eval()
         weighted = 0.0
@@ -900,20 +1216,35 @@ class Trainer:
         for batch in batcher.sequential_batches(max_batches=max_batches):
             inputs = torch.from_numpy(batch.inputs).to(self.device).long()
             targets = torch.from_numpy(batch.targets).to(self.device).long()
+            mask = self._mask_tensor(batch)
+            count = batch.trained_tokens
+            if count == 0:
+                # Nothing to score in this batch, and the model would return a loss of
+                # 0 for it. Weighting that in would drag the mean towards zero.
+                continue
             with self._autocast():
-                _, loss, _ = self.model(inputs, targets)
+                _, loss, _ = self.model(inputs, targets, loss_mask=mask)
             assert loss is not None
-            # The model's loss is a plain mean over every target position, so the
-            # weight is the count of positions -- which differs on the last batch.
-            count = int(targets.numel())
+            # The model's loss is a mean over the positions it scored, so the weight is
+            # that count -- which differs on the last batch, and on every batch of a
+            # masked split.
             weighted += float(loss) * count
             positions += count
         self.model.train()
-        if positions == 0:  # pragma: no cover - open_split refuses an empty split
+        if positions == 0:
             raise TrainingError(
-                "The validation split produced no batches.",
-                hint="Re-prepare the dataset with a larger --val-fraction.",
-                details={"max_batches": max_batches},
+                "The validation split produced no batches."
+                if not batcher.has_loss_mask
+                else "No token of the validation split is a training target, so there is "
+                "nothing to score it on.",
+                hint="Re-prepare the dataset with a larger --val-fraction."
+                if not batcher.has_loss_mask
+                else (
+                    "The held-out documents are all context: they have no assistant "
+                    "replies. Re-prepare with a larger --val-fraction, or train with "
+                    "--no-loss-mask to score every token."
+                ),
+                details={"max_batches": max_batches, "loss_mask": batcher.has_loss_mask},
             )
         return weighted / positions
 
@@ -965,6 +1296,7 @@ class Trainer:
                 seq_len=config.seq_len,
                 batch_size=rows,
                 seed=config.seed,
+                loss_mask=self._use_loss_mask(config),
             )
         except DatasetFormatError:
             # A damaged shard is not "this corpus is small"; it is a broken dataset, and
@@ -1006,12 +1338,16 @@ class Trainer:
         return int(torch.cuda.max_memory_allocated(self.device))
 
     # -- reporting ---------------------------------------------------------- #
-
-    def describe(self) -> str:
-        return (
-            f"{self.model_config.describe()} | {self.train_config.describe()} | "
-            f"{self.precision_note} on {self.device}"
-        )
+    #
+    # A ``describe`` used to live here: model shape, training config and precision
+    # joined with pipes. Nothing called it. Every panel that reports a run builds its
+    # own rows from ``model_config.describe`` and ``train_config.describe`` -- see
+    # ``cli/train.py``'s ``_run_rows`` -- because a table of labelled rows is what
+    # those panels print, and a single pipe-joined line is not a row. It went the same
+    # way as ``describe_presets``, ``describe_report`` and ``describe_plan`` before it,
+    # and for the same reason: a formatting helper no caller wants is a format nobody
+    # has agreed to, and it drifts from the panels that do the work without a test
+    # able to notice.
 
     def memory_note(self) -> str:
         """Measured peak allocation, or a statement that there is nothing to measure."""

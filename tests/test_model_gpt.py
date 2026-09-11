@@ -553,6 +553,26 @@ def test_rmsnorm_reduces_in_fp32_even_when_given_half_precision() -> None:
     assert torch.isfinite(out).all()
 
 
+def test_a_norm_says_how_wide_it_is_when_printed() -> None:
+    """``print(model)`` is the first thing anyone does with a checkpoint they loaded.
+
+    The bundle written by :mod:`trainai.export.bundle` hands users a loaded ``GPT``, and
+    a stack of bare ``RMSNorm()`` lines tells them nothing: the width is the one number
+    that says which model this is, and ``eps`` is a config field they are allowed to set
+    (``ModelConfig.norm_eps``) whose value would otherwise appear nowhere in the printed
+    architecture. ``nn.Module`` supplies the parentheses; what goes inside them is this.
+
+    Read off the parameter rather than stored, so it cannot disagree with the tensor.
+    """
+    assert repr(RMSNorm(8)) == "RMSNorm(dim=8, eps=1e-05)"
+    assert repr(RMSNorm(384, eps=1e-6)) == "RMSNorm(dim=384, eps=1e-06)"
+
+    # Every norm in the model, reached the way a user reaches it.
+    printed = repr(GPT(small_config()))
+    assert "RMSNorm(dim=32, eps=1e-05)" in printed
+    assert "RMSNorm()" not in printed
+
+
 # --------------------------------------------------------------------------- #
 # Weight tying
 # --------------------------------------------------------------------------- #
@@ -664,6 +684,186 @@ def test_an_empty_sequence_is_a_trainai_bug_not_a_crash(model: GPT) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The loss mask
+# --------------------------------------------------------------------------- #
+#: How far the masked reduction may sit from ``reduction="mean"``. Not a taste: see
+#: :func:`test_the_loss_tolerance_admits_the_gap_a_real_runner_produced`, which pins it
+#: against the gap a real machine produced and against the size of a formula error.
+MASKED_LOSS_REL = 1e-6
+
+#: The two values one CI runner produced for the same loss, computed the two ways, on the
+#: commit that made this a tolerance instead of an equality. Kept because a tolerance with
+#: no witness is a number someone felt was safe; this one is the number that was measured.
+#: The gap is 1.9 float32 ulps. Machines that vectorize the fused mean the same way the
+#: explicit sum accumulates -- this developer's, and roughly half the hosted runners --
+#: return the first value from both paths and cannot observe the difference at all.
+OBSERVED_MEAN_AND_WEIGHTED = (4.196224689483643, 4.196225166320801)
+
+
+def test_the_loss_tolerance_admits_the_gap_a_real_runner_produced() -> None:
+    """The tolerance above has to cover float32, and nothing larger.
+
+    Both halves matter. Too tight and the suite fails on a subset of the matrix that
+    depends on the runner's vector width, which is what it did for four commits. Too loose
+    and it stops distinguishing "the same formula summed in a different order" from "a
+    different formula", which is the only thing it is for. The two are separated by four
+    orders of magnitude, so a tolerance can sit between them -- but only if someone checks,
+    and this is the check.
+    """
+    plain, masked = OBSERVED_MEAN_AND_WEIGHTED
+    ulp = abs(plain) * torch.finfo(torch.float32).eps
+
+    assert plain != masked, "the witness has to be a pair that actually disagreed"
+    assert masked == pytest.approx(plain, rel=MASKED_LOSS_REL), (
+        "the tolerance no longer admits a gap a real runner produced; tightening it "
+        "re-breaks CI on hardware nobody here has"
+    )
+    assert abs(masked - plain) < 4 * ulp, "the witness is meant to be a rounding gap"
+    assert MASKED_LOSS_REL < 1e-4, (
+        "a tolerance this loose would accept a formula error as a rounding difference"
+    )
+
+
+def test_a_mask_of_ones_gives_the_unmasked_loss(model: GPT, tokens: torch.Tensor) -> None:
+    """The masked path has to be the same formula, which is not the same as the same bits.
+
+    Every existing run trains without a mask, so a masked path that differed in the fourth
+    decimal would show up as a "loss curve changed" bug report with no cause. That is the
+    claim worth defending, and two separate assertions defend it.
+
+    The first is *not* ``==``, and that was a real bug in this test rather than a
+    concession. ``reduction="mean"`` sums the per-token losses inside one fused kernel;
+    the masked path multiplies by the weights and calls ``.sum()``. Those are the same
+    arithmetic in exact real numbers and different orders of accumulation in float32, so
+    whether they agree bit-for-bit is a property of the CPU's vector width, not of this
+    code. Asserting equality made the outcome depend on which machine ran it: the two
+    values were 4.196225166320801 and 4.196224689483643 -- 1.9 float32 ulps apart -- on
+    some GitHub runners and identical on others, so the test failed on a shifting subset
+    of an eight-job matrix, on Windows and Linux alike, with nothing in the repository
+    having changed. A formula error moves a loss by percent; a summation order moves it by
+    parts per ten million, and the tolerance here sits four orders of magnitude below the
+    first and above the second.
+
+    The second assertion is the one that pins the formula, and it is exact: the weighted
+    mean computed independently in float64, where the accumulation order cannot matter at
+    this scale. A wrong denominator or a dropped weight fails it outright.
+
+    The two paths are deliberately *not* merged into one call to make the first assertion
+    trivially true. That would replace a measured agreement between the shipped hot path
+    and the masked path with a comparison of one code path against itself, which is the
+    weaker claim wearing the stronger operator.
+    """
+    targets = torch.roll(tokens, -1, dims=1)
+    ones = torch.ones_like(targets, dtype=torch.uint8)
+
+    with torch.no_grad():
+        logits, plain, _ = model(tokens, targets)
+        _, masked, _ = model(tokens, targets, loss_mask=ones)
+
+    assert plain is not None and masked is not None
+    assert float(masked) == pytest.approx(float(plain), rel=MASKED_LOSS_REL)
+
+    per_token = torch.nn.functional.cross_entropy(
+        logits.double().view(-1, logits.size(-1)), targets.reshape(-1), reduction="none"
+    )
+    reference = float(per_token.sum() / per_token.numel())
+    assert float(masked) == pytest.approx(reference, rel=MASKED_LOSS_REL)
+
+
+def test_a_mask_scores_only_the_positions_it_selects(model: GPT, tokens: torch.Tensor) -> None:
+    """Checked against cross-entropy over the selected columns, computed separately."""
+    targets = torch.roll(tokens, -1, dims=1)
+    mask = torch.zeros_like(targets, dtype=torch.uint8)
+    mask[0, 3:7] = 1
+    mask[1, 9:] = 1
+
+    with torch.no_grad():
+        _, masked, _ = model(tokens, targets, loss_mask=mask)
+        logits, _, _ = model(tokens)
+
+    selected = mask.reshape(-1).bool()
+    reference = torch.nn.functional.cross_entropy(
+        logits.float().view(-1, logits.size(-1))[selected], targets.reshape(-1)[selected]
+    )
+    assert masked is not None
+    assert float(masked) == pytest.approx(float(reference), abs=1e-6)
+
+
+def test_changing_a_masked_out_target_does_not_move_the_loss(
+    model: GPT, tokens: torch.Tensor
+) -> None:
+    """The negative control. A weight that is applied has to be applied everywhere.
+
+    Weighting the per-token losses and then dividing by ``targets.numel()`` instead of
+    by the weight sum passes the test above up to a constant and fails nothing else;
+    this pins the *targets* the loss reads rather than only the positions it counts.
+    """
+    targets = torch.roll(tokens, -1, dims=1)
+    mask = torch.zeros_like(targets, dtype=torch.uint8)
+    mask[:, :4] = 1
+    moved = targets.clone()
+    moved[:, 4:] = (moved[:, 4:] + 7) % VOCAB
+
+    with torch.no_grad():
+        _, before, _ = model(tokens, targets, loss_mask=mask)
+        _, after, _ = model(tokens, moved, loss_mask=mask)
+
+    assert before is not None and after is not None
+    assert float(before) == float(after)
+
+
+def test_a_window_with_no_target_gives_loss_zero_and_no_gradient() -> None:
+    """The case that makes this a weighted mean instead of ``ignore_index=-100``.
+
+    A window landing entirely inside a prompt selects nothing, and cross-entropy over
+    nothing is 0/0. With ``ignore_index`` that is a NaN, and it does not stay local: it
+    reaches every parameter through the backward pass and the run is dead from that step
+    on, reported as divergence. The clamped denominator makes the window contribute
+    exactly nothing instead, which is the truthful answer -- there was nothing to learn
+    from it -- and lets the trainer count it and say so.
+    """
+    torch.manual_seed(0)
+    model = GPT(small_config())
+    inputs = torch.randint(0, VOCAB, (2, 8))
+    targets = torch.randint(0, VOCAB, (2, 8))
+    empty = torch.zeros_like(targets, dtype=torch.uint8)
+
+    _, loss, _ = model(inputs, targets, loss_mask=empty)
+
+    assert loss is not None
+    assert float(loss.detach()) == 0.0
+    loss.backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is None or float(parameter.grad.abs().max()) == 0.0, name
+
+
+def test_a_mask_of_the_wrong_shape_is_refused_as_a_bug(model: GPT, tokens: torch.Tensor) -> None:
+    """Not a user error: nothing the user types can produce this, only wrong batching.
+
+    Left unchecked, broadcasting does something plausible -- a (1, T) mask silently
+    applies row 0's mask to every row of the batch -- and the loss it returns looks
+    fine.
+    """
+    targets = torch.roll(tokens, -1, dims=1)
+
+    with pytest.raises(ConfigError) as caught:
+        model(tokens, targets, loss_mask=torch.ones((1, targets.shape[1]), dtype=torch.uint8))
+
+    assert "bug" in (caught.value.hint or "").lower()
+    assert str(list(targets.shape)) in str(caught.value)
+
+
+def test_a_mask_without_targets_is_ignored_rather_than_silently_scoring(model: GPT) -> None:
+    """``forward`` with no targets returns no loss, so there is nothing to mask."""
+    inputs = torch.randint(0, VOCAB, (2, 8))
+
+    with torch.no_grad():
+        _, loss, _ = model(inputs, loss_mask=torch.ones((2, 8), dtype=torch.uint8))
+
+    assert loss is None
+
+
+# --------------------------------------------------------------------------- #
 # Dropout
 # --------------------------------------------------------------------------- #
 def test_dropout_is_stochastic_in_training_and_off_in_eval(tokens: torch.Tensor) -> None:
@@ -731,6 +931,46 @@ def test_zero_weight_decay_still_produces_usable_groups() -> None:
     assert sum(p.numel() for g in groups for p in g["params"]) == model.parameter_count()
 
 
+def test_a_frozen_parameter_is_handed_to_neither_group() -> None:
+    """Freezing the embedding is the ordinary fine-tune, and under tying it freezes two.
+
+    ``embed_tokens.weight`` *is* the output projection when ``tie_embeddings`` is on --
+    see ``test_tied_head_is_literally_the_embedding_tensor`` -- so this one call holds
+    both still, which is a third of a small model's parameters.
+
+    What makes the omission load-bearing rather than tidy is that ``parameter_count``
+    already excludes frozen parameters by default, and that count is what the run record
+    reports. Leave the frozen tensor in a group and the run says it is training one
+    number while the optimizer holds another, with nothing in the output disagreeing.
+    AdamW itself would not complain: it skips a parameter whose ``grad`` is ``None``, so
+    the divergence is silent for as long as the run lasts.
+
+    The control matters as much as the claim: ``parameter_groups`` dropping *everything*
+    would satisfy the assertions below and is what
+    ``test_every_parameter_lands_in_exactly_one_group`` above is holding down.
+    """
+    model = GPT(small_config(tie_embeddings=True))
+    frozen = model.embed_tokens.weight
+
+    before = model.parameter_groups(weight_decay=0.1)
+    assert any(p is frozen for group in before for p in group["params"]), (
+        "the embedding has to be in a group while it is trainable, or this proves nothing"
+    )
+
+    frozen.requires_grad_(False)
+    groups = model.parameter_groups(weight_decay=0.1)
+
+    kept = [p for group in groups for p in group["params"]]
+    assert not any(p is frozen for p in kept), "a frozen tensor was handed to the optimizer"
+    assert sum(p.numel() for p in kept) == model.parameter_count(), (
+        "the groups and the reported trainable count have to be the same set"
+    )
+    assert model.parameter_count(trainable_only=False) - model.parameter_count() == frozen.numel()
+    assert len(kept) == len([p for group in before for p in group["params"]]) - 1, (
+        "exactly one parameter left, not a whole group"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Generation
 # --------------------------------------------------------------------------- #
@@ -783,6 +1023,37 @@ def test_streaming_yields_one_token_per_step(model: GPT) -> None:
 
     assert len(pieces) == 7
     assert all(piece.shape == (3, 1) for piece in pieces)
+
+
+def test_asking_for_no_tokens_returns_the_window_the_model_would_have_seen() -> None:
+    """Zero is the one call where the promised left-truncation is directly visible.
+
+    :meth:`GPT.generate` documents that a prompt longer than the context is truncated
+    from the left, and every other test infers that from a suffix. Here the return value
+    *is* the truncation, so this is what pins it -- and what says the answer is the last
+    ``seq_len`` tokens rather than the first.
+
+    Reachable from a library caller: ``export.bundle`` writes a snippet that calls
+    ``model.generate`` directly, and a token budget computed from a limit minus a prompt
+    length arrives here as 0 when the prompt fills the budget. The CLI refuses ``--tokens
+    0`` before it gets this far (``cli/chat.py``), which is why nothing exercised it.
+
+    Returning the prompt untouched is the obvious implementation and the wrong one: a
+    caller who feeds the result back in has it truncated a second time, one round later
+    than they could have known about.
+    """
+    model = GPT(small_config()).eval()
+    context = model.config.seq_len
+
+    fits = torch.randint(0, VOCAB, (2, 4))
+    assert torch.equal(model.generate(fits, 0), fits), "nothing asked for, nothing appended"
+    assert not list(model.generate_stream(fits, 0)), "the streaming path agrees"
+
+    over_long = torch.arange(1, context * 2 + 1).reshape(1, -1) % VOCAB
+    kept = model.generate(over_long, 0)
+
+    assert kept.shape == (1, context)
+    assert torch.equal(kept, over_long[:, -context:]), "the *last* seq_len tokens, not the first"
 
 
 def test_streaming_builds_no_autograd_graph(model: GPT) -> None:

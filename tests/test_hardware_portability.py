@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import stat
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -36,7 +38,7 @@ import pytest
 import torch
 
 from conftest import flat
-from trainai.errors import TrainingError
+from trainai.errors import ExitCode, TrainingError, UsageError
 from trainai.hardware.install import (
     PYTORCH_SELECTOR,
     advise_install,
@@ -51,13 +53,20 @@ from trainai.hardware.probe import (
     _cgroup_memory_limit,
     _cpu_affinity_count,
     _linux_pci_vendors,
+    _platform_summary,
+    _probe_cpu,
     _probe_cpu_limit,
+    _probe_cpu_name,
+    _probe_disk,
+    _probe_ram,
     _probe_ram_limit,
+    _windows_registry_vendors,
     describe_unusable_gpu,
     detect_gpu_vendors,
     probe_hardware,
     vendor_labels,
 )
+from trainai.train.config import PRECISION_CHOICES
 from trainai.train.loop import precision_for
 
 GIB = 1024**3
@@ -266,10 +275,28 @@ def arc_a770() -> HardwareProfile:
 
 
 def apple_m2() -> HardwareProfile:
-    """MPS exposes no per-device VRAM, so gpus is empty by design."""
+    """A 24 GiB M2, with the memory figures the probe actually derives on Apple.
+
+    Not a card's VRAM. The total is Metal's declared working-set ceiling, which is
+    roughly 75% of installed RAM, and the usable figure is that ceiling capped by what
+    the OS says is free -- here 14.4 GiB of RAM available against an 18 GiB ceiling, so
+    RAM is the binding constraint and the lower number is the honest one.
+
+    This fixture used to be ``gpus=[]`` "by design", which is what the probe returned
+    before it read ``torch.mps.recommended_max_memory()``. The consequence was that
+    ``primary_gpu`` was ``None`` on every Apple machine, ``vram_budget_bytes()`` returned
+    0, and the planner's over-budget check -- gated on a positive budget -- never ran.
+    """
     return machine(
         "macOS-14 / Apple M2",
-        gpus=[],
+        gpus=[
+            gpu(
+                "Apple Silicon (unified memory)",
+                total_gib=18.0,
+                free_gib=24.0 * 0.6,
+                backend="mps",
+            )
+        ],
         backend="mps",
         os_name="Darwin",
         vendors=["apple"],
@@ -437,6 +464,85 @@ def test_half_precision_on_a_backend_without_it_falls_back_and_says_why(label: s
     assert "CUDA or ROCm" in note
 
 
+@pytest.mark.parametrize("label", ["rtx_4090", "rx_7900_xtx", "mi210", "arc_a770"])
+def test_requesting_bf16_where_it_exists_is_granted_without_a_scaler(label: str) -> None:
+    """The control for the refusal above, on one card per accelerator backend.
+
+    bf16 has the dynamic range of fp32, so the scaler that fp16 needs would be pure
+    overhead here -- and the note has to say "requested" rather than name the hardware,
+    because the user is being told their ask was honoured, not what was inferred.
+    """
+    profile = ALL_MACHINES[label]()
+
+    dtype, needs_scaler, note = precision_for(
+        "bf16",
+        backend=profile.backend,
+        supports_bf16=True,
+        capability=profile.primary_gpu.compute_capability,
+    )
+
+    assert dtype == torch.bfloat16
+    assert needs_scaler is False
+    assert note == "bf16 (requested)"
+
+
+@pytest.mark.parametrize("label", ["rtx_4090", "gtx_1080_ti", "rx_6900_xt", "arc_a770"])
+def test_requesting_fp16_is_granted_on_every_accelerator_and_always_paired_with_a_scaler(
+    label: str,
+) -> None:
+    """fp16 is never refused -- every accelerator here has it -- and never unscaled.
+
+    The pairing is the point. fp16's smallest normal value is about 6e-5, and gradients
+    live below that, so an unscaled fp16 run trains on zeros and reports a loss that
+    barely moves. A card with bf16 is included deliberately: asking for fp16 on a 4090
+    still gets the scaler, because the ask is honoured rather than second-guessed.
+    """
+    profile = ALL_MACHINES[label]()
+
+    dtype, needs_scaler, note = precision_for(
+        "fp16", backend=profile.backend, supports_bf16=profile.supports_bf16
+    )
+
+    assert dtype == torch.float16
+    assert needs_scaler is True
+    assert note == "fp16 with gradient scaling (requested)"
+
+
+@pytest.mark.parametrize("label", list(ALL_MACHINES))
+def test_a_precision_that_does_not_exist_is_refused_on_every_machine(label: str) -> None:
+    """Every machine, because the fall-through this closes was per-backend.
+
+    ``fp64`` matched no branch, so the CPU path returned "fp32 (on CPU)" and a bf16 card
+    returned "bf16 (supported by this cuda device)" -- each of them a note describing
+    ``auto``, printed for a user who asked for something else. The value is checked once,
+    before any of that, so the answer does not depend on the hardware.
+    """
+    profile = ALL_MACHINES[label]()
+
+    with pytest.raises(UsageError) as caught:
+        precision_for("fp64", backend=profile.backend, supports_bf16=profile.supports_bf16)
+
+    assert caught.value.exit_code == ExitCode.USAGE
+    assert ", ".join(PRECISION_CHOICES) in (caught.value.hint or "")
+
+
+def test_a_misspelt_precision_is_not_answered_with_the_one_auto_would_have_picked() -> None:
+    """The shape of the bug, rather than one value of it.
+
+    ``bf6`` is one character from ``bf16``, and on a card that supports bf16 the old
+    fall-through gave it *exactly what bf16 would have given*: the same dtype, the same
+    note, no error. A run could be asked for a precision that does not exist and report a
+    plausible one, which is indistinguishable from having worked.
+    """
+    profile = ALL_MACHINES["rtx_4090"]()
+    assert profile.supports_bf16, "this test needs a machine where auto and bf16 agree"
+
+    with pytest.raises(UsageError) as caught:
+        precision_for("bf6", backend=profile.backend, supports_bf16=True)
+
+    assert "bf16" in (caught.value.hint or ""), "a near miss this close should be named"
+
+
 # --------------------------------------------------------------------------- #
 # VRAM budgeting
 # --------------------------------------------------------------------------- #
@@ -460,9 +566,41 @@ def test_a_bigger_card_gets_a_proportionally_bigger_budget() -> None:
     assert large > small * 5
 
 
-@pytest.mark.parametrize("label", ["apple_m2", "cpu_only", "nvidia_with_cpu_wheel"])
+@pytest.mark.parametrize("label", ["cpu_only", "nvidia_with_cpu_wheel"])
 def test_a_machine_with_no_usable_gpu_has_no_vram_budget(label: str) -> None:
     assert ALL_MACHINES[label]().vram_budget_bytes() == 0
+
+
+def test_apple_gets_a_budget_from_the_metal_ceiling_rather_than_no_opinion() -> None:
+    """``apple_m2`` used to be in the list above, and that was the bug.
+
+    A budget of 0 is not "unlimited", it is "no opinion": the planner's over-budget
+    check is gated on ``budget_bytes > 0``, so on Apple it never ran and an oversized
+    rung was found out by the OOM instead of by the plan. The ceiling is a driver
+    figure, so there is a real number to use here.
+    """
+    profile = apple_m2()
+    device = profile.primary_gpu
+
+    assert device is not None
+    assert device.backend == "mps"
+    assert profile.vram_budget_bytes() == int(device.free_vram_bytes * DEFAULT_VRAM_SAFETY_FRACTION)
+    assert 0 < profile.vram_budget_bytes() < device.total_vram_bytes
+
+
+def test_apples_usable_memory_is_capped_by_free_ram_not_just_the_ceiling() -> None:
+    """The ceiling ignores every other process; unified memory means that matters.
+
+    A 24 GiB M2 declares an 18 GiB working set, but if the OS has 14.4 GiB free then
+    14.4 is the number a plan may spend. Reporting the ceiling would promise a browser's
+    worth of memory that is not there.
+    """
+    profile = apple_m2()
+    device = profile.primary_gpu
+
+    assert device is not None
+    assert device.free_vram_bytes == profile.available_ram_bytes
+    assert device.free_vram_bytes < device.total_vram_bytes
 
 
 def test_multi_gpu_budgets_from_the_first_card_only() -> None:
@@ -718,6 +856,201 @@ def test_intel_gets_an_xpu_index_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "whl/xpu" in advice.command
 
 
+def test_an_amd_card_on_a_platform_rocm_does_not_reach_says_so_and_offers_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS with an AMD card: a real machine, and the only honest answer is "CPU".
+
+    Every other vendor branch ends in a command. This one cannot: ROCm is Linux and
+    Windows only, so there is no wheel to name, and the note has to say that outright
+    rather than leave the user looking for a command that was never printed.
+    """
+    patch_environment(
+        monkeypatch, vendors=["amd"], system="Darwin", torch_cuda=None, accelerator=False
+    )
+
+    advice = advise_install(["amd"])
+
+    assert advice.command is None
+    notes = " ".join(advice.notes)
+    assert "Linux and Windows" in notes, notes
+    assert "train on the CPU" in notes, notes
+
+
+# --------------------------------------------------------------- how the install is read
+#
+# `patch_environment` replaces `_torch_build` wholesale, which is right for the advice
+# tests above and leaves the reader itself untested. It is the one function in the
+# module that touches the real torch, and the `import torch` inside its body -- late on
+# purpose, because torch's absence is a case it reports rather than a failure it
+# propagates -- is also what makes it substitutable: `sys.modules` is consulted first,
+# so a stub placed there is what the function imports.
+
+
+def fake_torch(
+    *,
+    cuda: str | None = None,
+    hip: str | None = None,
+    cuda_available: bool = False,
+    xpu_available: bool | None = None,
+    mps_available: bool | None = None,
+) -> types.ModuleType:
+    """A ``torch`` carrying only what ``_torch_build`` reads.
+
+    ``None`` for ``xpu_available`` or ``mps_available`` leaves the attribute off
+    altogether, which is the difference between a wheel built without that backend and
+    one that has it and finds no card.
+    """
+    module = types.ModuleType("torch")
+    module.version = types.SimpleNamespace(cuda=cuda, hip=hip)
+    module.cuda = types.SimpleNamespace(is_available=lambda: cuda_available)
+    module.backends = types.ModuleType("torch.backends")
+    if xpu_available is not None:
+        module.xpu = types.SimpleNamespace(is_available=lambda: xpu_available)
+    if mps_available is not None:
+        module.backends.mps = types.SimpleNamespace(is_available=lambda: mps_available)
+    return module
+
+
+def build_with(module: Any) -> tuple[str | None, bool]:
+    """Read the build with ``module`` standing in for torch, for exactly one call.
+
+    The swap is undone the moment the call returns rather than at teardown: the real
+    torch is imported at the top of this file and used by most of the suite, and there
+    is no reason to leave a stub in ``sys.modules`` for longer than the one function
+    that has to see it. ``None`` is how a missing torch is spelled -- an import that
+    finds ``None`` under its name raises ``ImportError``.
+    """
+    from trainai.hardware.install import _torch_build
+
+    original = sys.modules["torch"]
+    sys.modules["torch"] = module
+    try:
+        return _torch_build()
+    finally:
+        sys.modules["torch"] = original
+
+
+def test_a_cpu_only_wheel_is_read_as_cpu_only() -> None:
+    assert build_with(fake_torch()) == ("CPU-only", False)
+
+
+def test_a_cuda_wheel_is_named_by_the_version_it_was_built_against() -> None:
+    """The string reaches the user, and `doctor` prints it beside the driver's version."""
+    assert build_with(fake_torch(cuda="12.6", cuda_available=True)) == ("CUDA 12.6", True)
+
+
+def test_a_rocm_wheel_is_named_by_its_hip_version() -> None:
+    """`torch.version.cuda` is not the tell on ROCm -- `hip` is, and it is read first.
+
+    A ROCm build reaches the GPU through the CUDA API, so several of the attributes
+    around this one answer as if the card were NVIDIA. The description has to say ROCm
+    anyway, because it is what the user compares against the wheel they installed.
+    """
+    assert build_with(fake_torch(hip="6.2.41133", cuda_available=True)) == ("ROCm 6.2.41133", True)
+
+
+def test_an_intel_card_is_found_even_though_the_wheel_names_no_version() -> None:
+    """The accelerator flag and the wheel description answer different questions.
+
+    An XPU wheel sets neither ``version.cuda`` nor ``version.hip``, so the description
+    falls through to the same "CPU-only" a plain wheel gets. The flag is the part
+    ``advise_install`` acts on -- True here means it says the install already works and
+    prints no command, which is right, and would be wrong if it read the description.
+    """
+    assert build_with(fake_torch(xpu_available=True)) == ("CPU-only", True)
+
+
+def test_an_intel_build_with_no_card_in_the_machine_reports_no_accelerator() -> None:
+    """The control for the test above: the flag follows `is_available`, not the attribute.
+
+    Reading ``torch.xpu`` as the answer on its own would report an accelerator on every
+    XPU wheel, card or no card, and send a user with none of the hardware into a
+    training run that then falls back to the CPU without saying so.
+    """
+    assert build_with(fake_torch(xpu_available=False)) == ("CPU-only", False)
+
+
+def test_apple_metal_is_found_through_the_backends_module() -> None:
+    """MPS hangs off `torch.backends`, not `torch`, and the default wheel includes it."""
+    assert build_with(fake_torch(mps_available=True)) == ("CPU-only", True)
+    assert build_with(fake_torch(mps_available=False)) == ("CPU-only", False)
+
+
+def test_a_torch_that_answers_nothing_is_described_rather_than_raised() -> None:
+    """Regression. A file named `torch.py` beside the script imports as an empty module.
+
+    It is a beginner's mistake with a name this popular, and it lands in the one command
+    written for people whose install is wrong. ``torch.backends`` used to be read
+    without a guard while every attribute around it had one, so ``trainai setup`` died
+    with ``AttributeError: module 'torch' has no attribute 'backends'`` instead of
+    reporting what it found.
+    """
+    assert build_with(types.ModuleType("torch")) == ("CPU-only", False)
+
+
+def test_torch_missing_altogether_is_a_description_of_none() -> None:
+    """`None` is what `advise_install` turns into "PyTorch is not installed."
+
+    Distinct from ``"CPU-only"``: one means re-run the install, the other means the
+    install finished and picked the wrong wheel. Collapsing them would send a user
+    whose torch never installed a command to change channels.
+    """
+    assert build_with(None) == (None, False)
+
+
+# ------------------------------------------------------- where a 2.5 GB wheel would land
+#
+# `setup --install` refuses to run pip outside a virtual environment unless told twice,
+# because the alternative is 2.5 GB landing in the system Python. Until now the only
+# thing asserted about that gate was that it returns a bool.
+
+
+def test_a_virtual_environment_is_recognised_by_its_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "prefix", "/tmp/env")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+
+    assert in_virtualenv() is True
+
+
+def test_conda_is_recognised_although_it_leaves_the_prefixes_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """conda activates by environment variable, so the prefix test alone misses it.
+
+    Reading a conda environment as the system Python would make ``setup --install``
+    refuse the one install it should have been happy to do.
+    """
+    monkeypatch.setattr(sys, "prefix", "/usr")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    monkeypatch.setenv("CONDA_PREFIX", "/opt/conda/envs/trainai")
+
+    assert in_virtualenv() is True
+
+
+def test_the_system_python_is_not_mistaken_for_an_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The answer that matters: this is the case the confirmation prompt exists for."""
+    monkeypatch.setattr(sys, "prefix", "/usr")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+
+    assert in_virtualenv() is False
+
+
+def test_an_empty_conda_prefix_is_not_an_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A variable set to nothing is how a deactivated shell can leave it behind."""
+    monkeypatch.setattr(sys, "prefix", "/usr")
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    monkeypatch.setenv("CONDA_PREFIX", "")
+
+    assert in_virtualenv() is False
+
+
 # --------------------------------------------------------------------------- #
 # The one sentence both commands print
 # --------------------------------------------------------------------------- #
@@ -946,6 +1279,25 @@ def test_an_nvidia_smi_that_prints_nothing_useful_reports_no_driver(
     assert detect_driver_cuda_version() is None
 
 
+def test_no_nvidia_smi_on_the_path_reports_no_driver_without_running_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary case on every machine without an NVIDIA driver, including this one.
+
+    ``shutil.which`` is checked first so that the absence is answered without a
+    ``subprocess`` call at all -- a spawn that fails costs a process launch on every
+    ``doctor`` and ``setup`` run, and on Windows can put a "not recognized" line on
+    stderr that the user sees.
+    """
+    monkeypatch.setattr("trainai.hardware.install.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "trainai.hardware.install.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("nvidia-smi was launched with nothing to launch"),
+    )
+
+    assert detect_driver_cuda_version() is None
+
+
 # --------------------------------------------------------------------------- #
 # The Linux sysfs card walk
 # --------------------------------------------------------------------------- #
@@ -1018,6 +1370,218 @@ def test_a_missing_drm_directory_is_not_an_error(
     monkeypatch.setattr("trainai.hardware.probe._DRM_CLASS_PATH", str(tmp_path / "absent"))
 
     assert _linux_pci_vendors() == set()
+
+
+# --------------------------------------------------------------------------- #
+# Which vendors the machine says are present
+# --------------------------------------------------------------------------- #
+def fake_machine(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tools: tuple[str, ...] = (),
+    system: str = "Linux",
+    machine: str = "x86_64",
+    drm: Path | str = "/nonexistent",
+) -> None:
+    """Everything ``detect_gpu_vendors`` reads, so its answer is not this machine's.
+
+    Left alone the function reports whatever is installed on the machine running the
+    suite, and that is why seven of its lines had never been read: ``rocm-smi`` and
+    ``xpu-smi`` are on nobody's development PATH, and the platform fork can only take
+    one of its three branches per run. Measured here, the missing lines are the Linux
+    card walk and the two AMD/Intel tools; on a Linux runner the same file instead
+    leaves the whole registry walk unread. Neither list describes the code, so the
+    facts are supplied rather than sampled.
+    """
+    monkeypatch.setattr(
+        "trainai.hardware.probe.shutil.which",
+        lambda name: f"/usr/bin/{name}" if name in tools else None,
+    )
+    monkeypatch.setattr(platform, "system", lambda: system)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setattr("trainai.hardware.probe._DRM_CLASS_PATH", str(drm))
+
+
+def fake_winreg(adapters: dict[str, str | None]) -> types.ModuleType:
+    """A ``winreg`` that answers for a named set of display adapters.
+
+    Keys are the subkey names the display class key enumerates, in order; values are
+    the ``DriverDesc`` each one holds, or ``None`` for a subkey that has no such value.
+    Enumeration ends the way the real one does, by raising ``OSError`` once it runs
+    out, and the module is injected into ``sys.modules`` so the walk can be read on any
+    platform -- ``import winreg`` inside the function is the only seam it has.
+    """
+    names = list(adapters)
+
+    class Key:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self) -> Key:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    def enum_key(key: Key, index: int) -> str:
+        if index >= len(names):
+            raise OSError(259, "No more data is available")
+        return names[index]
+
+    def query_value_ex(key: Key, value: str) -> tuple[str, int]:
+        description = adapters[key.name]
+        if description is None:
+            raise OSError(2, f"{value} does not exist under {key.name}")
+        return description, 1
+
+    module = types.ModuleType("winreg")
+    module.HKEY_LOCAL_MACHINE = "HKLM"  # type: ignore[attr-defined]
+    module.OpenKey = lambda parent, path: Key(path)  # type: ignore[attr-defined]
+    module.EnumKey = enum_key  # type: ignore[attr-defined]
+    module.QueryValueEx = query_value_ex  # type: ignore[attr-defined]
+    return module
+
+
+@pytest.mark.parametrize(
+    ("tool", "vendor"),
+    [
+        ("nvidia-smi", "nvidia"),
+        ("rocm-smi", "amd"),
+        ("rocminfo", "amd"),
+        ("xpu-smi", "intel"),
+    ],
+)
+def test_a_vendors_own_tool_on_the_path_is_enough(
+    monkeypatch: pytest.MonkeyPatch, tool: str, vendor: str
+) -> None:
+    """A management tool means a driver, which is the thing that decides the answer.
+
+    ``rocm-smi`` and ``rocminfo`` are both checked because a ROCm install can carry
+    either one: ``rocminfo`` ships with the runtime and ``rocm-smi`` with the
+    management stack, and a container that installs one and not the other would
+    otherwise report no AMD GPU on a machine that has one.
+    """
+    fake_machine(monkeypatch, tools=(tool,))
+
+    assert detect_gpu_vendors() == [vendor]
+
+
+@pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+def test_apple_silicon_needs_no_tool_on_the_path(
+    monkeypatch: pytest.MonkeyPatch, machine: str
+) -> None:
+    """There is no ``metal-smi``, and there does not need to be.
+
+    Both spellings of the architecture are accepted because Python reports ``arm64``
+    on macOS and ``aarch64`` under an emulated or containerised Linux userland on the
+    same silicon.
+    """
+    fake_machine(monkeypatch, system="Darwin", machine=machine)
+
+    assert detect_gpu_vendors() == ["apple"]
+
+
+def test_an_intel_mac_is_not_given_an_apple_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The architecture is load-bearing, not decoration.
+
+    Pre-2020 Macs have an integrated GPU too, but Metal on them is not something
+    PyTorch can train through, so claiming one would turn `doctor` into an advert for
+    an install that cannot help. The elif chain also means a missed Darwin match falls
+    through to nothing rather than to the Linux card walk.
+    """
+    fake_machine(monkeypatch, system="Darwin", machine="x86_64")
+
+    assert detect_gpu_vendors() == []
+
+
+def test_the_platform_decides_which_enumeration_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Linux reads sysfs, Windows reads the registry, and neither runs on the other.
+
+    The point of pinning both from one test is that the branches are mutually
+    exclusive: a Linux runner covering the card walk says nothing about the registry
+    walk still compiling, and this is the fork where that goes unnoticed.
+    """
+    drm = fake_drm(tmp_path, {"card0": b"0x1002\n"})
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg({"0000": "Intel(R) Arc(TM) A770"}))
+
+    fake_machine(monkeypatch, system="Linux", drm=drm)
+    assert detect_gpu_vendors() == ["amd"]
+
+    fake_machine(monkeypatch, system="Windows", drm=drm)
+    assert detect_gpu_vendors() == ["intel"]
+
+
+def test_one_unreadable_adapter_key_does_not_hide_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry walk's version of the bug the card walk already carries a test for.
+
+    That class key holds more than adapters: ``Properties`` and ``Configuration``
+    subkeys sit beside the numbered ones, and a numbered one can exist with no
+    ``DriverDesc`` at all -- a device that was uninstalled, or one whose value the
+    process may not read. The unreadable key sorts *between* the two real adapters on
+    purpose: if its ``OSError`` broke the loop instead of skipping the key, Intel would
+    vanish and the machine would look like it had only an NVIDIA card.
+
+    ``Properties`` is given a description naming a third vendor so that the numeric
+    check is doing something here. The real one holds no ``DriverDesc``, so the walk
+    would drop it on the value read anyway -- the guard is what means it never gets
+    that far, whatever else that class key comes to hold.
+    """
+    monkeypatch.setitem(
+        sys.modules,
+        "winreg",
+        fake_winreg(
+            {
+                "Properties": "AMD platform device, not a display adapter",
+                "0000": "NVIDIA GeForce RTX 4090",
+                "0001": None,
+                "0002": "Intel(R) Arc(TM) A770",
+            }
+        ),
+    )
+
+    assert _windows_registry_vendors() == {"nvidia", "intel"}
+
+
+@pytest.mark.parametrize(
+    ("description", "vendor"),
+    [
+        ("NVIDIA GeForce RTX 4090", "nvidia"),
+        ("GeForce GTX 1080", "nvidia"),
+        ("AMD Radeon RX 6900 XT", "amd"),
+        ("Radeon (TM) Graphics", "amd"),
+        ("Intel(R) UHD Graphics 770", "intel"),
+        ("Microsoft Basic Display Adapter", None),
+    ],
+)
+def test_the_driver_description_is_matched_on_either_of_its_names(
+    monkeypatch: pytest.MonkeyPatch, description: str, vendor: str | None
+) -> None:
+    """``DriverDesc`` is marketing copy, so both the maker and the brand are matched.
+
+    An OEM machine can carry "GeForce GTX 1080" with no "NVIDIA" in the string and
+    "Radeon (TM) Graphics" with no "AMD", which is why neither vendor is matched on its
+    company name alone. The last case is the one that has to stay unclaimed: the
+    fallback adapter Windows installs when no display driver is present is not a GPU
+    anyone can train on.
+    """
+    monkeypatch.setitem(sys.modules, "winreg", fake_winreg({"0000": description}))
+
+    assert _windows_registry_vendors() == ({vendor} if vendor else set())
+
+
+def test_a_gpu_with_no_nameable_vendor_still_makes_a_sentence() -> None:
+    """No caller reaches this, and the sentence is here so that it stays true if one does.
+
+    Both callers guard on a non-empty vendor list, so the subject is written from
+    labels that are always there. Were that to lapse, the alternative reads "A  GPU is
+    present" or worse -- and this is a message shown to someone whose expensive card
+    is not being used, which is not the moment to look broken.
+    """
+    assert describe_unusable_gpu([]).startswith("A GPU is present but PyTorch cannot use it")
 
 
 # --------------------------------------------------------------------------- #
@@ -1300,6 +1864,25 @@ def test_usable_ram_is_the_lower_of_the_host_and_the_limit() -> None:
     assert no_usage.usable_available_ram_bytes == 8 * GIB
 
 
+def test_a_container_whose_host_ram_is_unreadable_still_has_the_limit_to_go_on() -> None:
+    """0 is `_probe_ram`'s "could not tell", and `min` would read it as "none left".
+
+    The two numbers being compared do not mean the same kind of thing. A cgroup limit is
+    read from a file and is either there or absent. The host's free RAM comes from psutil
+    or `sysconf`, and when neither answers -- a stripped container image, a platform with
+    no `os.sysconf` -- the probe appends a warning and returns 0, which is a sentinel and
+    not a measurement of an empty machine.
+
+    Taking the minimum of the two would then turn a container with 2 GiB of headroom into
+    one with nothing, on a machine where the limit was read perfectly well. That is not a
+    smaller plan, it is a refused one, and the reason would be a RAM probe failing rather
+    than any shortage of RAM. The sibling above covers the case where both are real.
+    """
+    unreadable = replace(constrained(), available_ram_bytes=0)
+
+    assert unreadable.usable_available_ram_bytes == 2 * GIB
+
+
 def test_an_unconstrained_machine_reports_the_machine() -> None:
     """The negative control. Every existing profile must be untouched by all of this."""
     for label, build in ALL_MACHINES.items():
@@ -1321,6 +1904,27 @@ def test_the_run_record_names_the_cores_the_run_actually_had() -> None:
 
     assert "4 threads" in summarise_for_log(constrained())
     assert "16 threads" in summarise_for_log(cpu_only())
+
+
+def test_the_run_record_names_the_card_a_gpu_run_was_on() -> None:
+    """The other half of ``summarise_for_log``, and the half that matters for a real run.
+
+    Both existing assertions pass a CPU profile, so only the no-GPU branch had ever run.
+    This is the line that goes into ``events.jsonl`` for every run that used a card, and
+    it is the record someone reads months later to answer "what was this trained on" --
+    so the card, its free and total VRAM, its compute capability and the torch version
+    all have to be in it. Free *and* total, because the same card with 2 GiB free and
+    with 22 GiB free plans two different runs.
+    """
+    from trainai.cli.doctor import summarise_for_log
+
+    line = summarise_for_log(rtx_4090())
+
+    assert "RTX 4090" in line
+    assert "22.1 GiB free of 24.0 GiB" in line
+    assert "cc 8.9" in line
+    assert "torch 2.6.0" in line
+    assert "threads" not in line, "the CPU form was used for a machine with a card"
 
 
 def test_doctor_reports_the_container_not_the_host(
@@ -1346,8 +1950,217 @@ def test_doctor_says_nothing_about_containers_on_an_ordinary_machine(
 
 
 # --------------------------------------------------------------------------- #
-# The real machine, whatever it is
+# The machine that will not answer
 # --------------------------------------------------------------------------- #
+def fake_sysconf(monkeypatch: pytest.MonkeyPatch, values: dict[str, int]) -> None:
+    """``os.sysconf`` answering for a named set of variables and no others.
+
+    Supplied rather than sampled, for the same reason the vendor tools are: this
+    branch is the one taken on every platform except Windows, so on the machine this
+    was written on ``os.sysconf`` does not exist at all and on a Linux runner it
+    returns that runner's RAM. Neither makes a test. Unknown names raise ``ValueError``,
+    which is what the real one does.
+    """
+
+    def sysconf(name: str) -> int:
+        if name not in values:
+            raise ValueError(f"unrecognized configuration name {name}")
+        return values[name]
+
+    monkeypatch.setattr(os, "sysconf", sysconf, raising=False)
+    monkeypatch.setattr(os, "sysconf_names", dict.fromkeys(values, 0), raising=False)
+
+
+def test_the_cpu_count_survives_psutil_being_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """psutil is a declared dependency, and its absence still must not be fatal.
+
+    What is lost is the physical core count, which only psutil knows -- so the answer
+    is ``None`` rather than a guess at logical/2, because hyperthreading is not
+    universal and a wrong physical count feeds straight into the dataloader worker
+    plan. What is kept is the logical count, which the stdlib has.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+    name, logical, physical = _probe_cpu()
+
+    assert logical == (os.cpu_count() or 1)
+    assert physical is None
+    assert name is None or isinstance(name, str)
+
+
+def test_ram_is_read_from_sysconf_when_psutil_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`trainai doctor` has to work on a machine where the install went wrong.
+
+    Page counts rather than bytes, which is the part worth pinning: ``SC_PHYS_PAGES``
+    times ``SC_PAGE_SIZE`` is the total, and it is ``SC_AVPHYS_PAGES`` -- not the
+    total -- that gives what is free.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    fake_sysconf(
+        monkeypatch,
+        {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 4 * 1024 * 1024, "SC_AVPHYS_PAGES": 1024 * 1024},
+    )
+    warnings: list[str] = []
+
+    total, available = _probe_ram(warnings)
+
+    assert (total, available) == (16 * GIB, 4 * GIB)
+    assert warnings == []
+
+
+def test_sysconf_without_the_available_pages_name_reports_the_total_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``SC_AVPHYS_PAGES`` is not in POSIX, so it is checked for before it is asked for.
+
+    Reporting the total as available overstates what is free, which is the safe
+    direction to be wrong in only because the planner budgets from a fraction of it and
+    the run is measured before it is offered. Reporting zero would read as a machine
+    with no memory left and refuse to plan anything at all.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    fake_sysconf(monkeypatch, {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 2 * 1024 * 1024})
+    warnings: list[str] = []
+
+    assert _probe_ram(warnings) == (8 * GIB, 8 * GIB)
+    assert warnings == []
+
+
+def test_a_platform_with_no_sysconf_at_all_warns_rather_than_ending_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured escape this handler was widened for.
+
+    ``os.sysconf`` is not on every platform -- it is absent on Windows, and the line
+    above already guards ``sysconf_names`` with ``hasattr`` for exactly that reason.
+    Guarding the second call while calling the first bare cannot be defended, and it
+    was not theoretical: measured on Windows with psutil absent and this branch
+    reached, the run ended with ``AttributeError: module 'os' has no attribute
+    'sysconf'`` -- out of the probe, out of ``probe_hardware``, and out of whichever
+    command asked, which for `doctor` means the one command whose job is to explain a
+    broken environment dying on it.
+
+    ``delattr`` rather than a platform check, so the condition is the same wherever
+    this runs.
+    """
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.delattr(os, "sysconf", raising=False)
+    warnings: list[str] = []
+
+    assert _probe_ram(warnings) == (0, 0)
+    assert warnings == ["System RAM could not be determined; RAM-based checks are disabled."]
+
+
+def test_a_sysconf_that_does_not_know_the_names_warns_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other way this branch fails: the call exists, the variable does not."""
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    fake_sysconf(monkeypatch, {})
+    warnings: list[str] = []
+
+    assert _probe_ram(warnings) == (0, 0)
+    assert "RAM-based checks are disabled" in warnings[0]
+
+
+def test_an_unheard_of_platform_still_names_its_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three platforms get a good name; everything else gets the stdlib's.
+
+    Windows, Linux and Darwin each have a place the readable model name lives, and
+    none of those places exists on a BSD or an AIX. ``platform.processor()`` there is
+    worse -- an architecture string rather than a model -- but it is true, and the
+    alternative is a profile that reports no CPU on a machine that plainly has one.
+    """
+    monkeypatch.setattr(platform, "system", lambda: "FreeBSD")
+    monkeypatch.setattr(platform, "processor", lambda: "amd64")
+
+    assert _probe_cpu_name() == "amd64"
+
+
+def test_a_platform_that_names_nothing_reports_no_cpu_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``processor()`` returns the empty string on more machines than it does not.
+
+    It is documented to, so the machine name is tried next, and if that is empty too
+    the answer is ``None``. Not the empty string: `doctor` prints the name when it has
+    one, and an empty line under "CPU" reads as a probe that broke rather than a
+    platform that does not say.
+    """
+    monkeypatch.setattr(platform, "system", lambda: "FreeBSD")
+    monkeypatch.setattr(platform, "processor", lambda: "  ")
+    monkeypatch.setattr(platform, "machine", lambda: "")
+
+    assert _probe_cpu_name() is None
+
+
+def test_the_platform_line_falls_back_to_release_and_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows and macOS have prettier version strings; nothing else needs one."""
+    monkeypatch.setattr(platform, "system", lambda: "FreeBSD")
+    monkeypatch.setattr(platform, "release", lambda: "14.1-RELEASE")
+    monkeypatch.setattr(platform, "machine", lambda: "amd64")
+
+    assert _platform_summary() == "FreeBSD 14.1-RELEASE (amd64)"
+
+
+def test_the_walk_up_for_a_disk_stops_at_the_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Free space is asked about a directory that does not exist yet, on purpose.
+
+    ``--out runs/2026-09-05/checkpoints`` names three directories the run is about to
+    create, so the probe walks up until it finds something real and measures that
+    filesystem. What stops the walk if *nothing* on the way up exists is the root
+    comparing equal to its own parent -- without that the loop never ends. On Windows
+    an unmounted drive letter reaches this for real; here nothing is said to exist, so
+    the condition is the same on every platform.
+    """
+    monkeypatch.setattr(os.path, "exists", lambda path: False)
+    warnings: list[str] = []
+
+    free = _probe_disk(tmp_path / "runs" / "later", warnings)
+
+    assert free > 0, "the root of a filesystem the suite is running on has a size"
+    assert warnings == []
+
+
+def test_free_space_that_cannot_be_read_is_a_warning_naming_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A directory can exist and still refuse to be measured.
+
+    A path inside a container mount that has gone away, or one the process may stat but
+    not query. Zero rather than a raise, because the planner reads this as "no free
+    space known" and says so, and the path is named because the one thing the user
+    needs is which location could not be measured -- not guessable when `train` was
+    given an output directory and a cache directory.
+
+    The path goes in bare. It was interpolated with ``!r`` until this test, which on
+    Windows -- the platform this is most often read on -- printed
+    ``'C:\\\\Users\\\\me\\\\runs'`` and left the reader deciding whether the doubled
+    separators were in their path or in the printing. Nothing else in the project
+    quotes a path that way.
+    """
+
+    def refuse(path: str) -> object:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(shutil, "disk_usage", refuse)
+    warnings: list[str] = []
+
+    assert _probe_disk(tmp_path, warnings) == 0
+    assert len(warnings) == 1
+    assert str(tmp_path) in warnings[0]
+    assert "\\\\" not in warnings[0]
+    assert "Permission denied" in warnings[0]
+
+
 def test_detection_is_fast_enough_to_run_before_every_command() -> None:
     """`doctor` and `setup` both call this; a slow probe makes the CLI feel broken."""
     import time
@@ -1532,6 +2345,70 @@ def test_doctor_mentions_multi_gpu_is_not_used(capsys: pytest.CaptureFixture[str
 
     assert "2 GPUs detected" in report
     assert "not implemented" in report
+
+
+def test_doctor_says_unknown_rather_than_zero_when_ram_cannot_be_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A machine whose RAM the probe could not read, which is not a machine with no RAM.
+
+    ``0.00 B available`` would be a measurement, and a wrong one -- the row exists to
+    say how much there is, and the honest answer when nothing was read is that nobody
+    knows. Every synthetic machine has a RAM figure, so this branch had never rendered.
+
+    The two neighbouring notes are asserted absent for the same reason: both are
+    thresholds on a number, and a machine that reports no number must not be told it is
+    short of something. ``usable_available_ram_bytes`` on this profile is 0, which is
+    below the 4 GiB threshold -- so the guard that keeps the note quiet is on
+    ``total_ram_bytes``, and this is what says so.
+    """
+    unreadable = replace(cpu_only(), total_ram_bytes=0, available_ram_bytes=0)
+
+    report = render_doctor(unreadable, capsys)
+
+    assert "RAM: unknown" in report
+    assert "0.00 B" not in report, "an unread figure was printed as a measurement of zero"
+    assert "of system RAM is available" not in report, (
+        "a machine with no reading was told it is low"
+    )
+
+
+def test_doctor_names_the_two_resources_it_finds_short(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The free-VRAM note and the free-disk note, neither of which any machine triggers.
+
+    Both are advice rather than observation, which is why they are worth a test: the
+    VRAM note says closing a browser will let TrainAI recommend a larger model, because
+    on this project's own measurements the planner's answer moves with free VRAM and not
+    with total. The disk note names the two things that fill a disk here, since "low
+    disk" on its own does not tell anyone how much a run will need.
+
+    Both thresholds are asserted from both sides in the same test. Every machine in the
+    catalogue is above them -- 92% of VRAM free, 200 GiB of disk -- so a note printed
+    unconditionally would appear on all thirteen, and one printed never would look
+    identical to this test passing.
+    """
+
+    def freeing(profile: HardwareProfile, *, vram_gib: float, disk_gib: float) -> HardwareProfile:
+        card = replace(profile.gpus[0], free_vram_bytes=int(vram_gib * GIB))
+        return replace(profile, gpus=[card], free_disk_bytes=int(disk_gib * GIB))
+
+    roomy = render_doctor(rtx_4090(), capsys)
+
+    assert "of VRAM is free" not in roomy
+    assert "of disk is free" not in roomy
+
+    tight = render_doctor(freeing(rtx_4090(), vram_gib=1.5, disk_gib=2.0), capsys)
+
+    assert "Only 1.50 GiB of VRAM is free" in tight
+    assert "Closing your browser" in tight
+    assert "recommend a larger model" in tight
+    assert "Only 2.00 GiB of disk is free" in tight
+    # The whole sentence, not its tail: "several GiB" alone passed with the two things
+    # that fill a disk here replaced by "Files", which is the part that says how much a
+    # run will need and of what.
+    assert "Tokenised datasets and checkpoints can each run to several GiB" in tight
 
 
 def test_doctor_does_not_comment_on_torch_compile(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1721,3 +2598,804 @@ def test_the_benchmark_and_the_loop_agree_on_what_a_step_took() -> None:
         synchronize(torch.device("mps"))
 
     assert recorder.calls == 2, "the benchmark and the loop take different paths"
+
+
+# ------------------------------------------------------------- Apple's memory reporting
+
+
+class _FakeMPS:
+    """Stands in for ``torch.mps``, whose real numbers this machine cannot produce.
+
+    Every value is a constructor argument so a test states the machine it is describing.
+    Passing ``None`` for a reader removes the attribute, which is how an older torch or a
+    build without MPS actually looks.
+    """
+
+    def __init__(
+        self,
+        *,
+        ceiling: int | None,
+        held: int = 0,
+        ceiling_raises: bool = False,
+        held_reader: str = "driver_allocated_memory",
+    ) -> None:
+        self._ceiling = ceiling
+        self._held = held
+        self._ceiling_raises = ceiling_raises
+        if ceiling is None and not ceiling_raises:
+            # An older torch simply does not have the function. Shadowing the method with
+            # None on the instance is what ``getattr(mps, name, None)`` sees as absent.
+            self.recommended_max_memory = None  # type: ignore[assignment]
+        # Exactly one of the two held-memory readers, because that is what a given torch
+        # looks like rather than a machine with both. The probe tries them in order.
+        absent = (
+            "current_allocated_memory"
+            if held_reader == "driver_allocated_memory"
+            else "driver_allocated_memory"
+        )
+        setattr(self, absent, None)
+
+    def recommended_max_memory(self) -> int:
+        if self._ceiling_raises:
+            raise RuntimeError("Metal query failed")
+        assert self._ceiling is not None
+        return self._ceiling
+
+    def driver_allocated_memory(self) -> int:
+        return self._held
+
+    def current_allocated_memory(self) -> int:
+        return self._held
+
+
+def _mps_torch(fake: _FakeMPS | None) -> Any:
+    """A ``torch`` stand-in exposing only what the Apple branch of the probe reads."""
+
+    class FakeTorch:
+        pass
+
+    stub = FakeTorch()
+    if fake is not None:
+        stub.mps = fake  # type: ignore[attr-defined]
+    return stub
+
+
+def test_apple_memory_is_the_ceiling_minus_what_torch_already_holds() -> None:
+    from trainai.hardware.probe import _probe_mps_device
+
+    warnings: list[str] = []
+    gpus = _probe_mps_device(
+        _mps_torch(_FakeMPS(ceiling=18 * GIB, held=2 * GIB)),
+        warnings,
+        available_ram_bytes=64 * GIB,
+    )
+
+    assert len(gpus) == 1
+    assert gpus[0].backend == "mps"
+    assert gpus[0].total_vram_bytes == 18 * GIB
+    assert gpus[0].free_vram_bytes == 16 * GIB
+    assert warnings == []
+
+
+def test_an_older_torch_that_names_held_memory_differently_is_still_read() -> None:
+    """``driver_allocated_memory`` is the newer name; the older one is still read.
+
+    Both are tried, in order, rather than the newer one alone -- and a torch that has
+    only ``current_allocated_memory`` is not a hypothetical, it is any build from before
+    the driver counter was exposed. Reading neither is not a warning either: ``held``
+    stays 0 and the ceiling is handed out whole, so a process already holding 2 GiB is
+    planned as though it held nothing, and the ceiling is spent twice.
+
+    The sibling above covers the newer name. Between them the order of the two is fixed
+    rather than incidental, which is the part worth keeping: the driver's figure is the
+    larger of the two -- it counts cached blocks the allocator has not handed back -- so
+    preferring it is the conservative reading, and swapping them would quietly raise
+    every Apple budget by whatever torch is caching.
+    """
+    from trainai.hardware.probe import _probe_mps_device
+
+    warnings: list[str] = []
+    gpus = _probe_mps_device(
+        _mps_torch(
+            _FakeMPS(ceiling=18 * GIB, held=2 * GIB, held_reader="current_allocated_memory")
+        ),
+        warnings,
+        available_ram_bytes=64 * GIB,
+    )
+
+    assert gpus[0].free_vram_bytes == 16 * GIB, "the absent reader ended the search"
+    assert warnings == [], "a torch without the newer name is working, not broken"
+
+
+def test_apple_memory_never_promises_more_than_the_os_has_free() -> None:
+    """The unified-memory case, and the reason the minimum is taken.
+
+    Metal's ceiling is a property of the machine and knows nothing about the browser.
+    An 18 GiB ceiling on a box with 3 GiB free is a 3 GiB budget, and a plan that spent
+    the ceiling would be planning against memory another process is holding.
+    """
+    from trainai.hardware.probe import _probe_mps_device
+
+    gpus = _probe_mps_device(
+        _mps_torch(_FakeMPS(ceiling=18 * GIB, held=0)), [], available_ram_bytes=3 * GIB
+    )
+
+    assert gpus[0].free_vram_bytes == 3 * GIB
+    assert gpus[0].total_vram_bytes == 18 * GIB
+
+
+def test_apple_without_a_readable_ceiling_keeps_no_opinion_and_says_so() -> None:
+    """No ceiling means no budget -- and inventing one from total RAM is the wrong fix.
+
+    Returning an empty list restores the old behaviour deliberately: the planner falls
+    back to choosing by measurement, which is what it did on every Apple machine before
+    this. The difference from before is that the user is told, instead of a silent 0
+    that reads as "fits fine".
+    """
+    from trainai.hardware.probe import _probe_mps_device
+
+    for fake in (_FakeMPS(ceiling=None), _FakeMPS(ceiling=None, ceiling_raises=True)):
+        warnings: list[str] = []
+
+        assert _probe_mps_device(_mps_torch(fake), warnings, available_ram_bytes=64 * GIB) == []
+        assert warnings, "an unreadable ceiling was not reported"
+
+
+def test_apple_reports_zero_usable_rather_than_a_negative_number() -> None:
+    """A driver holding more than its own ceiling is possible; a negative budget is not."""
+    from trainai.hardware.probe import _probe_mps_device
+
+    gpus = _probe_mps_device(
+        _mps_torch(_FakeMPS(ceiling=8 * GIB, held=12 * GIB)), [], available_ram_bytes=64 * GIB
+    )
+
+    assert gpus[0].free_vram_bytes == 0
+
+
+def test_a_torch_without_mps_at_all_yields_no_apple_device() -> None:
+    from trainai.hardware.probe import _probe_mps_device
+
+    assert _probe_mps_device(_mps_torch(None), [], available_ram_bytes=64 * GIB) == []
+
+
+def test_apple_peak_memory_is_still_not_claimed_as_measured() -> None:
+    """The budget got real; the peak did not, and conflating them would be the regression.
+
+    ``torch.mps`` has ``recommended_max_memory`` and ``current_allocated_memory`` but no
+    ``max_memory_allocated`` and no ``reset_peak_memory_stats``. So a plan on Apple can
+    now say whether a model fits, and still cannot say what it actually peaked at --
+    those are different claims and the plan keeps them apart.
+    """
+    from trainai.hardware.benchmark import _peak_memory
+
+    peak, reserved, measured = _peak_memory(torch.device("mps"))
+
+    assert (peak, reserved, measured) == (0, 0, False)
+    assert not hasattr(getattr(torch, "mps", object()), "max_memory_allocated")
+
+
+# ------------------------------------------------------------- Intel's memory reporting
+
+
+class _FakeXPUDevice:
+    """One device's properties block, as ``torch.xpu.get_device_properties`` returns it."""
+
+    def __init__(self, name: str, total_memory: int) -> None:
+        self.name = name
+        self.total_memory = total_memory
+
+
+class _FakeXPU:
+    """Stands in for ``torch.xpu``, which this machine does not have.
+
+    Built like :class:`_FakeMPS`: every number is a constructor argument, so a test
+    states the machine it is describing rather than patching a global. ``free=None``
+    makes ``mem_get_info`` raise, which is how a torch build without the newer memory
+    query actually behaves, and ``bf16=None`` removes the query altogether, which is
+    how an older one looks.
+    """
+
+    def __init__(
+        self,
+        *,
+        devices: list[_FakeXPUDevice],
+        free: list[int] | None = None,
+        available: bool = True,
+        bf16: bool | None = False,
+    ) -> None:
+        self._devices = devices
+        self._free = free
+        self._available = available
+        self._bf16 = bool(bf16)
+        if bf16 is None:
+            self.is_bf16_supported = None  # type: ignore[assignment]
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def device_count(self) -> int:
+        return len(self._devices)
+
+    def get_device_properties(self, index: int) -> _FakeXPUDevice:
+        return self._devices[index]
+
+    def mem_get_info(self, index: int) -> tuple[int, int]:
+        if self._free is None:
+            raise RuntimeError("this torch build has no XPU memory query")
+        return self._free[index], self._devices[index].total_memory
+
+    def is_bf16_supported(self) -> bool:
+        return self._bf16
+
+
+def _xpu_torch(fake: _FakeXPU | None) -> Any:
+    """A ``torch`` stand-in exposing only what the Intel branch of the probe reads."""
+
+    class FakeTorch:
+        pass
+
+    stub = FakeTorch()
+    if fake is not None:
+        stub.xpu = fake  # type: ignore[attr-defined]
+    return stub
+
+
+def test_intel_memory_is_read_from_the_runtime_not_the_properties_block() -> None:
+    """Free VRAM comes from ``mem_get_info``, which knows what is already allocated.
+
+    ``total_memory`` on the properties block is the card's size and never changes. A
+    plan built from it on a card already holding another process's model would promise
+    memory that is not there, which is the same overcommit the Apple branch avoids.
+    """
+    from trainai.hardware.probe import _probe_xpu_devices
+
+    warnings: list[str] = []
+    gpus = _probe_xpu_devices(
+        _xpu_torch(
+            _FakeXPU(
+                devices=[
+                    _FakeXPUDevice("Intel(R) Arc(TM) A770 Graphics", 16 * GIB),
+                    _FakeXPUDevice("Intel(R) Arc(TM) A750 Graphics", 8 * GIB),
+                ],
+                free=[12 * GIB, 8 * GIB],
+            )
+        ),
+        warnings,
+    )
+
+    assert [g.index for g in gpus] == [0, 1]
+    assert [g.name for g in gpus] == [
+        "Intel(R) Arc(TM) A770 Graphics",
+        "Intel(R) Arc(TM) A750 Graphics",
+    ]
+    assert [g.total_vram_bytes for g in gpus] == [16 * GIB, 8 * GIB]
+    assert [g.free_vram_bytes for g in gpus] == [12 * GIB, 8 * GIB]
+    assert {g.backend for g in gpus} == {"xpu"}
+    assert warnings == []
+
+
+def test_intel_without_a_free_memory_query_falls_back_to_total_and_says_so() -> None:
+    """The fallback is the card's full size, and that is exactly why it is warned about.
+
+    Planning against total memory on a card that is already busy overcommits. The
+    number is still the best available, so the probe keeps it -- but a user reading a
+    plan that turns out not to fit deserves to have been told which number it came
+    from, rather than discovering it as an out-of-memory error at step 1.
+    """
+    from trainai.hardware.probe import _probe_xpu_devices
+
+    warnings: list[str] = []
+    gpus = _probe_xpu_devices(
+        _xpu_torch(_FakeXPU(devices=[_FakeXPUDevice("Intel(R) Arc(TM) A770", 16 * GIB)])),
+        warnings,
+    )
+
+    assert gpus[0].total_vram_bytes == 16 * GIB
+    assert gpus[0].free_vram_bytes == 16 * GIB, "the fallback is total, not zero"
+    assert len(warnings) == 1
+    assert "overcommit" in warnings[0], warnings
+
+
+def test_a_torch_without_xpu_at_all_yields_no_intel_device() -> None:
+    """The common case: every mainstream PyTorch wheel has no ``torch.xpu``."""
+    from trainai.hardware.probe import _probe_xpu_devices
+
+    warnings: list[str] = []
+
+    assert _probe_xpu_devices(_xpu_torch(None), warnings) == []
+    assert warnings == [], "an absent backend is not a problem worth reporting"
+
+
+def test_an_xpu_build_with_no_intel_card_present_yields_no_intel_device() -> None:
+    """A build *with* XPU support on a machine without the hardware is not an error.
+
+    Distinguished from the test above on purpose: that one is a missing module, this one
+    is a present module answering "no". Both must return empty, and neither is a warning
+    -- a user on an NVIDIA box running an XPU-capable wheel has nothing to fix.
+    """
+    from trainai.hardware.probe import _probe_xpu_devices
+
+    warnings: list[str] = []
+    fake = _FakeXPU(devices=[_FakeXPUDevice("unused", 16 * GIB)], available=False)
+
+    assert _probe_xpu_devices(_xpu_torch(fake), warnings) == []
+    assert warnings == []
+
+
+def test_intel_bf16_support_is_read_from_the_runtime() -> None:
+    """Read, not inferred from the device name.
+
+    The Apple branch hardcodes ``False`` and the NVIDIA branch infers from compute
+    capability; Intel exposes a direct query, so the probe asks instead of guessing.
+    """
+    from trainai.hardware.probe import _probe_xpu_bf16
+
+    devices = [_FakeXPUDevice("Intel(R) Arc(TM) A770", 16 * GIB)]
+
+    assert _probe_xpu_bf16(_xpu_torch(_FakeXPU(devices=devices, bf16=True))) is True
+    assert _probe_xpu_bf16(_xpu_torch(_FakeXPU(devices=devices, bf16=False))) is False
+
+
+def test_an_older_torch_without_the_bf16_query_reports_no_bf16() -> None:
+    """Absent query means no claim, and no claim has to mean ``False``.
+
+    Defaulting to ``True`` would hand the training loop an autocast dtype the runtime
+    may not implement, and the failure would surface as a kernel error mid-run rather
+    than as a plan that chose fp32.
+    """
+    from trainai.hardware.probe import _probe_xpu_bf16
+
+    devices = [_FakeXPUDevice("Intel(R) Arc(TM) A770", 16 * GIB)]
+
+    assert _probe_xpu_bf16(_xpu_torch(_FakeXPU(devices=devices, bf16=None))) is False
+    assert _probe_xpu_bf16(_xpu_torch(None)) is False, "no torch.xpu at all"
+
+
+# ------------------------------------------------------------------- which branch runs
+#
+# The four probes above are each tested on their own, and until now nothing tested the
+# dispatch that chooses between them. That gap is not academic: `_probe_accelerators`
+# returns the `device_type` and `backend` every later decision reads, and a routing
+# mistake would leave all four probes passing. It is also invisible from this machine,
+# which has a CUDA card and therefore takes the first branch every time -- and from CI,
+# which has none and never reaches the numbers.
+#
+# The `HardwareInfo` builder at the top of this file already encodes the answer for
+# ROCm -- `device_type={"rocm": "cuda"}.get(backend, backend)` -- so every planner test
+# is written against an asymmetry that nothing checked the probe actually produces.
+
+
+class _FakeCUDADevice:
+    """One device's properties block, as ``torch.cuda.get_device_properties`` returns it.
+
+    ``major``/``minor`` are the compute capability on NVIDIA and the gfx architecture on
+    ROCm, which is the whole difficulty the dispatch exists to handle: the same two
+    fields, read the same way, meaning different things.
+    """
+
+    def __init__(
+        self, name: str, total_memory: int, major: int, minor: int, sm_count: int = 0
+    ) -> None:
+        self.name = name
+        self.total_memory = total_memory
+        self.major = major
+        self.minor = minor
+        self.multi_processor_count = sm_count
+
+
+class _FakeCUDA:
+    """Stands in for ``torch.cuda``, which a ROCm build also answers to."""
+
+    def __init__(
+        self,
+        *,
+        devices: list[_FakeCUDADevice] | None = None,
+        available: bool = True,
+        bf16: bool = True,
+        free: list[int] | None = None,
+        free_raises: Exception | None = None,
+    ) -> None:
+        self._devices = devices or []
+        self._available = available
+        self._bf16 = bf16
+        self._free = free
+        self._free_raises = free_raises
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def device_count(self) -> int:
+        return len(self._devices)
+
+    def get_device_properties(self, index: int) -> _FakeCUDADevice:
+        return self._devices[index]
+
+    def mem_get_info(self, index: int) -> tuple[int, int]:
+        if self._free_raises is not None:
+            raise self._free_raises
+        total = self._devices[index].total_memory
+        return (total if self._free is None else self._free[index], total)
+
+    def is_bf16_supported(self) -> bool:
+        return self._bf16
+
+
+class _FakeMPSBackend:
+    """``torch.backends.mps``, which answers only the availability question.
+
+    Distinct from :class:`_FakeMPS`, which stands in for ``torch.mps``: the dispatch
+    reads the first to decide, and :func:`_probe_mps_device` reads the second for the
+    numbers. A machine needs both to be routed to Apple and then measured.
+    """
+
+    def __init__(self, *, available: bool) -> None:
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
+
+
+class _Untouchable:
+    """Any attribute access fails, which is how a test proves a branch was not taken.
+
+    It fails through ``pytest.fail`` rather than by raising ``AssertionError`` on purpose.
+    ``_probe_xpu_devices`` treats a torch that answers badly as a machine without an Intel
+    card -- it catches ``Exception`` and returns no devices -- so an ``AssertionError`` from
+    here would be swallowed and the reach into Intel would go unreported. ``pytest.fail``
+    raises an ``OutcomeException``, which derives from ``BaseException`` and passes straight
+    through that guard.
+    """
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __getattr__(self, name: str) -> Any:
+        pytest.fail(f"the {self._label} branch was consulted: .{name}", pytrace=False)
+
+
+def _routing_torch(
+    *,
+    cuda: _FakeCUDA | None = None,
+    hip: str | None = None,
+    xpu: Any = None,
+    mps_backend: _FakeMPSBackend | None = None,
+    mps: _FakeMPS | None = None,
+) -> Any:
+    """A ``torch`` exposing exactly what the dispatch reads, and nothing it does not.
+
+    ``torch.backends`` is always present: leaving it off would send the Apple check into
+    the ``except Exception`` guard and route to CPU for the wrong reason, which would
+    make a passing test out of a broken dispatch.
+    """
+
+    class FakeVersion:
+        pass
+
+    class FakeBackends:
+        pass
+
+    class FakeTorch:
+        pass
+
+    version = FakeVersion()
+    version.hip = hip  # type: ignore[attr-defined]
+    backends = FakeBackends()
+    if mps_backend is not None:
+        backends.mps = mps_backend  # type: ignore[attr-defined]
+    stub = FakeTorch()
+    stub.version = version  # type: ignore[attr-defined]
+    stub.backends = backends  # type: ignore[attr-defined]
+    stub.cuda = cuda or _FakeCUDA(available=False)  # type: ignore[attr-defined]
+    if xpu is not None:
+        stub.xpu = xpu  # type: ignore[attr-defined]
+    if mps is not None:
+        stub.mps = mps  # type: ignore[attr-defined]
+    return stub
+
+
+def _route(torch: Any, **kwargs: Any) -> tuple[Any, list[str]]:
+    """``_probe_accelerators`` with its warnings list, since both are the answer."""
+    from trainai.hardware.probe import _probe_accelerators
+
+    warnings: list[str] = []
+    return _probe_accelerators(torch, warnings, **kwargs), warnings
+
+
+AMPERE = _FakeCUDADevice("NVIDIA GeForce RTX 3090", 24 * GIB, major=8, minor=6, sm_count=82)
+#: gfx908, an MI100. (9, 0) clears the NVIDIA bf16 rule, and the number means nothing here.
+GFX908 = _FakeCUDADevice("AMD Instinct MI100", 32 * GIB, major=9, minor=0, sm_count=120)
+
+
+def test_a_cuda_build_routes_to_cuda_and_reports_tf32_on_an_ampere_card() -> None:
+    """The ordinary case, and the baseline the ROCm tests below differ from by one field."""
+    (device_type, backend, gpus, bf16, tf32), warnings = _route(
+        _routing_torch(cuda=_FakeCUDA(devices=[AMPERE]))
+    )
+
+    assert (device_type, backend) == ("cuda", "cuda")
+    assert [gpu.name for gpu in gpus] == ["NVIDIA GeForce RTX 3090"]
+    assert (bf16, tf32) == (True, True)
+    assert warnings == [], f"an NVIDIA card is the supported case and needs no caveat: {warnings}"
+
+
+def test_a_rocm_build_keeps_the_cuda_device_type_and_changes_only_the_backend() -> None:
+    """``torch.version.hip`` is the only reliable way to tell the builds apart.
+
+    A ROCm build reports CUDA as available and serves AMD cards through the entire
+    ``torch.cuda`` API, so the device type stays ``"cuda"`` -- that is what selects the
+    code path, and the path is shared. ``backend`` is what carries "this is AMD" to
+    everything that has to treat it differently.
+
+    The asymmetry is worth pinning here rather than trusting: the ``HardwareInfo``
+    builder at the top of this file hard-codes it for every planner test, so if the
+    probe ever produced ``("rocm", "rocm")`` the fixtures would keep agreeing with
+    themselves and disagreeing with the machine.
+    """
+    (device_type, backend, gpus, _, _), warnings = _route(
+        _routing_torch(cuda=_FakeCUDA(devices=[GFX908]), hip="6.2.41134")
+    )
+
+    assert (device_type, backend) == ("cuda", "rocm")
+    assert [gpu.backend for gpu in gpus] == ["rocm"]
+    assert any("ROCm detected" in warning for warning in warnings), warnings
+
+
+def test_rocm_reports_no_tf32_however_high_the_architecture_number_reads() -> None:
+    """TF32 is an NVIDIA tensor-core format. There is no AMD equivalent to detect.
+
+    This is the test the dispatch most needs, because the mistake is silent and the
+    numbers invite it: gfx908 fills ``major``/``minor`` with ``(9, 0)``, which clears the
+    ``>= (8, 0)`` NVIDIA rule comfortably. Drop the ``not is_rocm`` guard and an MI100
+    is reported as a TF32 device, and whatever acts on that flag asks for a format the
+    card has never had.
+
+    bf16 is the contrast, and it is why this is a routing question rather than a
+    capability one: the same card *does* report bf16, because that answer comes from the
+    runtime rather than from the architecture number.
+    """
+    (_, backend, _, bf16, tf32), _ = _route(
+        _routing_torch(cuda=_FakeCUDA(devices=[GFX908], bf16=True), hip="6.2.41134")
+    )
+
+    assert backend == "rocm"
+    assert bf16 is True, "the runtime was asked and said yes"
+    assert tf32 is False, "an architecture number that clears an NVIDIA rule is not TF32"
+
+
+def test_an_intel_card_is_routed_to_xpu_only_when_cuda_is_unavailable() -> None:
+    """Intel is reached by falling through, so what comes before it decides.
+
+    ``tf32`` is ``False`` by construction on this path rather than by measurement, and it
+    has to be: there is no query to ask, and inferring it from the Arc generation would
+    be the ROCm mistake again in a different vendor's numbers.
+    """
+    xpu = _FakeXPU(devices=[_FakeXPUDevice("Intel(R) Arc(TM) A770", 16 * GIB)], bf16=True)
+
+    (device_type, backend, gpus, bf16, tf32), warnings = _route(_routing_torch(xpu=xpu))
+
+    assert (device_type, backend) == ("xpu", "xpu")
+    assert [gpu.backend for gpu in gpus] == ["xpu"]
+    assert (bf16, tf32) == (True, False)
+    assert any("Intel XPU detected" in warning for warning in warnings), warnings
+
+
+def test_a_discrete_nvidia_card_wins_over_the_intel_graphics_beside_it() -> None:
+    """The laptop case: an NVIDIA GPU and Intel integrated graphics in one machine.
+
+    Both are real and both are visible to torch, so the order in the dispatch is the
+    whole answer, and returning early is how it is expressed. ``_Untouchable`` makes that
+    a fact rather than a reading of the source: if the Intel branch is ever moved above
+    the CUDA one, this fails with the attribute it reached for instead of quietly
+    planning a training run on integrated graphics.
+    """
+    (device_type, backend, _, _, _), _ = _route(
+        _routing_torch(cuda=_FakeCUDA(devices=[AMPERE]), xpu=_Untouchable("Intel"))
+    )
+
+    assert (device_type, backend) == ("cuda", "cuda")
+
+
+def test_apple_is_routed_to_mps_and_claims_neither_bf16_nor_tf32() -> None:
+    """Both flags are hard ``False`` here, and neither is a measurement.
+
+    The probe's own warning says autocast on MPS is not something this project has
+    verified, so the honest report is no bf16 -- and a plan that trains in fp32 on Apple
+    is the intended consequence, not a gap. Routing that returned ``True`` for either
+    would send a run into a path nobody has checked, on the strength of nothing.
+    """
+    (device_type, backend, gpus, bf16, tf32), warnings = _route(
+        _routing_torch(
+            mps_backend=_FakeMPSBackend(available=True),
+            mps=_FakeMPS(ceiling=18 * GIB, held=2 * GIB),
+        )
+    )
+
+    assert (device_type, backend) == ("mps", "mps")
+    assert [gpu.backend for gpu in gpus] == ["mps"]
+    assert (bf16, tf32) == (False, False)
+    assert any("Apple MPS detected" in warning for warning in warnings), warnings
+
+
+def test_an_xpu_build_with_no_intel_card_falls_through_to_apple() -> None:
+    """Presence of ``torch.xpu`` is not presence of a device, and the dispatch tests the
+    device list rather than the module.
+
+    An Intel-enabled wheel installed on a Mac is not a contrived machine -- it is what a
+    single "install PyTorch with every backend" build looks like -- and routing on the
+    import would send it to a backend with no hardware under it.
+    """
+    (device_type, _, _, _, _), _ = _route(
+        _routing_torch(
+            xpu=_FakeXPU(devices=[]),
+            mps_backend=_FakeMPSBackend(available=True),
+            mps=_FakeMPS(ceiling=18 * GIB),
+        )
+    )
+
+    assert device_type == "mps"
+
+
+def test_a_machine_with_no_accelerator_reports_cpu_and_says_nothing_about_it() -> None:
+    """The CPU fall-through, which every branch above has to decline first.
+
+    The empty warning list is half the test. Each accelerator branch appends a caveat,
+    so a fall-through that had touched one would leave its warning behind for a machine
+    that has no GPU to caveat -- and CPU is a supported configuration here, not a
+    degraded one worth a message.
+    """
+    (device_type, backend, gpus, bf16, tf32), warnings = _route(
+        _routing_torch(xpu=_FakeXPU(devices=[]), mps_backend=_FakeMPSBackend(available=False))
+    )
+
+    assert (device_type, backend) == ("cpu", "cpu")
+    assert gpus == []
+    assert (bf16, tf32) == (False, False)
+    assert warnings == [], f"nothing to warn about on a CPU-only machine: {warnings}"
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        # A torch old enough not to have the call at all, and a driver that has it and
+        # fails it. The probe cannot tell the two apart and does not need to: either way
+        # the free figure is unavailable and total is the only number left.
+        pytest.param(AttributeError, "module 'torch.cuda' has no attribute", id="absent"),
+        pytest.param(RuntimeError, "CUDA error: initialization error", id="fails"),
+    ],
+)
+def test_cuda_without_a_readable_free_figure_falls_back_to_total_and_says_so(
+    failure: type[Exception], message: str
+) -> None:
+    """The fallback overcommits by construction, which is why it is warned about.
+
+    ``mem_get_info`` is what makes the CUDA budget honest -- it reports what the driver
+    will hand over right now, desktop compositor and other processes included -- and
+    ``total_memory`` is the card's size, which is true and unhelpful. Planning against
+    the sticker figure on a card already holding something else promises memory that is
+    not there. The number is still the best one available so the probe keeps it, and the
+    exception text goes in the warning: a user reading a plan that then does not fit
+    should be able to see which number it was built from.
+
+    The exact sibling for Intel is
+    :func:`test_intel_without_a_free_memory_query_falls_back_to_total_and_says_so`, and
+    the pair is deliberate -- the two backends read different APIs to answer the same
+    question, and both degrade the same way.
+    """
+    (_, _, gpus, _, _), warnings = _route(
+        _routing_torch(cuda=_FakeCUDA(devices=[AMPERE], free_raises=failure(message)))
+    )
+
+    assert gpus[0].total_vram_bytes == 24 * GIB
+    assert gpus[0].free_vram_bytes == 24 * GIB, "the fallback is total, not zero"
+    assert len(warnings) == 1, warnings
+    assert "device 0" in warnings[0], "an eight-GPU box needs to know which one"
+    assert message in warnings[0], warnings
+    assert "overcommit" in warnings[0], warnings
+
+
+# ------------------------------------------------------------ assembling a whole profile
+#
+# Everything above tests one probe. `probe_hardware` calls a dozen of them and then makes
+# two decisions of its own with what comes back, and neither is reachable from a machine
+# this suite has ever run on: one needs a ROCm build, the other needs a GPU card sitting
+# next to a PyTorch that cannot use it. Both are stated here rather than sampled, for the
+# same reason the vendor detector is -- see `fake_machine` -- and both are what a user
+# reads first when something is wrong, in `doctor`'s report.
+
+
+def probe_with(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    torch: Any,
+    vendors: list[str],
+) -> HardwareProfile:
+    """``probe_hardware`` against a stated PyTorch and a stated set of installed cards.
+
+    ``sys.modules`` is the seam because ``_try_import_torch`` imports inside the function
+    -- which is what makes an unimportable torch a warning instead of a crash -- so there
+    is no module attribute to reach for. ``detect_gpu_vendors`` is patched rather than
+    called for the reason the whole vendor section exists: it reads this machine, so on
+    the developer's box it answers ``["amd", "nvidia"]`` and in CI ``[]``, and a test
+    whose subject is what the answer is *used for* cannot also depend on it.
+
+    The CPU, RAM and disk probes are left reading the real machine. They have their own
+    tests above, and none of the three feeds either decision under test here.
+    """
+    # Read into `torch_version` and reported, but not part of either decision below.
+    torch.__version__ = "2.5.1"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr("trainai.hardware.probe.detect_gpu_vendors", lambda: vendors)
+    return probe_hardware(disk_path=tmp_path)
+
+
+def test_a_rocm_build_reports_its_runtime_version_instead_of_no_cuda_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``torch.version.cuda`` is genuinely empty on ROCm, and printing that misleads.
+
+    The wheel was not built against CUDA, so the field is None and truthful; what the
+    machine is actually running is in ``torch.version.hip``. `doctor` prints this line,
+    and an AMD user with a working card reading "CUDA: not available" underneath a
+    detected GPU has been told their PyTorch has no GPU support compiled in -- which is
+    wrong, and is the one thing they would then go and try to fix.
+
+    The routing sibling above pins that ``backend`` becomes ``"rocm"`` while
+    ``device_type`` stays ``"cuda"``; this is the reporting half of the same fork, and it
+    is the half that reaches a person.
+    """
+    profile = probe_with(
+        monkeypatch,
+        tmp_path,
+        torch=_routing_torch(cuda=_FakeCUDA(devices=[GFX908]), hip="6.2.41134"),
+        vendors=["amd"],
+    )
+
+    assert (profile.device_type, profile.backend) == ("cuda", "rocm")
+    assert profile.cuda_version == "ROCm 6.2.41134"
+
+
+def test_a_card_the_installed_torch_cannot_use_is_named_along_with_the_fix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The commonest broken install there is, and it looks exactly like having no GPU.
+
+    ``pip install torch`` gives a CPU-only wheel on Linux with no index URL, so the card
+    is present, the driver is fine, and training silently runs on the CPU at a fraction of
+    the speed. The two situations -- no GPU, and a GPU torch cannot see -- produce the
+    same symptom and have completely different remedies, so the profile carries the
+    difference in ``has_unusable_gpu`` and the warning names the vendor and the command.
+
+    The second half is the guard: a machine that really has no GPU must not be handed an
+    install instruction for one. That is the ``vendors and`` in the condition, and without
+    it every CPU-only CI runner in the world gets told to go and fix its PyTorch.
+    """
+    stranded = probe_with(
+        monkeypatch,
+        tmp_path,
+        torch=_routing_torch(
+            xpu=_FakeXPU(devices=[]), mps_backend=_FakeMPSBackend(available=False)
+        ),
+        vendors=["nvidia"],
+    )
+
+    assert (stranded.backend, stranded.gpus) == ("cpu", [])
+    assert stranded.has_unusable_gpu is True
+    advice = [warning for warning in stranded.warnings if "trainai setup" in warning]
+    assert len(advice) == 1, stranded.warnings
+    assert "An NVIDIA GPU is present" in advice[0]
+    assert "CPU-only" in advice[0], "the likely cause is the whole value of the message"
+
+    cpu_only_machine = probe_with(
+        monkeypatch,
+        tmp_path,
+        torch=_routing_torch(
+            xpu=_FakeXPU(devices=[]), mps_backend=_FakeMPSBackend(available=False)
+        ),
+        vendors=[],
+    )
+
+    assert cpu_only_machine.has_unusable_gpu is False
+    assert not [w for w in cpu_only_machine.warnings if "trainai setup" in w], (
+        cpu_only_machine.warnings
+    )

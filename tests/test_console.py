@@ -19,6 +19,7 @@ from trainai.console import (
     fmt_int,
     fmt_params,
     print_command,
+    printable,
     render_error,
     supports_unicode,
 )
@@ -128,6 +129,43 @@ def test_supports_unicode_accepts_utf_encodings(encoding: str) -> None:
 def test_supports_unicode_rejects_legacy_codepages(encoding: str) -> None:
     """cp1252 can encode U+2022, but terminals then mis-decode it. Reject anyway."""
     assert supports_unicode(_FakeStream(encoding)) is False
+
+
+def test_printable_drops_characters_the_stream_cannot_encode() -> None:
+    """The except branch of ``printable``, reached by every legacy Windows console.
+
+    ``printable`` clears the one path ``supports_unicode`` deliberately leaves
+    open. ``supports_unicode`` rejects cp1252 so our own decoration stays ASCII, but
+    the text ``printable`` guards is a model's output: a byte-level tokenizer can emit
+    a byte sequence that never completes a character, which decodes to U+FFFD, and
+    cp1252 cannot encode U+FFFD. Writing it raises ``UnicodeEncodeError`` from inside
+    Rich's writer mid-stream, after tokens have already been printed.
+
+    The existing chat path calls ``printable`` with no ``stream``, so it always probes
+    the real console -- which on this machine and on any Windows console is cp1252 --
+    and an unencodable character takes the except branch. Here that is pinned down by
+    faking the stream instead, so the assertion does not depend on the encoding the
+    test process happens to have. U+FFFD is ASCII-free, so every literal stays printable
+    on any console.
+    """
+    replacement = chr(0xFFFD)
+
+    # A character the target cannot encode is replaced with '?' rather than
+    # raising, and the round trip is pure ASCII.
+    assert printable("a" + replacement + "b", _FakeStream("cp1252")) == "a?b"
+    assert printable("caf" + chr(0x00E9), _FakeStream("ascii")) == "caf?"
+    # A replace that clipped a multi-byte character does not leave a stray
+    # replacement character behind for the console to choke on.
+    assert replacement not in printable("a" + replacement + "b", _FakeStream("cp1252"))
+
+    # A stream with a UTF encoding takes the fast path and gets the text unchanged.
+    assert printable("a" + replacement + "b", _FakeStream("utf-8")) == "a" + replacement + "b"
+
+    # A stream with no encoding at all takes the ``not encoding`` guard.
+    class NoEncoding:
+        pass
+
+    assert printable("a" + replacement + "b", NoEncoding()) == "a" + replacement + "b"
 
 
 def test_render_error_prints_message_and_hint(capsys: pytest.CaptureFixture[str]) -> None:

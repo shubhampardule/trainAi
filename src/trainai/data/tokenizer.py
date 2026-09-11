@@ -34,6 +34,7 @@ __all__ = [
     "MIN_VOCAB_SIZE",
     "ROUNDTRIP_PROBES",
     "ByteLevelBPE",
+    "Encoded",
     "TokenizerReport",
     "train_tokenizer",
 ]
@@ -86,6 +87,26 @@ ROUNDTRIP_PROBES: tuple[tuple[str, str], ...] = (
 
 
 @dataclass(frozen=True)
+class Encoded:
+    """One encoded string: its token ids, and where each token came from.
+
+    ``offsets[i]`` is the half-open **character** range of ``ids[i]`` in the string
+    that was encoded. Returned as a small record rather than the tokenizer library's
+    own ``Encoding`` so that nothing outside this module depends on that type.
+    """
+
+    ids: list[int]
+    offsets: list[tuple[int, int]]
+
+    def __post_init__(self) -> None:
+        if len(self.ids) != len(self.offsets):
+            raise ValueError(
+                f"{len(self.ids)} ids but {len(self.offsets)} offsets; a token without a "
+                "position it came from would silently shift every position after it."
+            )
+
+
+@dataclass(frozen=True)
 class TokenizerReport:
     """Measured compression of a real sample. No estimates in here."""
 
@@ -103,16 +124,13 @@ class TokenizerReport:
     def bytes_per_token(self) -> float:
         return self.sample_utf8_bytes / self.sample_tokens if self.sample_tokens else 0.0
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "vocab_size": self.vocab_size,
-            "sample_documents": self.sample_documents,
-            "sample_chars": self.sample_chars,
-            "sample_utf8_bytes": self.sample_utf8_bytes,
-            "sample_tokens": self.sample_tokens,
-            "chars_per_token": round(self.chars_per_token, 3),
-            "bytes_per_token": round(self.bytes_per_token, 3),
-        }
+    # A ``to_dict`` used to live here, serialising these five fields plus the two
+    # ratios rounded to three places. Nothing called it, and nothing wrote this
+    # report to disk: the ``tokenizer`` block of a manifest comes from
+    # :meth:`ByteLevelBPE.to_dict`, which is a different document -- vocabulary
+    # size, the end-of-text token and the fingerprint, none of them measured from a
+    # sample. This report is read attribute by attribute by the caller that asked for
+    # it, so a JSON shape for it was a format with no reader to agree with.
 
 
 class ByteLevelBPE:
@@ -183,10 +201,13 @@ class ByteLevelBPE:
 
     # -- identity ---------------------------------------------------------- #
 
-    @property
-    def raw(self) -> Tokenizer:
-        """The underlying ``tokenizers.Tokenizer``, for callers that need it."""
-        return self._tokenizer
+    # A ``raw`` property used to expose ``self._tokenizer`` "for callers that need
+    # it". No caller ever did, in this package or in the tests. The class docstring
+    # says it is the operations TrainAI needs from a tokenizer, and the point of
+    # wrapping is that ``Encoded`` exists so nothing outside this module depends on the
+    # library's own ``Encoding`` type -- a public handle on the wrapped object is the
+    # one thing that would undo that, by making the dependency reachable without being
+    # visible in any signature.
 
     @property
     def vocab_size(self) -> int:
@@ -243,6 +264,32 @@ class ByteLevelBPE:
         if add_eot:
             return [[*e.ids, self._eot_id] for e in encoded]
         return [e.ids for e in encoded]
+
+    def encode_batch_with_offsets(self, texts: list[str]) -> list[Encoded]:
+        """Encode many strings, keeping where in each string every token came from.
+
+        The offsets are **character** positions into the string that was passed in,
+        half-open, in token order -- not byte positions. Verified on non-ASCII input:
+        ``"a\\xe9\\u4e2d\\U0001f600b"`` is five characters and eleven UTF-8 bytes, and
+        the last offset ends at 5. That matters because the only caller matches them
+        against :attr:`trainai.data.ingest.Document.trained_spans`, which are character
+        offsets too.
+
+        Two properties of the byte-level pre-tokenizer that a caller comparing offsets
+        to spans has to know:
+
+        * ``trim_offsets`` is on, so a token that begins with a space reports the
+          range of its *text*, not of the space. The ranges are therefore not
+          contiguous, and a position can belong to no token at all.
+        * A single character can span several tokens, each reporting the same range,
+          because a codepoint outside ASCII is several bytes and the vocabulary is
+          built from bytes.
+
+        Both are why a token is selected by *intersecting* a range rather than by
+        containment in either direction.
+        """
+        encoded = self._tokenizer.encode_batch(texts, add_special_tokens=False)
+        return [Encoded(ids=e.ids, offsets=e.offsets) for e in encoded]
 
     def decode(self, ids: Iterable[int]) -> str:
         return self._tokenizer.decode(list(ids), skip_special_tokens=False)

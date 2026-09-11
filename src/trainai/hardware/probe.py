@@ -15,7 +15,6 @@ import importlib.util
 import os
 import platform
 import shutil
-import sys
 from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
@@ -85,9 +84,11 @@ class GPUInfo:
     compute_capability: tuple[int, int] | None = None
     multiprocessor_count: int | None = None
     supports_bf16: bool = False
-    #: Which runtime this device is reached through: ``cuda``, ``rocm`` or ``xpu``.
-    #: ROCm devices are addressed through the ``torch.cuda`` API but are not CUDA
-    #: devices, and several numbers mean different things on them.
+    #: Which runtime this device is reached through: ``cuda``, ``rocm``, ``xpu`` or
+    #: ``mps``. ROCm devices are addressed through the ``torch.cuda`` API but are not
+    #: CUDA devices, and several numbers mean different things on them. On ``mps`` the
+    #: two memory figures are a driver ceiling and a derived headroom rather than a
+    #: card's own VRAM -- see :func:`_probe_mps_device`.
     backend: str = "cuda"
 
     @property
@@ -279,7 +280,7 @@ def probe_hardware(*, disk_path: str | os.PathLike[str] | None = None) -> Hardwa
         cuda_version = getattr(torch.version, "cuda", None)
         hip_version = getattr(torch.version, "hip", None)
         device_type, backend, gpus, supports_bf16, supports_tf32 = _probe_accelerators(
-            torch, warnings
+            torch, warnings, available_ram_bytes=available_ram
         )
         if backend == "rocm" and hip_version:
             # Report the version of the runtime actually in use, not an absent
@@ -342,9 +343,14 @@ def _try_import_torch(warnings: list[str]) -> Any | None:
 
 
 def _probe_accelerators(
-    torch: Any, warnings: list[str]
+    torch: Any, warnings: list[str], *, available_ram_bytes: int = 0
 ) -> tuple[str, str, list[GPUInfo], bool, bool]:
-    """Return ``(device_type, backend, gpus, supports_bf16, supports_tf32)``."""
+    """Return ``(device_type, backend, gpus, supports_bf16, supports_tf32)``.
+
+    ``available_ram_bytes`` is only used by the Apple branch, where the GPU has no
+    memory of its own and the ceiling on what it may allocate is partly a fact about
+    system RAM. Every other backend reads its own device memory and ignores it.
+    """
     try:
         cuda_available = torch.cuda.is_available()
     except Exception as exc:  # pragma: no cover - driver-level failure
@@ -385,8 +391,8 @@ def _probe_accelerators(
         )
         return "xpu", "xpu", xpu_gpus, _probe_xpu_bf16(torch), False
 
-    # Apple Silicon. Detected and reported, but TrainAI has no MPS test coverage.
-    # We surface it rather than silently using CPU.
+    # Apple Silicon. Reported with a memory ceiling but no peak counter: see
+    # _probe_mps_device for which of those numbers are real and which are not.
     try:
         mps_backend = getattr(torch.backends, "mps", None)
         if mps_backend is not None and mps_backend.is_available():
@@ -396,7 +402,8 @@ def _probe_accelerators(
                 "will run in fp32, because autocast on MPS is not something this "
                 "project has been able to verify."
             )
-            return "mps", "mps", [], False, False
+            mps_gpus = _probe_mps_device(torch, warnings, available_ram_bytes=available_ram_bytes)
+            return "mps", "mps", mps_gpus, False, False
     except Exception:  # pragma: no cover
         pass
 
@@ -429,6 +436,85 @@ def _probe_bf16(torch: Any, gpus: list[GPUInfo], backend: str, warnings: list[st
             g.compute_capability is not None and g.compute_capability >= _NVIDIA_BF16_CAPABILITY
             for g in gpus
         )
+
+
+def _probe_mps_device(
+    torch: Any, warnings: list[str], *, available_ram_bytes: int = 0
+) -> list[GPUInfo]:
+    """Apple Silicon as a single device, with a ceiling that is honest about its source.
+
+    The GPU has no memory of its own. What ``torch.mps`` exposes is:
+
+    ``recommended_max_memory()``
+        Metal's ``recommendedMaxWorkingSetSize`` -- a driver-declared ceiling on one
+        process's GPU allocation, typically around 75% of installed RAM. It is a
+        property of the machine, not a reading of what is free right now.
+    ``driver_allocated_memory()``
+        A live reading of what this process has actually taken.
+    ``current_allocated_memory()``
+        The same, counted by the allocator rather than the driver.
+
+    What it does **not** expose is any peak counter: there is no
+    ``max_memory_allocated`` and no ``reset_peak_memory_stats``, which is why
+    :func:`trainai.hardware.benchmark` still reports ``memory_measured=False`` here.
+    Sampling the current allocation and calling it a peak would be a fabricated number
+    in a field whose whole purpose is to say whether a number was measured.
+
+    The free figure is the **lower** of the driver ceiling minus what torch holds, and
+    what the OS says is actually free. Taking the minimum is the point: on unified
+    memory the ceiling ignores every other process on the machine, so a 24 GiB Mac with
+    a browser open would otherwise be planned as though 18 GiB were waiting. Before
+    this, ``gpus`` was empty on Apple, ``primary_gpu`` was ``None``, and
+    ``vram_budget_bytes()`` returned 0 -- so the planner's over-budget check, which is
+    gated on a positive budget, never ran and a rung that could not fit was found out
+    by the OOM rather than by the plan.
+    """
+    mps = getattr(torch, "mps", None)
+    if mps is None:  # pragma: no cover - only on a torch built without MPS
+        return []
+
+    ceiling = 0
+    reader = getattr(mps, "recommended_max_memory", None)
+    if reader is not None:
+        try:
+            ceiling = int(reader())
+        except Exception as exc:  # pragma: no cover - depends on the driver
+            warnings.append(f"Could not read the Apple GPU memory ceiling: {exc}")
+    if ceiling <= 0:
+        # Without a ceiling there is no honest budget to state, and inventing one from
+        # total RAM would be a guess presented as a driver figure. Stay at "no opinion",
+        # which is what the planner did on every Apple machine until now.
+        warnings.append(
+            "This PyTorch does not report an Apple GPU memory ceiling, so the plan "
+            "cannot say whether a model fits before it runs. It is still chosen by "
+            "measurement: a size that does not survive a real step is not offered."
+        )
+        return []
+
+    held = 0
+    for name in ("driver_allocated_memory", "current_allocated_memory"):
+        probe = getattr(mps, name, None)
+        if probe is None:
+            continue
+        try:
+            held = int(probe())
+            break
+        except Exception:  # pragma: no cover - depends on the driver
+            continue
+
+    free = max(0, ceiling - held)
+    if available_ram_bytes > 0:
+        free = min(free, available_ram_bytes)
+
+    return [
+        GPUInfo(
+            index=0,
+            name="Apple Silicon (unified memory)",
+            total_vram_bytes=ceiling,
+            free_vram_bytes=free,
+            backend="mps",
+        )
+    ]
 
 
 def _probe_xpu_devices(torch: Any, warnings: list[str]) -> list[GPUInfo]:
@@ -967,7 +1053,7 @@ def _probe_ram(warnings: list[str]) -> tuple[int, int]:
                 return int(status.ullTotalPhys), int(status.ullAvailPhys)
         except Exception:
             pass
-    else:  # pragma: no cover - platform specific
+    else:
         try:
             page_size = os.sysconf("SC_PAGE_SIZE")
             total = os.sysconf("SC_PHYS_PAGES") * page_size
@@ -975,7 +1061,15 @@ def _probe_ram(warnings: list[str]) -> tuple[int, int]:
             if hasattr(os, "sysconf_names") and "SC_AVPHYS_PAGES" in os.sysconf_names:
                 available = os.sysconf("SC_AVPHYS_PAGES") * page_size
             return int(total), int(available)
-        except (OSError, ValueError):
+        # ``AttributeError`` because ``os.sysconf`` does not exist on every platform,
+        # only on the POSIX-ish ones. The line below already guards ``sysconf_names``
+        # with ``hasattr`` for that reason, and guarding the second call while calling
+        # the first bare is not a position anything can defend: measured, with psutil
+        # absent and this branch taken, the missing name ends the whole run with
+        # ``AttributeError: module 'os' has no attribute 'sysconf'`` -- out of here,
+        # out of ``probe_hardware``, and out of whichever command asked. RAM being
+        # unknowable is a warning, which is what the two lines below are for.
+        except (AttributeError, OSError, ValueError):
             pass
 
     warnings.append("System RAM could not be determined; RAM-based checks are disabled.")
@@ -995,7 +1089,12 @@ def _probe_disk(path: str | os.PathLike[str] | None, warnings: list[str]) -> int
     try:
         return int(shutil.disk_usage(probe_target).free)
     except OSError as exc:
-        warnings.append(f"Free disk space for {target!r} could not be determined ({exc}).")
+        # The path plainly, not ``!r``. On the platform this is most often read on,
+        # repr doubles every separator -- ``'C:\\Users\\me\\runs'`` -- and a user
+        # checking whether TrainAI was given the right directory should not have to
+        # decide whether the extra backslashes are in the path or in the printing.
+        # Every other path this project puts in front of someone is bare.
+        warnings.append(f"Free disk space for {target} could not be determined ({exc}).")
         return 0
 
 
@@ -1020,8 +1119,3 @@ def _platform_summary() -> str:
     if system == "Darwin":  # pragma: no cover - platform specific
         return f"macOS {platform.mac_ver()[0]} ({platform.machine()})"
     return f"{system} {platform.release()} ({platform.machine()})".strip()
-
-
-def python_summary() -> str:
-    """Short interpreter description, useful in bug reports."""
-    return f"{platform.python_implementation()} {platform.python_version()} ({sys.platform})"

@@ -352,3 +352,64 @@ def test_the_driver_row_appears_only_when_a_driver_was_read(
     report = flat(capsys.readouterr().out)
     assert "NVIDIA driver" not in report
     assert "none detected" in report, "an empty vendor list still has to be stated"
+
+
+# --------------------------------------------------------------------------- #
+# The command's wiring
+# --------------------------------------------------------------------------- #
+def test_every_setup_flag_reaches_the_argument_it_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test above calls ``run_setup`` directly; this is the one that types the command.
+
+    Four flags, four keyword arguments, and a body that is nothing but the mapping between
+    them -- which is exactly the kind of code a wrong-way-round default survives in
+    unnoticed, because ``run_setup`` is tested to the hilt and the command is one
+    function call. Recorded rather than run, so the machine is not read and nothing is
+    installed.
+
+    One flag per invocation, not all of them at once. The first version of this test
+    typed ``--install --allow-global --yes`` together and passed with ``allow_global``
+    and ``assume_yes`` swapped: three trues are three trues in any order. Typed alone,
+    each flag has to light up its own argument and no other.
+    """
+    from trainai.cli.main import main
+
+    received: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> None:
+        received.append(kwargs)
+
+    monkeypatch.setattr("trainai.cli.setup.run_setup", record)
+    nothing = {"install": False, "allow_global": False, "assume_yes": False, "json_output": False}
+
+    for flag, argument in [
+        (None, None),
+        ("--install", "install"),
+        ("--allow-global", "allow_global"),
+        ("--yes", "assume_yes"),
+        ("-y", "assume_yes"),
+        ("--json", "json_output"),
+    ]:
+        monkeypatch.setattr(sys, "argv", ["trainai", "setup", *([flag] if flag else [])])
+        assert main() == ExitCode.OK
+        assert received[-1] == {**nothing, **({argument: True} if argument else {})}, flag
+    assert len(received) == 6
+
+
+def test_setup_json_through_the_command_is_the_advice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], diagnosis: Ran
+) -> None:
+    """The real ``run_setup`` behind the real command, with the diagnosis fixed.
+
+    The test above proves the flags arrive; this proves the command as typed produces
+    the document a script would parse, and nothing else on stdout to spoil the parse.
+    """
+    from trainai.cli.main import main
+
+    monkeypatch.setattr(sys, "argv", ["trainai", "setup", "--json"])
+
+    assert main() == ExitCode.OK
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == CUDA_COMMAND
+    assert payload["in_virtualenv"] is True
+    assert diagnosis.calls == []

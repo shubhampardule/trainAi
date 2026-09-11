@@ -39,7 +39,7 @@ from stat import S_ISREG
 
 import numpy as np
 
-from trainai.data.binarize import SPLITS, DatasetManifest, ShardInfo, Split
+from trainai.data.binarize import MASK_DTYPE, SPLITS, DatasetManifest, ShardInfo, Split
 from trainai.errors import DatasetError, DatasetFormatError
 
 __all__ = [
@@ -105,16 +105,31 @@ class Batch:
     ``int64`` because that is what an embedding lookup wants; the shards are
     ``uint16`` on disk and widened here, which costs one small copy per step and
     saves half the disk and page cache.
+
+    ``loss_mask`` is ``uint8`` of the same shape, or ``None`` on a dataset prepared
+    without one. It is aligned with ``targets``, not ``inputs``: a mask byte
+    describes the token it was written for, and the loss at position *i* scores
+    ``targets[i]``. Getting that off by one would train on the last context token of
+    every prompt and skip the first token of every reply -- a shift small enough to
+    converge and be wrong.
     """
 
     inputs: np.ndarray
     targets: np.ndarray
     step: int
     epoch: int
+    loss_mask: np.ndarray | None = None
 
     @property
-    def tokens(self) -> int:
-        return int(self.inputs.size)
+    def trained_tokens(self) -> int:
+        """Tokens the loss will actually be computed over.
+
+        Every token when there is no mask, which is what makes an unmasked run and a
+        masked one comparable in the same reporting code.
+        """
+        if self.loss_mask is None:
+            return int(self.targets.size)
+        return int(self.loss_mask.sum())
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -149,10 +164,6 @@ class ShardedTokenStream:
     def total_tokens(self) -> int:
         return int(self._starts[-1])
 
-    @property
-    def shard_count(self) -> int:
-        return len(self._paths)
-
     def read(self, start: int, count: int) -> np.ndarray:
         """Return ``count`` tokens beginning at global offset ``start``."""
         if start < 0 or count < 0 or start + count > self.total_tokens:
@@ -186,12 +197,6 @@ class ShardedTokenStream:
         permission error rather than anything informative.
         """
         self._maps = [None] * len(self._paths)
-
-    def __enter__(self) -> ShardedTokenStream:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
     def _shard(self, index: int) -> np.memmap:
         existing = self._maps[index]
@@ -287,6 +292,7 @@ class TokenBatcher:
         batch_size: int,
         seed: int = 0,
         split: str = "train",
+        mask_stream: ShardedTokenStream | None = None,
     ) -> None:
         if seq_len < MIN_SEQ_LEN:
             raise DatasetError(
@@ -303,11 +309,33 @@ class TokenBatcher:
             )
 
         self._stream = stream
+        self._mask_stream = mask_stream
         self._seq_len = seq_len
         self._window = seq_len + 1
         self._batch_size = batch_size
         self._seed = seed
         self._split = split
+
+        if mask_stream is not None and mask_stream.total_tokens != stream.total_tokens:
+            # Checked here rather than trusted from the manifest, because the two
+            # streams are addressed with the *same* offset arithmetic: a mask stream
+            # one token shorter does not fail, it reads a mask byte belonging to the
+            # next token for every window past the discrepancy. A dataset that trains
+            # and converges on the wrong tokens is the failure this whole feature is
+            # built to avoid, so the disagreement is refused before the first read.
+            raise DatasetFormatError(
+                f"The {split} split has {stream.total_tokens:,} tokens but its loss mask "
+                f"covers {mask_stream.total_tokens:,}.",
+                hint=(
+                    "Run `trainai data inspect <dataset> --verify` to check the dataset, "
+                    "then re-run `trainai data prepare`."
+                ),
+                details={
+                    "split": split,
+                    "tokens": stream.total_tokens,
+                    "mask_tokens": mask_stream.total_tokens,
+                },
+            )
 
         # Reserve seq_len tokens so the per-epoch alignment offset can never push
         # the last window past the end of the stream.
@@ -369,14 +397,6 @@ class TokenBatcher:
     # -- shape ------------------------------------------------------------- #
 
     @property
-    def seq_len(self) -> int:
-        return self._seq_len
-
-    @property
-    def batch_size(self) -> int:
-        return self._batch_size
-
-    @property
     def total_tokens(self) -> int:
         return self._stream.total_tokens
 
@@ -401,11 +421,20 @@ class TokenBatcher:
         return self._usable_windows
 
     @property
-    def tokens_per_step(self) -> int:
-        return self._batch_size * self._seq_len
+    def has_loss_mask(self) -> bool:
+        """Whether the batches this batcher yields carry a mask."""
+        return self._mask_stream is not None
 
-    def epoch_of(self, step: int) -> int:
-        return (step * self._batch_size) // self._usable_windows
+    def close(self) -> None:
+        """Release both streams' memory maps.
+
+        The way to finish with what :func:`open_split` returned: closing only the
+        token stream would leave the mask maps open, which on Windows keeps a lock on
+        files that `trainai data prepare` may be about to rewrite in place.
+        """
+        self._stream.close()
+        if self._mask_stream is not None:
+            self._mask_stream.close()
 
     # -- sampling ---------------------------------------------------------- #
 
@@ -424,14 +453,18 @@ class TokenBatcher:
         indices = order[within : within + self._batch_size]
 
         rows = np.empty((self._batch_size, self._window), dtype=np.int64)
+        masks = self._empty_mask(self._batch_size)
         for row, index in enumerate(indices):
             start = offset + int(index) * self._window
             rows[row] = self._stream.read(start, self._window)
+            if masks is not None:
+                masks[row] = self._mask_read(start)
         return Batch(
             inputs=rows[:, :-1],
             targets=rows[:, 1:],
             step=step,
             epoch=epoch,
+            loss_mask=None if masks is None else masks[:, 1:],
         )
 
     def sequential_batches(self, *, max_batches: int | None = None) -> Iterator[Batch]:
@@ -448,14 +481,35 @@ class TokenBatcher:
             first = step * self._batch_size
             rows_wanted = min(self._batch_size, self._windows - first)
             rows = np.empty((rows_wanted, self._window), dtype=np.int64)
+            masks = self._empty_mask(rows_wanted)
             for row in range(rows_wanted):
-                rows[row] = self._stream.read((first + row) * self._window, self._window)
+                start = (first + row) * self._window
+                rows[row] = self._stream.read(start, self._window)
+                if masks is not None:
+                    masks[row] = self._mask_read(start)
             yield Batch(
                 inputs=rows[:, :-1],
                 targets=rows[:, 1:],
                 step=step,
                 epoch=0,
+                loss_mask=None if masks is None else masks[:, 1:],
             )
+
+    def _empty_mask(self, rows: int) -> np.ndarray | None:
+        """Uninitialised mask rows, or ``None`` when this split has no mask."""
+        if self._mask_stream is None:
+            return None
+        return np.empty((rows, self._window), dtype=MASK_DTYPE)
+
+    def _mask_read(self, start: int) -> np.ndarray:
+        """The mask window matching the token window at ``start``.
+
+        The same ``(start, window)`` arithmetic as the token read, deliberately: the
+        alignment between a token and its mask byte is the offset, and computing it
+        twice in two places is how it drifts.
+        """
+        assert self._mask_stream is not None
+        return self._mask_stream.read(start, self._window)
 
     def _epoch_order(self, epoch: int) -> tuple[np.ndarray, int]:
         """Permutation of window indices for ``epoch``, plus the alignment offset.
@@ -489,10 +543,18 @@ def open_split(
     seq_len: int,
     batch_size: int,
     seed: int = 0,
+    loss_mask: bool = True,
 ) -> tuple[TokenBatcher, ShardedTokenStream]:
     """Open one split of a prepared dataset for batching.
 
-    Returns the batcher and the underlying stream; close the stream when done.
+    Returns the batcher and the underlying token stream. Call ``batcher.close()``
+    when done -- it releases the mask stream as well, which the returned stream
+    knows nothing about.
+
+    ``loss_mask`` is honoured only if the dataset has one; a dataset prepared without
+    a mask yields batches whose ``loss_mask`` is ``None``, and every token is scored.
+    Passing ``False`` on a masked dataset trains on every token deliberately, which is
+    what `trainai train --no-loss-mask` is for.
     """
     manifest = (
         dataset if isinstance(dataset, DatasetManifest) else DatasetManifest.load(Path(dataset))
@@ -534,12 +596,27 @@ def open_split(
         tokens=[shard.tokens for shard in shards],
         dtype=manifest.numpy_dtype,
     )
+    # `all`, never `any`: DatasetManifest.load already refuses a partly masked
+    # dataset, and reading the mask of only the shards that have one would score
+    # every token of the shards that do not -- the exact failure the mask exists to
+    # stop. The paths come from the same shard entries as the tokens, so they are in
+    # shard order by construction rather than by a second sort.
+    mask_stream = (
+        ShardedTokenStream(
+            paths=manifest.mask_paths(split),
+            tokens=[shard.tokens for shard in shards],
+            dtype=MASK_DTYPE,
+        )
+        if loss_mask and manifest.has_loss_mask
+        else None
+    )
     batcher = TokenBatcher(
         stream,
         seq_len=seq_len,
         batch_size=batch_size,
         seed=seed,
         split=split,
+        mask_stream=mask_stream,
     )
     return batcher, stream
 

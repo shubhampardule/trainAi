@@ -23,7 +23,7 @@ from typer.testing import CliRunner
 from conftest import flat, unwrapped
 from trainai.cli.main import app, main
 from trainai.errors import ExitCode
-from trainai.hardware.planner import PLAN_VERSION
+from trainai.hardware.planner import PLAN_FILENAME, PLAN_VERSION
 from trainai.model.config import preset
 from trainai.train.config import TrainConfig
 
@@ -259,9 +259,14 @@ def test_the_step_count_is_derived_from_the_corpus(
     )
     payload = json.loads(capsys.readouterr().out)
 
+    from trainai.cli.train import DERIVED_EPOCHS, MAX_DERIVED_STEPS, MIN_DERIVED_STEPS
+
     train_tokens = DatasetManifest.load(dataset_dir).tokens("train")
     tokens_per_step = payload["train"]["tokens_per_step"]
-    expected = max(50, min(20_000, int(3.0 * train_tokens / tokens_per_step)))
+    expected = max(
+        MIN_DERIVED_STEPS,
+        min(MAX_DERIVED_STEPS, int(DERIVED_EPOCHS * train_tokens / tokens_per_step)),
+    )
     assert payload["train"]["steps"] == expected
 
 
@@ -297,6 +302,118 @@ def test_a_run_that_overshoots_three_epochs_says_so(
         assert payload["budget"]["will_memorise"] is False
 
 
+def test_the_steps_help_text_names_the_cap_the_code_actually_applies() -> None:
+    """`--steps` help promised three passes and the cap quietly delivered a fraction.
+
+    The help text said "about three passes over the training split" full stop. On this
+    project's own largest prepared corpus -- 633,422,803 train tokens -- the derived count
+    hits the 20,000-step cap, which at the default 2,048 tokens per step is 0.065 of one
+    pass -- so the documented default was wrong by a factor of forty-six, in the direction
+    of doing less work than promised. The number in the help text is checked against the
+    constant here so the two cannot drift apart again.
+
+    Whitespace is collapsed before matching because rich wraps the help to the terminal
+    width, and this repo has been bitten before by an assertion that passed only at the
+    width the developer happened to have.
+    """
+    from trainai.cli.train import MAX_DERIVED_STEPS
+
+    result = runner.invoke(app, ["train", "--help"])
+
+    assert result.exit_code == 0
+    rendered = " ".join(result.stdout.split())
+    assert f"capped at {MAX_DERIVED_STEPS:,}" in rendered
+
+
+def test_a_run_that_reads_only_part_of_the_corpus_says_so() -> None:
+    """The mirror of the memorising warning, for the direction the cap causes.
+
+    A run capped at 20,000 steps over a large corpus never reads most of it. That is
+    legitimate -- real pretraining is under one epoch -- so this is a note stating the
+    measurement, not a refusal. What it must not do is stay silent, because the user
+    who typed no `--steps` at all has no other way to find out that a cap, and not
+    their corpus, decided how much of their data was used.
+    """
+    from trainai.train.budget import DataBudget
+
+    budget = DataBudget(
+        train_tokens=774_641_791,
+        val_tokens=1_000_000,
+        parameters=13_800_000,
+        non_embedding_parameters=10_000_000,
+        tokens_per_step=2_048,
+        steps=20_000,
+    )
+
+    assert budget.leaves_corpus_unread is True
+    assert budget.epochs < 0.1
+    assert budget.tokens_never_read == 774_641_791 - 20_000 * 2_048
+
+    note = next(n for n in budget.warnings() if "never read" in n)
+    assert f"{budget.tokens_never_read:,}" in note
+    # The actionable number: what --steps would reach one full pass.
+    assert f"{int(budget.steps_per_epoch):,}" in note
+
+
+def test_a_run_that_makes_a_full_pass_reports_nothing_unread() -> None:
+    """The negative control: exactly one pass leaves no tokens unread and no note.
+
+    Without this, an inverted comparison in `leaves_corpus_unread` would fire on every
+    ordinary run and the new note would become noise nobody reads.
+    """
+    from trainai.train.budget import DataBudget
+
+    budget = DataBudget(
+        train_tokens=2_048_000,
+        val_tokens=10_000,
+        parameters=13_800_000,
+        non_embedding_parameters=10_000_000,
+        tokens_per_step=2_048,
+        steps=1_000,
+    )
+
+    assert budget.epochs == 1.0
+    assert budget.leaves_corpus_unread is False
+    assert budget.tokens_never_read == 0
+    assert not any("never read" in note for note in budget.warnings())
+
+
+def test_a_budget_note_is_printed_once_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Two layers both had a claim on the budget advice, and both were printing it.
+
+    ``Trainer.run`` logs ``budget.warnings()`` when it starts, because it is the layer
+    a caller cannot skip and a corpus quietly being memorised is what
+    :mod:`trainai.train.budget` exists to announce. The CLI panel printed the same
+    strings as bullets a few lines above, so every real run said each note twice. The
+    trainer's copy is the one that stays; this pins that only one of them prints.
+
+    A dry run keeps its bullets, asserted here too, because it never builds a trainer
+    and would otherwise print no advice at all -- which is the opposite failure in the
+    one command whose entire purpose is answering whether the run is sensible.
+    """
+    common = ("--data", str(dataset_dir), *TINY, *FAST, "--steps", "60")
+
+    # This note is guaranteed rather than incidental: the fixture's corpus is a few
+    # thousand tokens and the model has ~30K parameters, so the ratio is far under the
+    # data-limited threshold whatever the tokenizer does.
+    marker = "training tokens per parameter"
+
+    assert cli(monkeypatch, "train", *common, "--out", str(tmp_path / "real")) == ExitCode.OK
+    real = flat(capsys.readouterr().out)
+    assert real.count(marker) == 1, real
+
+    assert cli(monkeypatch, "train", *common, "--out", str(tmp_path / "plan"), "--dry-run") == 0
+    planned = flat(capsys.readouterr().out)
+
+    assert planned.count(marker) == 1
+    assert "What to expect" in planned
+
+
 def test_the_dry_run_parameter_count_matches_a_real_model(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -323,6 +440,70 @@ def test_the_dry_run_parameter_count_matches_a_real_model(
 
     config = ModelConfig.from_dict(payload["model"])
     assert payload["budget"]["parameters"] == sum(p.numel() for p in GPT(config).parameters())
+
+
+def test_the_plan_spells_out_grouped_query_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """``--kv-heads`` changes what the model *is*, and the plan is where that is read.
+
+    The shape line already carries it, as the ``/1kv`` suffix ``ModelConfig.describe``
+    appends -- which is four characters, in a row that is mostly other numbers, for the
+    one flag here that makes attention a different operation. The row says it in words
+    instead, with the ratio spelled out, because "2 query heads share 1" is the sentence
+    that explains the parameter count printed two rows above it.
+
+    Conditional, and asserted both ways: without ``--kv-heads`` every head is its own,
+    and a row claiming grouped-query attention on a model that has none would describe
+    a saving the weights do not show.
+    """
+    flags = ("train", "--data", str(dataset_dir), "--out", str(tmp_path / "run"), "--dry-run")
+
+    assert cli(monkeypatch, *flags, *TINY, "--kv-heads", "1") == ExitCode.OK
+    shown = flat(capsys.readouterr().out)
+
+    assert "grouped-query" in shown
+    assert "2 query heads share 1 key/value heads (2 to 1)" in shown
+
+    assert cli(monkeypatch, *flags, *TINY) == ExitCode.OK
+
+    assert "grouped-query" not in flat(capsys.readouterr().out), (
+        "a model whose heads each keep their own key/value pair was called grouped-query"
+    )
+
+
+def test_the_plan_reports_the_effective_batch_when_gradients_accumulate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """``--batch-size`` alone is the wrong number to read a learning rate against.
+
+    Accumulation is the one place this project's two batch sizes differ, and the module
+    docstring of :mod:`trainai.train.config` calls conflating them "the most common way
+    a training script gets a wrong learning rate". So the row prints the arithmetic
+    rather than either number on its own.
+
+    The negative half is what keeps it honest: ``grad_accum`` is 1 by default, and
+    "2 x 1 accumulated = 2" is a multiplication printed for its own sake, on every run
+    that never accumulates anything.
+    """
+    flags = ("train", "--data", str(dataset_dir), "--out", str(tmp_path / "run"), "--dry-run")
+
+    assert cli(monkeypatch, *flags, *TINY, "--batch-size", "2", "--grad-accum", "2") == ExitCode.OK
+    shown = flat(capsys.readouterr().out)
+
+    assert "2 x 2 accumulated = 4" in shown
+
+    assert cli(monkeypatch, *flags, *TINY, "--batch-size", "2") == ExitCode.OK
+
+    assert "accumulated" not in flat(capsys.readouterr().out), (
+        "a run that takes one forward pass per step reported accumulating them"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -550,6 +731,179 @@ def test_the_panel_prints_both_the_reason_and_the_fix(
 
 
 # --------------------------------------------------------------------------- #
+# The result panel's conditional rows
+# --------------------------------------------------------------------------- #
+class PanelTrainer:
+    """The two things ``_print_result`` asks a trainer for, and nothing else.
+
+    A real :class:`~trainai.train.loop.Trainer` needs a dataset, a built model and a
+    run directory, and none of that changes a row of this panel: every number in it
+    comes off the ``TrainResult``. The ``TrainConfig`` is a real one rather than a
+    stand-in because ``tokens_per_step`` is the denominator of the loss-mask share
+    below, and an integer written by hand there would let this test and the config
+    disagree about how many tokens a step reads.
+    """
+
+    def __init__(self, **overrides: Any) -> None:
+        self.train_config = TrainConfig(
+            steps=10,
+            batch_size=2,
+            seq_len=32,
+            warmup_steps=1,
+            eval_every=0,
+            device="cpu",
+            **overrides,
+        )
+
+    def memory_note(self) -> str:
+        return "not measured on cpu"
+
+
+def a_finished_run(run_dir: Path, **overrides: Any) -> Any:
+    """A run that completed, with every unconditional row's number filled in.
+
+    The fields the conditional rows key off keep the defaults that switch those rows
+    *off*, so each test below sets only the ones its own row depends on -- which makes
+    the call itself the statement of what that row is conditional on.
+
+    ``steps_completed`` and ``tokens_seen`` agree with :class:`PanelTrainer`'s
+    ``tokens_per_step``: ten steps of 64 tokens. The panel derives one of its numbers
+    from that product, so a fixture whose three fields disagreed would read as a bug in
+    the arithmetic under test rather than as a bug in the fixture.
+    """
+    from trainai.train.loop import TrainResult
+
+    measured: dict[str, Any] = {
+        "steps_completed": 10,
+        "final_train_loss": 2.5,
+        "best_val_loss": None,
+        "best_val_step": None,
+        "final_val_loss": None,
+        "tokens_seen": 640,
+        "elapsed_seconds": 4.0,
+        "tokens_per_second": 160.0,
+        "peak_vram_bytes": 0,
+        "checkpoint_path": None,
+        "run_dir": run_dir,
+        "precision": "fp32",
+        "device": "cpu",
+    }
+    return TrainResult(**{**measured, **overrides})
+
+
+def test_the_panel_says_when_the_last_checkpoint_is_not_the_best_one(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The most consequential row in the report, and the one no other number implies.
+
+    A final validation loss above the best one is the difference between keeping the
+    model that generalised and keeping the one that memorised, and the loss printed
+    first -- the training loss -- moves the wrong way to reveal it: it goes on falling
+    while the held-out loss climbs. So the row says which checkpoint to use.
+
+    Both halves of the condition, because the row is printed only when the best step is
+    not the last. Without the negative half, deleting the guard would still pass here:
+    every run would grow a row reading "worse than step 10" on a run whose step 10 *was*
+    its best, which is advice to throw away the right checkpoint.
+    """
+    from trainai.cli.train import _print_result
+
+    _print_result(
+        a_finished_run(tmp_path, best_val_loss=3.0, best_val_step=6, final_val_loss=3.8),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+    shown = flat(capsys.readouterr().out)
+
+    assert "at step 6" in shown, "the best step was not reported"
+    assert "3.8000" in shown, "the final validation loss was not reported"
+    assert "worse than step 6" in shown
+    assert "use the best checkpoint, not the last" in shown
+
+    _print_result(
+        a_finished_run(tmp_path, best_val_loss=3.0, best_val_step=10, final_val_loss=3.0),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+
+    assert "worse than step" not in flat(capsys.readouterr().out), (
+        "a run whose last step was its best was told to use an earlier checkpoint"
+    )
+
+
+def test_the_panel_reports_what_share_of_positions_the_mask_scored(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The share, not just the fact that a mask was used.
+
+    A masked loss is not the same number as an unmasked one, and comparing the two as
+    though they measured the same thing is the mistake this row exists to prevent. The
+    denominator is what says how different: 41% of the predicted positions means the
+    loss above is over the replies and nothing else.
+
+    The share is computed here rather than read off the result, which is why it is
+    asserted as a percentage as well as by its two operands -- the fact that a mask was
+    on is already in ``metrics.jsonl``, but nothing else in the run divides.
+    """
+    from trainai.cli.train import _print_result
+
+    _print_result(
+        a_finished_run(tmp_path, loss_mask=True, scored_tokens=262),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+    shown = flat(capsys.readouterr().out)
+
+    # 262 of ten steps x 64 tokens: the denominator is the trainer's, not the result's.
+    assert "scored 262 of 640 predicted positions (41%)" in shown
+    assert "the losses above are over the dataset's targets, not every token" in shown
+
+    # A run that stopped before its first step still has to print this row. `scored /
+    # seen` with `seen` 0 is a ZeroDivisionError, and it would arrive as a traceback in
+    # place of the whole result panel, after the run had finished and saved its work.
+    _print_result(
+        a_finished_run(tmp_path, steps_completed=0, loss_mask=True, scored_tokens=0),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+
+    assert "scored 0 of 0 predicted positions (0%)" in flat(capsys.readouterr().out)
+
+
+def test_the_panel_names_the_steps_that_scored_no_token_at_all(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A step whose windows held no target is skipped, and skipping is not loss 0.
+
+    The distinction is the point: averaging a 0 into the curve for a step that measured
+    nothing pulls the reported loss down for a reason that has nothing to do with the
+    model, so those steps are recorded as ``unscored`` and left out. This row is where a
+    reader finds out how many were, because the loss curve cannot show a gap.
+
+    The negative half matters as much as the positive one. Every unmasked run has zero
+    of these, so a row printed unconditionally would tell the great majority of runs
+    that "0 step(s) scored no tokens" -- a warning about nothing, in yellow, on the
+    panel that is supposed to say the run went fine.
+    """
+    from trainai.cli.train import _print_result
+
+    _print_result(
+        a_finished_run(tmp_path, loss_mask=True, scored_tokens=262, unscored_steps=3),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+    shown = flat(capsys.readouterr().out)
+
+    assert "3 step(s) scored no tokens" in shown
+    assert "their windows held no target" in shown
+    assert "recorded as `unscored` in metrics.jsonl and skipped, not counted as loss 0" in shown
+
+    _print_result(
+        a_finished_run(tmp_path, loss_mask=True, scored_tokens=640, unscored_steps=0),
+        PanelTrainer(),  # type: ignore[arg-type]
+    )
+
+    assert "scored no tokens" not in flat(capsys.readouterr().out), (
+        "a run in which every step scored was warned about steps that did not"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Guard rails
 # --------------------------------------------------------------------------- #
 def test_training_into_an_existing_run_is_refused_with_the_resume_command(
@@ -644,6 +998,63 @@ def test_resume_from_a_path_with_no_checkpoint_is_a_usage_error(
 
     assert code == ExitCode.USAGE
     assert "step-*.pt" in capsys.readouterr().err
+
+
+def test_resume_accepts_a_single_checkpoint_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """The third of the three things ``--resume`` says it takes, and the loose one.
+
+    A run directory and its checkpoints directory are both searched, and the test above
+    covers the first; this is the branch that takes the path as given. It matters
+    because a checkpoint copied out of a run -- to keep it while the run directory is
+    overwritten, which is exactly what ``--force`` invites -- no longer has a
+    checkpoints directory around it for the search to find, and the search is all there
+    would be without this.
+
+    The copy is named ``spare.pt``, not ``step-N.pt``: the step is read out of the
+    file's own payload, and a resume that recovered it from the filename instead would
+    silently restart the schedule from 0 here while still reporting the right total.
+    ``resumed_from`` in the run record is what pins that, since it names the file the
+    trainer actually opened rather than the argument the CLI was handed.
+    """
+    run = tmp_path / "first"
+    common = ("--data", str(dataset_dir), "--out", str(run), *FAST, *TINY)
+    assert (
+        cli(monkeypatch, "train", *common, "--steps", "6", "--checkpoint-every", "3") == ExitCode.OK
+    )
+    capsys.readouterr()
+
+    written = sorted((run / "checkpoints").glob("step-*.pt"))
+    assert len(written) >= 2, "the run saved no intermediate checkpoint to copy"
+    spare = tmp_path / "spare.pt"
+    spare.write_bytes(written[0].read_bytes())
+
+    code = cli(
+        monkeypatch,
+        "train",
+        "--data",
+        str(dataset_dir),
+        "--out",
+        str(tmp_path / "second"),
+        "--steps",
+        "6",
+        "--json",
+        "--resume",
+        str(spare),
+        *FAST,
+        *TINY,
+    )
+
+    assert code == ExitCode.OK, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["steps_completed"] == 6
+    start = json.loads(
+        (tmp_path / "second" / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert Path(start["resumed_from"]).name == "spare.pt"
 
 
 def test_training_on_a_raw_corpus_says_to_prepare_it_first(
@@ -998,9 +1409,105 @@ def test_a_loadable_plan_is_actually_loadable(
     assert "L1 d32 h2" in capsys.readouterr().out
 
 
+def test_a_plan_can_be_named_by_the_directory_holding_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """``trainai plan`` writes ``plan.json`` into a directory, so a directory is an answer.
+
+    The command that produces the file takes a directory and names the file itself, and
+    the run directory it writes into is the obvious thing to type back. Requiring the
+    filename means the two halves of one workflow disagree about what a plan is.
+
+    The second half is the assertion with teeth. Both halves exit 2 without the join --
+    reading a directory raises ``PermissionError`` on Windows and ``IsADirectoryError``
+    on Linux, and both are ``OSError``, so both would land on the "could not be read"
+    refusal below -- so only the message says whether the filename was appended or the
+    directory was opened as a file.
+    """
+    holding = tmp_path / "plans"
+    holding.mkdir()
+    (holding / PLAN_FILENAME).write_text(
+        json.dumps(a_loadable_plan(dataset_dir), indent=2), encoding="utf-8", newline="\n"
+    )
+    flags = ("train", "--data", str(dataset_dir), "--out", str(tmp_path / "run"), "--dry-run")
+
+    assert cli(monkeypatch, *flags, "--plan", str(holding)) == ExitCode.OK
+    assert "L1 d32 h2" in capsys.readouterr().out
+
+    empty = tmp_path / "nothing-here"
+    empty.mkdir()
+
+    assert cli(monkeypatch, *flags, "--plan", str(empty)) == ExitCode.USAGE
+    captured = capsys.readouterr()
+
+    assert f"{empty.name}/{PLAN_FILENAME}" in unwrapped(captured.out + captured.err), (
+        "the refusal named the directory, not the file that was looked for inside it"
+    )
+
+
+def test_a_plan_file_that_will_not_open_is_refused_rather_than_raised(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A plan that exists and cannot be read: exit 2 and the path, not a traceback.
+
+    ``FileNotFoundError`` is the case the table above covers, and it is not the only
+    way ``read_bytes`` fails. A plan under a directory whose permissions changed, on a
+    network share that went away mid-command, or open exclusively by the editor that
+    wrote it all raise some other ``OSError``, and each of those ended the command with
+    a bare traceback and exit 1 -- the exit code this project documents for a bug in
+    itself, on a condition that is entirely about the filesystem.
+
+    The failure is injected rather than arranged on disk, because there is no portable
+    way to arrange it: ``chmod 000`` does not stop root, which is who CI runs as, and
+    Windows' read-only attribute does not stop a read at all. Patched on the name so
+    every other file the command opens -- the manifest and the shards behind it --
+    still reads normally, which is what leaves the plan as the only thing under test.
+    """
+    plan_file = tmp_path / PLAN_FILENAME
+    plan_file.write_text(
+        json.dumps(a_loadable_plan(dataset_dir), indent=2), encoding="utf-8", newline="\n"
+    )
+    readable = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self.name == PLAN_FILENAME:
+            raise PermissionError(13, "Permission denied")
+        return readable(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+
+    code = cli(
+        monkeypatch,
+        "train",
+        "--data",
+        str(dataset_dir),
+        "--out",
+        str(tmp_path / "run"),
+        "--plan",
+        str(plan_file),
+        "--dry-run",
+    )
+    captured = capsys.readouterr()
+    output = flat(captured.out + captured.err)
+
+    assert code == ExitCode.USAGE
+    assert "Traceback" not in output, output[:400]
+    assert "could not be read" in output
+    assert "permissions" in output, "the hint did not say where to look"
+    assert PLAN_FILENAME in unwrapped(output), "the refusal did not name the file"
+
+
 # --------------------------------------------------------------------------- #
 # A plan file that is not UTF-8
 # --------------------------------------------------------------------------- #
+
+
 #: Written as bytes rather than through ``write_text``, which is the whole point: the
 #: table above cannot express a file that is not decodable, so the encoding path it
 #: shares with every case there went untested. ``UnicodeDecodeError`` is a

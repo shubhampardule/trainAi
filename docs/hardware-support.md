@@ -50,7 +50,7 @@ suggestion, so the table is presented as a shortcut and never as a promise.
 | NVIDIA / CUDA | yes | yes | **yes** — RTX 2050, 4 GiB, Windows 11 |
 | AMD / ROCm (Linux) | yes | should | no hardware to test on |
 | Intel / XPU | yes | should | no hardware to test on |
-| Apple / MPS | yes | yes, in fp32 | no |
+| Apple / MPS | yes | yes, in fp32 | no — planned against a real memory ceiling, peak still unmeasurable |
 | CPU | yes | yes, slowly | **yes** — CI, Linux and Windows, Python 3.10–3.13 |
 | AMD on Windows | yes | should | wheel comes from AMD's index, not pytorch.org |
 | Multiple GPUs | yes | first one only | multi-GPU is not implemented |
@@ -81,6 +81,33 @@ than being asked to look one number up at
 Note also what "supported" means there: that document distinguishes *build
 passing* from *sanity tested* from *release ready*, and warns that the first of the
 three "does not imply the runtime is functional on target hardware."
+
+### Apple Silicon, and the two memory questions
+
+Apple is the one backend where "how much memory is there" and "how much did the run
+use" have different answers, so TrainAI answers them separately.
+
+**Can it fit?** Yes, now. `torch.mps.recommended_max_memory()` returns Metal's
+declared working-set ceiling — roughly 75% of installed RAM — and TrainAI plans
+against the *lower* of that ceiling minus what torch already holds, and what the OS
+reports as free. The minimum matters because the memory is unified: the ceiling is a
+property of the machine and knows nothing about the browser you have open, so a
+24 GiB Mac with 3 GiB actually free has a 3 GiB budget and not an 18 GiB one.
+
+Until this landed, `gpus` was empty on Apple, so `primary_gpu` was `None`,
+`vram_budget_bytes()` returned 0, and the planner's over-budget check — which only
+runs on a positive budget — never ran at all. An oversized model was discovered by
+the crash rather than by the plan.
+
+**What did it peak at?** Still unknown, and reported as unknown. `torch.mps` has no
+`max_memory_allocated` and no `reset_peak_memory_stats`; there is no peak counter to
+read. The benchmark therefore reports `memory_measured=false` on Apple and the plan
+prints "Memory was not measured" rather than a figure. Sampling the current
+allocation and presenting it as a peak would be a made-up number in the one field
+whose entire job is to say whether a number was measured.
+
+Training runs in fp32 on MPS. Autocast there is not something this project has been
+able to verify, and an unverified fast path is not worth a wrong result.
 
 ## How hardware nobody here owns gets tested
 
@@ -152,6 +179,16 @@ exception. Concretely, that is two modules:
   you could have had, a false negative costs a run that appears to work and takes
   twenty times as long.
 
+`trainai plan --max-vram 4GB` lowers that budget when 85% of free VRAM is more than you
+want spent — a GPU shared with a desktop, or with another job that has not started yet.
+It only ever lowers it. Raising it would size a plan against memory the card does not
+have, so the search would have to measure candidates it cannot hold, which is the OOM
+this whole measurement pass exists to prevent; a cap above what is free is therefore
+reported in the plan's notes as having changed nothing rather than obeyed or refused.
+The plan records both numbers — `vram_cap_bytes` for what was asked and
+`provenance.measured.vram_budget_bytes` for what the peaks were compared against — so a
+small plan on a small card reads differently from a small plan that was asked for.
+
 The measurement was taken on NVIDIA; WDDM is a driver model rather than a vendor
 feature, so the flag is set for AMD on Windows too. It only ever makes TrainAI more
 careful, so applying it where it has not been measured errs in the safe direction.
@@ -164,15 +201,15 @@ is the one nobody tests, on the one platform where it is the only thing that wor
 
 ## No GPU at all
 
-Everything works. The CPU suite — more than 1,800 tests, everything not marked
-`gpu` — passes
-locally, and `.github/workflows/ci.yml` is configured to run exactly that against a
-**CPU-only** torch build on Linux and Windows across Python 3.10–3.13, which is the
-arrangement that would enforce "works without a GPU" on every commit rather than
-leaving it hoped for. Be aware that this has not happened yet: the repository has no
-remote, so no CI run has ever executed, and the local runs were on a machine that
-does have a CUDA device (the GPU tests were deselected, not made impossible). Data
-preparation is CPU work anyway and is not meaningfully slower.
+Everything works. The CPU suite — more than 2,700 tests, everything not marked
+`gpu` — passes locally, and `.github/workflows/ci.yml` runs exactly that against a
+**CPU-only** torch build on Linux and Windows across Python 3.10–3.13, which is what
+enforces "works without a GPU" on every push rather than leaving it hoped for. What
+that does *not* cover is a GPU: no hosted runner has one, so every `gpu`-marked test
+is deselected there and the local runs that do execute them were on a machine with a
+CUDA device. "Works without a GPU" is continuously verified; "works on your GPU" is
+not, and cannot be from here. Data preparation is CPU work anyway and is not
+meaningfully slower.
 
 Training is roughly 20–100× slower. For a first run on a megabyte of text that is
 survivable — minutes, not hours. For anything larger it is not, and TrainAI says so

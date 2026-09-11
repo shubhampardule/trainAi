@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -258,33 +259,65 @@ def _write_jsonl_corpus(directory: Path, *, count: int) -> Path:
     return directory
 
 
-@pytest.fixture(scope="session")
-def cli_trained_run(tmp_path_factory: pytest.TempPathFactory) -> Any:
-    """A corpus, a prepared dataset and a trained run, all built through the CLI.
+def _write_messages_corpus(directory: Path, *, count: int) -> Path:
+    """The same prose as :func:`_write_jsonl_corpus`, typed as conversations.
 
-    Returned as an object with ``.corpus``, ``.data`` and ``.run``. Built by driving
-    ``main()`` rather than the library, because the commands that consume this --
-    ``eval``, ``chat`` -- are being tested for their wiring, and a run assembled by
-    hand would not exercise the parts that put a tokenizer in the run directory or a
-    dataset path in the checkpoint.
+    Written as records with a ``messages`` field rather than as flattened
+    ``User:``/``Assistant:`` text, because the point of a corpus in this shape is that
+    ``data prepare --jsonl-messages-field`` records the chat template it rendered -- and
+    flattened text, however identical the shards, records nothing.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    subjects = ("rivers", "clocks", "bridges", "harbours", "orchards", "lanterns")
+    verbs = ("carry", "measure", "cross", "shelter", "ripen", "kindle")
+    lines = []
+    for index in range(count):
+        subject = subjects[index % len(subjects)]
+        verb = verbs[(index * 5) % len(verbs)]
+        lines.append(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": f"What do the {subject} {verb}?"},
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"Answer {index}. The {subject} {verb} what the previous "
+                                "ones did not, and a second sentence keeps this reply long "
+                                f"enough that the tokenizer sees {subject} and {verb} twice."
+                            ),
+                        },
+                    ]
+                }
+            )
+        )
+    (directory / "conversations.jsonl").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
+    )
+    return directory
 
-    Session-scoped: it trains a tokenizer and then a model, which is far too slow to
-    repeat per test. Nothing that uses it writes to it.
+
+@dataclass(frozen=True)
+class TrainedRun:
+    """Where the three artefacts of a CLI-built run are. See :func:`_train_through_cli`."""
+
+    corpus: Path
+    data: Path
+    run: Path
+
+
+def _train_through_cli(root: Path, corpus: Path, *, prepare: tuple[str, ...] = ()) -> TrainedRun:
+    """Prepare ``corpus`` and train on it by driving ``main()``, twice through ``sys.argv``.
+
+    Shared by the CLI run fixtures rather than copied into each, because the flags that
+    make the run small enough to build in a test are incidental to every one of them --
+    what differs is the corpus and the handful of ``prepare`` flags in ``prepare``.
     """
     import sys
-    from dataclasses import dataclass
 
     from trainai.cli.main import main
     from trainai.errors import ExitCode
 
-    @dataclass(frozen=True)
-    class TrainedRun:
-        corpus: Path
-        data: Path
-        run: Path
-
-    root = tmp_path_factory.mktemp("cli_run")
-    corpus = _write_jsonl_corpus(root / "corpus", count=120)
     data = root / "prepared"
     run = root / "run"
 
@@ -299,6 +332,7 @@ def cli_trained_run(tmp_path_factory: pytest.TempPathFactory) -> Any:
             str(data),
             "--vocab-size",
             "512",
+            *prepare,
             "--json",
         ]
         assert main() == ExitCode.OK
@@ -340,6 +374,42 @@ def cli_trained_run(tmp_path_factory: pytest.TempPathFactory) -> Any:
         sys.argv = argv
 
     return TrainedRun(corpus=corpus, data=data, run=run)
+
+
+@pytest.fixture(scope="session")
+def cli_trained_run(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """A corpus, a prepared dataset and a trained run, all built through the CLI.
+
+    Returned as an object with ``.corpus``, ``.data`` and ``.run``. Built by driving
+    ``main()`` rather than the library, because the commands that consume this --
+    ``eval``, ``chat`` -- are being tested for their wiring, and a run assembled by
+    hand would not exercise the parts that put a tokenizer in the run directory or a
+    dataset path in the checkpoint.
+
+    Its corpus is **prose**, so the checkpoint records no chat template. That is what
+    makes it the right fixture for everything about generation that is not about the
+    template, and :func:`cli_chat_run` is the one for the rest.
+
+    Session-scoped: it trains a tokenizer and then a model, which is far too slow to
+    repeat per test. Nothing that uses it writes to it.
+    """
+    root = tmp_path_factory.mktemp("cli_run")
+    return _train_through_cli(root, _write_jsonl_corpus(root / "corpus", count=120))
+
+
+@pytest.fixture(scope="session")
+def cli_chat_run(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """The same, from a corpus of typed conversations, so the run records its template.
+
+    Deliberately a second trained run rather than a copy of :func:`cli_trained_run` with
+    the checkpoint's ``chat`` block edited in. The block is written by ``data prepare``,
+    carried through the manifest, copied by the trainer and read by the inference session;
+    an edited copy would test ``trainai chat`` against a value no command had produced,
+    which is the one thing worth knowing here.
+    """
+    root = tmp_path_factory.mktemp("cli_chat_run")
+    corpus = _write_messages_corpus(root / "corpus", count=120)
+    return _train_through_cli(root, corpus, prepare=("--jsonl-messages-field", "messages"))
 
 
 @pytest.fixture(scope="session")
@@ -395,3 +465,52 @@ def dataset_without_validation(
         val_fraction=0.0,
         ingest_options=ingestor.options,
     )
+
+
+@pytest.fixture(scope="session")
+def masked_dataset(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """A prepared dataset of typed conversations, so it carries a loss mask.
+
+    Built from the real chat template and the real span machinery rather than from a
+    hand-written mask file, because what the trainer and the evaluator have to agree
+    with is what ``data prepare`` actually writes. Session-scoped for the same reason
+    :func:`prepared_dataset` is: training the tokenizer is the slow part.
+
+    Sized so that a batch of 4 windows of 32 tokens fits in *both* splits, and so that
+    the target share is neither 0 nor 1 -- a mask that selects everything or nothing
+    would let a trainer that ignores it pass every test here.
+    """
+    from trainai.data import IngestOptions, Ingestor, binarize_documents, train_tokenizer
+    from trainai.data.chat import render_conversation
+    from trainai.data.ingest import Document
+
+    root = tmp_path_factory.mktemp("masked")
+    documents = []
+    for index in range(240):
+        conversation = render_conversation(
+            [
+                {"role": "user", "content": f"Question {index} about rivers and clocks?"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Answer {index}. The rivers carry what the clocks measure, and "
+                        "the bridges cross both of them before the lanterns kindle."
+                    ),
+                },
+            ]
+        )
+        documents.append(Document(conversation.text, "chat.jsonl", index, 0, conversation.spans))
+    tokenizer = train_tokenizer((d.text for d in documents), vocab_size=512)
+    manifest = binarize_documents(
+        documents,
+        root / "prepared",
+        tokenizer,
+        seed=1234,
+        val_fraction=0.1,
+        loss_mask=True,
+        ingest_options=Ingestor(IngestOptions(jsonl_messages_field="messages")).options,
+    )
+    assert manifest.has_loss_mask
+    trained = int(manifest.totals["trained_tokens"])
+    assert 0 < trained < manifest.total_tokens
+    return manifest

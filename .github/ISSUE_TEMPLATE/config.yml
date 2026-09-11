@@ -1,0 +1,26 @@
+# Blank issues are off so that every report arrives with the version, the platform
+# and the exact command already in it. Those three are what makes a report
+# actionable, and asking for them afterwards costs a round trip every time.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/shubhampardule/trainAi/security/advisories/new
+    about: >-
+      Private, visible only to the maintainers. Use this rather than a public
+      issue for anything in SECURITY.md's scope - a corpus that crashes or hangs
+      the parser, a report that lies about what was ingested, or anything in the
+      installed package reaching the network.
+
+  - name: Before you file
+    url: https://github.com/shubhampardule/trainAi/blob/main/CONTRIBUTING.md
+    about: >-
+      What v0.1 is deliberately narrow about, how to run the suite, and the rules
+      a pull request is judged by.
+
+  - name: Is it a documented limitation?
+    url: https://github.com/shubhampardule/trainAi/blob/main/README.md#known-limitations
+    about: >-
+      Single GPU only, full fine-tuning only, no torch.compile, and reruns are
+      not bitwise on CUDA. These are stated rather than hidden; a report that one
+      of them is real is not news, but a report that one of them is wrong is.

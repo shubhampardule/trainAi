@@ -155,6 +155,34 @@ def test_verify_roundtrip_names_the_failing_probe(
     assert "bug in TrainAI" in (caught.value.hint or "")
 
 
+def test_a_probe_that_decodes_to_nothing_is_named_as_the_empty_string(
+    tokenizer: ByteLevelBPE, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure message renders both sides as codepoints, and one side can be empty.
+
+    ``U+0061 U+000A`` rather than the raw text, because printing the string can itself
+    raise ``UnicodeEncodeError`` on a legacy Windows code page and an error that crashes
+    while being displayed is worse than a terse one. An empty string renders to no
+    codepoints at all, so the message would read "came back as ." -- a sentence that
+    describes nothing, on the one failure where "the tokenizer produced nothing" is the
+    whole finding.
+
+    Reachable only through a broken decode, like the test above: a correct byte-level BPE
+    has no input it fails on, which is the reason the self-check exists.
+    """
+    monkeypatch.setattr(ByteLevelBPE, "decode", lambda self, ids: "")
+
+    with pytest.raises(TokenizerError) as caught:
+        tokenizer.verify_roundtrip([("deliberate", "the original text")])
+
+    message = str(caught.value)
+    assert "came back as <empty string>" in message
+    assert "came back as ." not in message
+    # The other side is a real string, so it still renders as codepoints -- which is
+    # what says the placeholder is for the empty case and not for every message.
+    assert "U+0074 U+0068 U+0065" in message, "'the' as codepoints"
+
+
 # --------------------------------------------------------------------------- #
 # Vocabulary
 # --------------------------------------------------------------------------- #
@@ -500,11 +528,106 @@ def test_loading_a_file_that_is_not_a_tokenizer_says_so(tmp_path: Path) -> None:
     assert caught.value.hint
 
 
+def test_a_tokenizer_with_no_end_of_text_token_is_refused_when_it_is_loaded(
+    tmp_path: Path,
+) -> None:
+    """A real tokenizer file, validly trained, that TrainAI cannot use.
+
+    The end-of-text token is how documents are separated in the shards: without one
+    there is no boundary between the last sentence of one document and the first of the
+    next, and a model trained on that learns to run them together. Every tokenizer this
+    project trains has one, so this is the case the hint describes -- a tokenizer
+    supplied from elsewhere, pointed at by ``--tokenizer``.
+
+    Trained here rather than hand-written, because what has to be refused is a file the
+    library itself considers valid. Refused in the constructor, so it cannot be reached
+    through ``load`` alone: every path that builds one goes through it.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+    stranger = Tokenizer(models.BPE())
+    stranger.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    stranger.train_from_iterator(
+        ["the rivers carry what the clocks measure"] * 8,
+        trainers.BpeTrainer(vocab_size=300, special_tokens=[], show_progress=False),
+    )
+    path = tmp_path / "no-eot.json"
+    stranger.save(str(path))
+    assert stranger.token_to_id(EOT_TOKEN) is None, "the fixture accidentally trained one"
+
+    with pytest.raises(TokenizerError) as caught:
+        ByteLevelBPE.load(path)
+
+    assert EOT_TOKEN in str(caught.value)
+    assert "separate documents" in (caught.value.hint or "")
+    assert "trainai data prepare" in (caught.value.hint or "")
+    assert caught.value.details["vocab_size"] == stranger.get_vocab_size()
+
+
 def test_loading_a_missing_file_names_the_path(tmp_path: Path) -> None:
     with pytest.raises(TokenizerError) as caught:
         ByteLevelBPE.load(tmp_path / "absent.json")
 
     assert "absent.json" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# Offsets: where each token came from
+# --------------------------------------------------------------------------- #
+def test_offsets_cover_the_string_a_token_at_a_time(tokenizer: ByteLevelBPE) -> None:
+    """Every mask byte in a chat dataset is placed by these ranges.
+
+    ``build_loss_mask`` decides whether a token is a target by asking whether its
+    character range overlaps a reply's span, so an offset list that is off by one puts
+    the boundary of the trained region on the wrong token. There is no test for the
+    offsets themselves: the mask tests all go through ``binarize_documents``, which means
+    a shift here and a compensating shift there would agree with each other and with no
+    text.
+
+    Checked by slicing the original string with each range and rebuilding it, which is
+    the property the mask arithmetic relies on and the one a shift breaks.
+    """
+    text = "The rivers carry what the clocks measure."
+
+    encoded = tokenizer.encode_batch_with_offsets([text])[0]
+
+    assert len(encoded.ids) == len(encoded.offsets)
+    assert encoded.ids == tokenizer.encode(text), "the ids are the ordinary ones"
+    for start, end in encoded.offsets:
+        assert 0 <= start <= end <= len(text)
+    assert encoded.offsets[0][0] == 0
+    assert encoded.offsets[-1][1] == len(text)
+    # Rebuilt from the ranges rather than compared range by range: the GPT-2
+    # pre-tokenizer's `trim_offsets` leaves the space before a word outside that word's
+    # range, so consecutive ranges are not required to touch -- but together they still
+    # have to account for every character.
+    rebuilt = "".join(text[start:end] for start, end in encoded.offsets)
+    assert rebuilt.replace(" ", "") == text.replace(" ", "")
+
+
+def test_a_token_without_a_position_is_refused_rather_than_shifting_the_rest(
+    tokenizer: ByteLevelBPE,
+) -> None:
+    """``Encoded`` is two parallel lists, and a length mismatch is silent damage.
+
+    Zipping ids with offsets stops at the shorter one, so a missing offset does not
+    raise -- it drops the tail of the document from the mask and shifts nothing visibly.
+    The check is in ``__post_init__`` because that is the only place both lists are known
+    before anyone indexes them.
+
+    Constructed directly: no encode produces this, which is why the guard exists at the
+    boundary rather than as a comment about what the Rust layer promises.
+    """
+    from trainai.data.tokenizer import Encoded
+
+    intact = Encoded(ids=[1, 2], offsets=[(0, 1), (1, 2)])
+    assert intact.ids == [1, 2], "the well-formed case is accepted"
+
+    with pytest.raises(ValueError) as caught:
+        Encoded(ids=[1, 2, 3], offsets=[(0, 1), (1, 2)])
+
+    assert "3 ids but 2 offsets" in str(caught.value)
+    assert "shift every position after it" in str(caught.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -541,3 +664,73 @@ def test_to_dict_carries_what_the_manifest_needs(tokenizer: ByteLevelBPE) -> Non
     assert payload["eot_id"] == tokenizer.eot_id
     assert payload["eot_token"] == EOT_TOKEN
     assert payload["fingerprint"] == tokenizer.fingerprint()
+
+
+# --------------------------------------------------------------------------- #
+# What reaches the trainer
+# --------------------------------------------------------------------------- #
+#
+# ``train_from_iterator`` is Rust, and the generator feeding it resumes under a Rust
+# caller -- which is why a coverage trace of the whole suite reports ``_non_empty``
+# as never having run even though every tokenizer test drives it. Never-run in the
+# trace, not untested by choice: these three tests call it directly.
+
+
+def test_empty_documents_never_reach_the_trainer() -> None:
+    """An empty document is a word boundary the trainer learns nothing from.
+
+    The BPE trainer counts each document it is handed, so empty strings inflate the
+    denominator of every frequency it computes without contributing a single pair to
+    merge. A corpus assembled from a directory of files, or from a JSONL export with
+    blank ``text`` fields, arrives full of them.
+    """
+    from trainai.data.tokenizer import _non_empty
+
+    kept = list(_non_empty(["first", "", "second", "", "", "third"]))
+
+    assert kept == ["first", "second", "third"]
+
+
+def test_a_whitespace_only_document_is_not_empty_and_is_kept() -> None:
+    """The filter's exact boundary, pinned because moving it changes a fingerprint.
+
+    ``if text:`` keeps ``" "`` and ``"\\n"``; ``if text.strip():`` would not. The
+    tempting tidy-up is not a refactor: whitespace-only documents contribute
+    whitespace pairs, so dropping them trains a different vocabulary, which is a
+    different :meth:`ByteLevelBPE.fingerprint`, which no longer matches the
+    checkpoints written against the old one. Changing this is allowed; changing it by
+    accident is not.
+    """
+    from trainai.data.tokenizer import _non_empty
+
+    assert list(_non_empty([" ", "\n", "\t"])) == [" ", "\n", "\t"]
+
+
+def test_the_filter_pulls_one_document_at_a_time() -> None:
+    """Why it is a generator and not a list comprehension.
+
+    ``train_tokenizer`` documents that it consumes its corpus once, as a stream, and
+    that promise is what lets a corpus larger than memory be tokenized at all. A
+    filter that materialised its input would keep that signature and that docstring
+    while quietly loading the whole corpus into RAM -- and every existing test would
+    still pass, because they all use corpora small enough to fit.
+
+    So the source records what it has been asked for. Yielding ``"second"`` requires
+    pulling the empty string in front of it and discarding it, which is the minimum;
+    what must not appear is ``"third"``.
+    """
+    from trainai.data.tokenizer import _non_empty
+
+    produced: list[str] = []
+
+    def source() -> Iterator[str]:
+        for text in ("first", "", "second", "third"):
+            produced.append(text)
+            yield text
+
+    stream = _non_empty(source())
+
+    assert next(stream) == "first"
+    assert produced == ["first"], f"the filter read ahead: {produced}"
+    assert next(stream) == "second"
+    assert produced == ["first", "", "second"], f"the filter read ahead: {produced}"

@@ -365,6 +365,47 @@ def test_binary_masquerading_as_text_is_rejected() -> None:
     assert any("control" in code or "binary" in code for code in codes(result)), codes(result)
 
 
+def test_the_binary_advice_names_the_files_when_it_knows_them_and_stops_when_it_does_not() -> None:
+    """The one hint that appends a measured list, in both of the states it can be in.
+
+    ``likely_binary`` is the only finding whose advice names files, and the test above
+    only asserts the code, so nothing pinned the sentence. Every other test of this
+    finding measures through ``analyze_documents``, which fills ``largest_sources`` from
+    the document sources whenever it saw a document at all -- and a corpus with no
+    documents returns at ``empty_corpus`` before this check runs. So the empty branch is
+    unreachable from a measured corpus and reachable from a built one: ``DatasetReport``
+    is exported from ``trainai.data`` and constructed by field in ``report_with`` and by
+    anything embedding TrainAI's checks without its ingest.
+
+    Without the guard that branch does not fail, it produces "The largest files are: ."
+    -- a hint that looks like the tool lost the answer, at the moment it is telling
+    someone their corpus is binary. The populated half is asserted for the cut at three
+    as well, because ``_largest_sources`` keeps five and a hint listing all of them was
+    the reason the slice is there.
+    """
+    binary = {**PLAIN, "control_chars": 1_000}
+    named = validate_corpus(
+        report_with(
+            **binary,
+            largest_sources=[{"path": f"part{n}.bin", "chars": 500 - n} for n in range(5)],
+        )
+    )
+    hint = next(i for i in named.issues if i.code == "likely_binary").hint
+
+    assert hint.endswith(" The largest files are: part0.bin, part1.bin, part2.bin.")
+    assert "part3.bin" not in hint and "part4.bin" not in hint, "the slice keeps three of five"
+
+    unnamed = validate_corpus(report_with(**binary))
+    bare = next(i for i in unnamed.issues if i.code == "likely_binary")
+
+    assert "largest files" not in bare.hint, bare.hint
+    assert bare.hint.endswith("only the text you want to train on.")
+    # The finding itself does not depend on knowing the file names, and its details
+    # still carry the (empty) list rather than omitting the key.
+    assert not unnamed.ok
+    assert bare.details["largest_sources"] == []
+
+
 def test_heavy_duplication_is_flagged() -> None:
     report = analyze_documents(docs(*[prose(2000)] * 20))
 
@@ -457,6 +498,51 @@ def test_to_dict_counts_errors_and_warnings() -> None:
     assert payload["errors"] == 0
     assert payload["warnings"] == len(result.warnings)
     assert len(payload["issues"]) == len(result.issues)
+
+
+def test_the_three_levels_partition_the_findings() -> None:
+    """``notes`` is the one level accessor nothing in the repo reads.
+
+    ``errors`` decides the exit code, ``warnings`` is counted into ``to_dict``, and
+    ``ok`` gates ``raise_if_failed`` -- all three are covered by the tests just above.
+    ``notes`` had no caller and no test, so nothing established it returns the note
+    level rather than a neighbouring one. It is public and ``code`` is documented as
+    stable to match on, so a script filtering a verdict down to the advisory findings
+    calls it, and a copy-paste slip in the level literal would hand that script the
+    warnings instead -- findings that are the opposite of advisory.
+
+    Asserted as a partition rather than a level at a time, because that is what makes
+    a wrong literal visible from any direction: three accessors returning the same
+    issue, or dropping one, both break the totals. The report is built by field for the
+    reason ``report_with`` exists -- reaching an error, several warnings and two notes
+    at once takes measurements no single corpus produces.
+    """
+    result = validate_corpus(
+        report_with(
+            documents=10,
+            total_chars=10_000,
+            median_chars=10,
+            control_chars=1_000,
+            whitespace_chars=8_000,
+            duplicate_documents=6,
+            duplicate_check_truncated=True,
+        ),
+        IngestStats(files_read=4, long_files_split=1),
+        max_doc_chars=16_384,
+    )
+
+    assert {i.level for i in result.notes} == {"note"}, [i.code for i in result.notes]
+    assert [i.code for i in result.notes] == ["duplicate_check_truncated", "documents_were_split"]
+    assert len(result.errors) + len(result.warnings) + len(result.notes) == len(result.issues)
+    # By identity, not by value: ``ValidationIssue`` is frozen but carries a details
+    # dict, so it is unhashable and a set of issues cannot be built.
+    partitioned = [id(i) for group in (result.errors, result.warnings, result.notes) for i in group]
+    assert sorted(partitioned) == sorted(id(i) for i in result.issues)
+    assert not {id(i) for i in result.notes} & {id(i) for i in (*result.errors, *result.warnings)}
+    # A note is advice, not a verdict: the errors here are what makes `ok` false, and
+    # a corpus whose only findings were notes still prepares.
+    assert not result.ok
+    assert validate_corpus(analyze_documents(docs(prose(MIN_TRAINABLE_CHARS * 5)))).ok
 
 
 def test_the_shared_fixture_corpus_is_trainable(tmp_corpus: Path) -> None:

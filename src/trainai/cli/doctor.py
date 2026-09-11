@@ -100,23 +100,39 @@ def _compute_rows(profile: HardwareProfile) -> list[tuple[str, str]]:
         label = f"GPU {gpu.index}"
         rows.append((label, f"[bold]{gpu.name}[/]"))
         used = gpu.used_vram_bytes
-        vram = (
-            f"[bold]{fmt_bytes(gpu.free_vram_bytes)}[/] free of {fmt_bytes(gpu.total_vram_bytes)}"
-        )
-        if used > 0:
-            vram += f"  [dim]({fmt_bytes(used)} already in use)[/]"
-        rows.append(("  VRAM", vram))
+        if gpu.backend == "mps":
+            # Neither number is a card's VRAM: the total is Metal's declared working-set
+            # ceiling and the free figure is that ceiling minus what torch holds, capped
+            # by what the OS says is actually free. Labelling it "VRAM ... free" would
+            # read as a driver measurement of a dedicated pool, and there is no such
+            # pool -- the GPU is spending the same RAM as everything else on the machine.
+            rows.append(
+                (
+                    "  GPU memory",
+                    f"[bold]{fmt_bytes(gpu.free_vram_bytes)}[/] usable of a "
+                    f"{fmt_bytes(gpu.total_vram_bytes)} ceiling  [dim](unified with "
+                    "system RAM)[/]",
+                )
+            )
+        else:
+            vram = (
+                f"[bold]{fmt_bytes(gpu.free_vram_bytes)}[/] free of "
+                f"{fmt_bytes(gpu.total_vram_bytes)}"
+            )
+            if used > 0:
+                vram += f"  [dim]({fmt_bytes(used)} already in use)[/]"
+            rows.append(("  VRAM", vram))
         rows.append(
             (
                 "  Capability",
                 f"{gpu.capability_str}   bf16 {_YES if gpu.supports_bf16 else _NO}"
                 + (
                     ""
-                    if profile.backend == "rocm"
-                    # TF32 is an NVIDIA tensor-core format; there is no AMD or Intel
-                    # equivalent, so reporting "TF32 no" there would imply the
+                    # TF32 is an NVIDIA tensor-core format; there is no AMD, Intel or
+                    # Apple equivalent, so reporting "TF32 no" there would imply the
                     # hardware fell short of something rather than that the concept
                     # does not apply.
+                    if profile.backend != "cuda"
                     else f"   TF32 {_YES if profile.supports_tf32 else _NO}"
                 ),
             )

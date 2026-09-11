@@ -31,8 +31,12 @@ Five things can end the search, and the plan names whichever one did:
     inside the time horizon.
 
 ``unconstrained``
-    Nothing stopped it: the largest preset on the ladder passed. This machine has room
-    for a bigger model than the project ships a preset for.
+    The ladder ran out rather than anything rejecting its top rung. It does not follow
+    that the machine has room to spare: a rung is accepted as soon as *some* micro-batch
+    on it fits, so this regime also covers a top rung reached only by halving the batch
+    and accumulating. :attr:`TrainingPlan.regime_detail` distinguishes the two, because
+    "nothing was rejected" and "nothing rejected the largest rung" are different claims
+    and only one of them means buying a bigger card would change nothing.
 
 ``blocked``
     A candidate failed for a reason that is not a capacity limit at all. Reported as
@@ -63,7 +67,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -261,6 +265,11 @@ class TrainingPlan:
     dataset_path: str = ""
     preset_name: str = ""
     vram_budget_bytes: int = 0
+    #: What ``--max-vram`` asked for, or 0 when it was not given. Kept beside the budget
+    #: rather than folded into it: ``vram_budget_bytes`` is the number the search actually
+    #: compared against, and without this a reader cannot tell a small budget on a small
+    #: card from a small budget the user asked for.
+    vram_cap_bytes: int = 0
 
     @property
     def estimated_seconds(self) -> float:
@@ -361,6 +370,10 @@ class TrainingPlan:
             "preset": self.preset_name,
             "regime": self.regime,
             "regime_detail": self.regime_detail,
+            # Top level rather than under ``provenance.measured`` beside the budget it
+            # bounded: this is what the user typed, and the provenance block exists to
+            # keep a typed number from being read as a measured one.
+            "vram_cap_bytes": self.vram_cap_bytes or None,
             "model": self.model_config.to_dict(),
             "train": self.train_config.to_dict(),
             "budget": self.budget.to_dict(),
@@ -415,18 +428,56 @@ _MEMORY_VERDICTS = frozenset(
 )
 
 
-def _regime_for(stop: PlanCandidate | None) -> tuple[str, str]:
+def _regime_for(
+    stop: PlanCandidate | None,
+    *,
+    accepted: PlanCandidate | None = None,
+    records: Sequence[PlanCandidate] = (),
+) -> tuple[str, str]:
     """Name the constraint that ended the search, and quote the evidence for it.
 
     ``stop`` is the candidate that stopped the ladder, or ``None`` when nothing did.
     The detail always repeats the actual verdict and the measurement's own words, so a
     user who disagrees with the regime can see what it was inferred from.
+
+    ``stop is None`` does not mean nothing was rejected. A rung is accepted as soon as
+    *some* micro-batch on it fits, so the ladder can run to its end while several larger
+    batches were measured and refused on the way -- on a 3 GiB card the ``large`` rung is
+    reached at a micro-batch of 2 with 8-way accumulation, after three rejections. The
+    regime is still ``unconstrained``, because what ended the search was the ladder
+    running out rather than anything rejecting its top rung, and that is the documented
+    meaning of the word. The *detail* has to say what happened anyway: this used to read
+    "Every rung fitted", which contradicted the plan's own accumulation note two rows
+    below it, where the same report says memory is what shaped the batch.
     """
     if stop is None:
+        rejected = [record for record in records if not record.ok]
+        if not rejected:
+            return (
+                REGIME_UNCONSTRAINED,
+                "Every candidate fitted first time, had the data behind it, and finished "
+                "inside the time horizon, so the largest preset on the ladder was "
+                "accepted.",
+            )
+        shape = accepted.candidate if accepted is not None else None
+        trimmed = (
+            f" Memory shaped the batch rather than the model: the accepted shape holds "
+            f"{shape.effective_batch} sequences as {shape.micro_batch} at a time, "
+            f"{shape.grad_accum} times per step."
+            if shape is not None and shape.grad_accum > 1
+            else ""
+        )
+        count = len(rejected)
+        last = rejected[-1].candidate.describe()
+        rejections = (
+            f"one candidate was rejected on the way: {last}"
+            if count == 1
+            else f"{count} candidates were rejected on the way, the last of them {last}"
+        )
         return (
             REGIME_UNCONSTRAINED,
-            "Every rung fitted, had the data behind it, and finished inside the time "
-            "horizon, so the largest preset was accepted.",
+            f"The ladder ran out rather than anything rejecting its largest preset, so "
+            f"that preset was accepted -- but {rejections}.{trimmed}",
         )
     verdict = stop.result.verdict
     label = stop.candidate.describe()
@@ -439,7 +490,15 @@ def _regime_for(stop: PlanCandidate | None) -> tuple[str, str]:
         return REGIME_COMPUTE_LIMITED, f"{label} was rejected -- {detail}"
     if verdict == VERDICT_ERROR:
         return REGIME_BLOCKED, f"{label} failed for a reason unrelated to capacity -- {detail}"
-    return REGIME_BLOCKED, f"{label} ended the search with verdict {verdict!r} -- {detail}"
+    # Every verdict either module defines is named above, and ``stop`` is only ever set
+    # from a candidate that failed, so the one remaining verdict -- ``fits`` -- cannot
+    # arrive here. Kept as a named regime with the verdict quoted, so a verdict added to
+    # ``benchmark.py`` without a branch here reports itself instead of being mapped to
+    # whichever limit happens to be listed last.
+    return (  # pragma: no cover - see the comment
+        REGIME_BLOCKED,
+        f"{label} ended the search with verdict {verdict!r} -- {detail}",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +507,44 @@ def _regime_for(stop: PlanCandidate | None) -> tuple[str, str]:
 _DURATION_HINT = "Give minutes as a bare number, or use units: 90s, 45m, 2h, 1h30m, 1d."
 _UNIT_SECONDS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd])")
+
+_VRAM_HINT = "Give gigabytes as a bare number, or use units: 6GB, 6.5GiB, 512MB, 2048MiB."
+#: Binary throughout, and ``GB`` is a synonym for ``GiB`` rather than 10**9. Every tool a
+#: user reads VRAM from -- nvidia-smi, Task Manager, this project's own ``fmt_bytes`` --
+#: reports binary units, and a card sold as "8 GB" holds 8 GiB. Reading ``--max-vram 8GB``
+#: as 8e9 would report it back as "7.45 GiB" and look like TrainAI had shaved it.
+_VRAM_UNIT_BYTES = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+_VRAM_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*(?:([kmgt])i?b?|(b))?$")
+
+
+def parse_vram(raw: str) -> int:
+    """Read ``6GB``, ``6.5GiB``, ``512MB``, ``2048MiB`` or a bare number of gigabytes.
+
+    A bare number means gigabytes, for the same reason a bare ``--time`` means minutes:
+    it is the unit the quantity is discussed in. ``--max-vram 6`` reading as six bytes
+    would reject every configuration there is and call it a memory limit.
+
+    Unlike :func:`parse_duration` this takes one quantity rather than a sum -- ``1h30m``
+    is a natural way to say a duration, ``1g512m`` is not a natural way to say a size, and
+    accepting it would mean guessing at what ``8 6`` was supposed to mean.
+    """
+    text = raw.strip().lower().replace(",", "")
+    if not text:
+        raise UsageError("A VRAM cap cannot be empty.", hint=_VRAM_HINT)
+
+    match = _VRAM_RE.match(text)
+    if match is None:
+        raise UsageError(
+            f"Cannot read {raw!r} as an amount of memory.",
+            hint=_VRAM_HINT,
+            details={"value": raw},
+        )
+    amount = float(match.group(1))
+    unit = match.group(2) or ("b" if match.group(3) else "g")
+    total = amount * _VRAM_UNIT_BYTES[unit]
+    if total <= 0:
+        raise UsageError(f"A VRAM cap must be positive, not {raw!r}.", hint=_VRAM_HINT)
+    return int(total)
 
 
 def parse_duration(raw: str) -> float:
@@ -505,7 +602,12 @@ def max_windows_for(tokens: int, seq_len: int) -> int:
 
 
 def _round_significant(value: float, digits: int) -> float:
-    if value == 0.0 or not math.isfinite(value):
+    # Not reachable through the only caller: ``recommended_lr`` guards the divide, and the
+    # smallest non-zero result it can produce underflows to 0.0 only around a width of
+    # 10**1000, which ``ModelConfig`` refuses long before this. Kept because
+    # ``math.log10(0.0)`` raises rather than returning -inf, so a second caller would get
+    # a ValueError from a rounding helper instead of a number.
+    if value == 0.0 or not math.isfinite(value):  # pragma: no cover - see the comment
         return 0.0
     exponent = math.floor(math.log10(abs(value)))
     return round(value, -(exponent - digits + 1))
@@ -556,7 +658,11 @@ def _largest_divisor_at_most(value: int, cap: int) -> int:
     for candidate in range(max(1, min(cap, value)), 0, -1):
         if value % candidate == 0:
             return candidate
-    return 1
+    # The range always ends at 1 and 1 divides every integer, so the loop returns on its
+    # last step at the latest -- checked exhaustively, negative and zero inputs included,
+    # by ``test_largest_divisor_keeps_the_effective_batch_exact``. Kept because a ``for``
+    # with nothing after it reads as a function that can fall off the end.
+    return 1  # pragma: no cover - the loop above always returns
 
 
 def _cadence(steps: int, *, target_count: int, floor: int, ceiling: int) -> int:
@@ -688,9 +794,12 @@ def _check_horizon(
     )
 
 
-def _capacity_hint(records: list[PlanCandidate], budget_bytes: int) -> str:
+def _capacity_hint(records: list[PlanCandidate], budget_bytes: int, cap_bytes: int = 0) -> str:
     """What to actually do about a machine that could not train anything."""
-    if not records:
+    # Only reachable if the ladder was empty, and ``_preset_ladder`` raises rather than
+    # returning nothing. Says so instead of indexing an empty list, because a hint is what
+    # a user sees when the search already failed.
+    if not records:  # pragma: no cover - the ladder always has at least one rung
         return "No candidate was attempted at all, which is a bug worth reporting."
     last = records[-1].result
     if last.verdict == VERDICT_NOT_ENOUGH_DATA:
@@ -700,6 +809,14 @@ def _capacity_hint(records: list[PlanCandidate], budget_bytes: int) -> str:
         )
     if last.verdict in _MEMORY_VERDICTS:
         budget = fmt_bytes(budget_bytes) if budget_bytes > 0 else "available"
+        # A cap that bound is the first thing to say: told the machine is too small when
+        # the number came from their own flag, a user goes looking at their card.
+        if cap_bytes and budget_bytes == cap_bytes:
+            return (
+                f"The smallest preset at a micro-batch of 1 did not fit the {budget} you "
+                "allowed with --max-vram. Raise it or drop it, lower --seq-len, or pass "
+                "--device cpu to train slowly rather than not at all."
+            )
         return (
             f"The smallest preset at a micro-batch of 1 did not fit the {budget} memory "
             "budget. Close other GPU applications and try again, lower --seq-len, or "
@@ -727,6 +844,7 @@ def plan_training(
     seq_len: int | None = None,
     precision: str = "auto",
     safety_fraction: float = DEFAULT_VRAM_SAFETY_FRACTION,
+    max_vram_bytes: int | None = None,
     measure: Callable[..., BenchmarkResult] = measure_candidate,
     warmup_steps: int = 2,
     measure_steps: int = 3,
@@ -748,7 +866,10 @@ def plan_training(
 
     Three caps apply, and :attr:`TrainingPlan.regime` names whichever one bound:
 
-    * **memory** -- the measured peak must fit ``safety_fraction`` of *free* VRAM.
+    * **memory** -- the measured peak must fit ``safety_fraction`` of *free* VRAM, or
+      ``max_vram_bytes`` when that is smaller. A cap never raises the budget: sizing
+      against memory the device does not have would mean measuring candidates it cannot
+      hold, and the OOM that follows is the thing this check exists to prevent.
     * **data** -- the model must not have more parameters than the corpus can train.
     * **time** -- the rung must finish its data-derived step count inside the horizon.
 
@@ -782,7 +903,8 @@ def plan_training(
         )
 
     val_tokens = dataset.tokens("val")
-    budget_bytes = hardware.vram_budget_bytes(safety_fraction)
+    device_budget = hardware.vram_budget_bytes(safety_fraction)
+    budget_bytes = device_budget
     torch_device = resolve_device(device)
     horizon = float(time_budget_seconds) if time_budget_seconds else float(SIZE_HORIZON_SECONDS)
     ladder = _preset_ladder(max_preset)
@@ -792,6 +914,31 @@ def plan_training(
     accepted: PlanCandidate | None = None
     stop: PlanCandidate | None = None
     best_flop_rate = 0.0
+
+    # A cap only ever lowers the budget. Raising it would produce a plan whose memory fit
+    # was never measured -- the search would have to run candidates the device cannot hold,
+    # and an OOM is what it is trying to spare the user. So it is a floor on caution, and
+    # asking for more than the card has is reported rather than obeyed or refused: the same
+    # `--max-vram 12GB` in a shared script is right on one machine and generous on another.
+    if max_vram_bytes:
+        if device_budget <= 0:
+            notes.append(
+                f"--max-vram {fmt_bytes(max_vram_bytes)} had no effect: there is no GPU "
+                "budget to cap on this device, so nothing was sized against VRAM."
+            )
+        elif max_vram_bytes >= device_budget:
+            notes.append(
+                f"--max-vram {fmt_bytes(max_vram_bytes)} is above the "
+                f"{fmt_bytes(device_budget)} this device already limits itself to, so it "
+                f"changed nothing. That limit is {safety_fraction:.0%} of free VRAM."
+            )
+        else:
+            budget_bytes = max_vram_bytes
+            notes.append(
+                f"Sized against --max-vram {fmt_bytes(max_vram_bytes)} rather than the "
+                f"{fmt_bytes(device_budget)} this device could have offered, so a larger "
+                "model may well fit if you raise or drop the cap."
+            )
 
     for spec in ladder:
         seq = int(seq_len) if seq_len else int(spec.seq_len)
@@ -898,11 +1045,12 @@ def plan_training(
     if accepted is None:
         raise CapacityError(
             "Nothing on the candidate ladder could be trained on this machine.",
-            hint=_capacity_hint(records, budget_bytes),
+            hint=_capacity_hint(records, budget_bytes, int(max_vram_bytes or 0)),
             details={
                 "dataset": dataset_path or "<unknown>",
                 "device": str(torch_device),
                 "vram_budget_bytes": budget_bytes,
+                "vram_cap_bytes": int(max_vram_bytes or 0) or None,
                 "train_tokens": train_tokens,
                 "candidates": [record.to_dict() for record in records],
             },
@@ -916,6 +1064,7 @@ def plan_training(
         dataset_path=dataset_path,
         hardware=hardware,
         budget_bytes=budget_bytes,
+        cap_bytes=int(max_vram_bytes or 0),
         train_tokens=train_tokens,
         val_tokens=val_tokens,
         horizon=horizon,
@@ -937,6 +1086,7 @@ def _assemble(
     dataset_path: str,
     hardware: HardwareProfile,
     budget_bytes: int,
+    cap_bytes: int = 0,
     train_tokens: int,
     val_tokens: int,
     horizon: float,
@@ -966,7 +1116,7 @@ def _assemble(
     steps = _data_derived_steps(
         train_tokens, model_config.parameter_count, candidate.tokens_per_step
     )
-    regime, regime_detail = _regime_for(stop)
+    regime, regime_detail = _regime_for(stop, accepted=accepted, records=records)
 
     if result.step_seconds > 0:
         affordable = int(horizon // result.step_seconds)
@@ -1118,4 +1268,5 @@ def _assemble(
         dataset_path=dataset_path,
         preset_name=candidate.name,
         vram_budget_bytes=budget_bytes,
+        vram_cap_bytes=int(cap_bytes or 0),
     )

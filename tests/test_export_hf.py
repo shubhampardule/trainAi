@@ -236,6 +236,39 @@ def test_a_weight_with_no_mapping_stops_the_export(monkeypatch: pytest.MonkeyPat
     assert caught.value.details["unmapped"] == ["blocks.0.attn.new_thing.weight"]
 
 
+def test_a_weight_outside_the_block_stack_stops_the_export_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other way a tensor can have no mapping: it is not in a block at all.
+
+    ``test_a_weight_with_no_mapping_stops_the_export`` adds its tensor *inside* the
+    block stack, so the name still matches the ``blocks.<n>.<rest>`` pattern and it
+    is the per-block table that comes back empty for it. A tensor added outside the
+    stack -- learned position embeddings, a second final norm, an auxiliary head --
+    fails the pattern itself, which is a separate route to the same refusal and the
+    only one no test took.
+
+    Worth separating because of what the two prevent. A name lookup that passed
+    unknown names through instead of rejecting them would write ``pos_embed.weight``
+    into the export under that name; ``LlamaForCausalLM`` has no such parameter, so
+    the directory would load, ignore the tensor, and generate from a model missing a
+    component. That is the silent wrong answer this module's docstring is about, and
+    it is the top-level route that reaches it -- a stray ``blocks.0.*`` name at least
+    lands in a namespace the loader is reading.
+    """
+    model = small_model()
+    real = model.state_dict()
+    extra = {**real, "pos_embed.weight": real["embed_tokens.weight"]}
+    monkeypatch.setattr(model, "state_dict", lambda *a, **k: extra)
+
+    with pytest.raises(ExportError) as caught:
+        hf_layout.hf_state_dict(model, dtype=torch.float32)
+
+    assert "no HuggingFace equivalent" in str(caught.value)
+    assert caught.value.details["unmapped"] == ["pos_embed.weight"]
+    assert "pos_embed.weight" in str(caught.value)
+
+
 def test_the_tensors_are_detached_copies_not_views() -> None:
     """safetensors writes the whole underlying buffer, so a view exports too much."""
     model = small_model()
@@ -294,6 +327,107 @@ def test_corrupted_weights_are_caught_and_nothing_is_written(
     assert not list(tmp_path.glob("broken.partial-*")), "the staging directory is cleaned up"
 
 
+def test_a_staging_directory_left_behind_by_a_crash_is_replaced(
+    cli_trained_run: Any, tmp_path: Path
+) -> None:
+    """The one cleanup the ``finally`` above cannot do, because it never ran.
+
+    Staging is named after the process id, so it is unique among concurrent exports
+    and *not* unique across time -- the operating system reuses process ids. A
+    machine that lost power mid-export, or an export killed with SIGKILL, leaves a
+    directory holding half a tensor file that the next export to draw the same id
+    finds sitting there.
+
+    What makes it worth a test rather than a comment is that the leftover is not
+    inert: the staging directory is what gets measured and then moved into place, so
+    a stale file surviving in it ends up inside the export as a file no loader asked
+    for. `test_force_leaves_nothing_from_the_previous_export_behind` is the same
+    property one directory over, for the destination rather than for staging.
+    """
+    import os
+
+    out = tmp_path / "resumed"
+    stale = tmp_path / f"resumed.partial-{os.getpid()}"
+    stale.mkdir()
+    (stale / "half-a-tensor.safetensors").write_text("garbage", encoding="utf-8", newline="\n")
+
+    result = export_run(cli_trained_run.run, out)
+
+    assert not stale.exists(), "the leftover staging directory outlived the export"
+    assert "half-a-tensor.safetensors" not in {item.name for item in result.files}
+    assert not (out / "half-a-tensor.safetensors").exists()
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ({"kept.weight": torch.ones(2, 2), "extra.weight": torch.zeros(3)}, "key mismatch"),
+        ({"kept.weight": torch.ones(2, 2), "lost.weight": torch.zeros(3, 3)}, "came back as"),
+    ],
+    ids=["keys", "shape"],
+)
+def test_a_file_that_does_not_match_what_was_handed_to_the_writer_is_reported(
+    tmp_path: Path, written: dict[str, torch.Tensor], expected: str
+) -> None:
+    """The two ways the round-trip check can fail on structure rather than on values.
+
+    ``test_corrupted_weights_are_caught_and_nothing_is_written`` goes through the whole
+    export with a sabotaged writer, and reaches only the value comparison: the keys and
+    the shapes still agree there, because a writer that mangles them would have to be
+    broken in a way safetensors itself does not permit. So the two structural branches
+    are reached by calling the check directly with a file whose keys and shapes are
+    chosen to disagree -- the only way in, and the way that says which branch ran.
+
+    Both details name the offending tensor. A check that reported only "verification
+    failed" would send someone reading the whole mapping table instead of one entry.
+    """
+    from safetensors.torch import save_file
+
+    from trainai.export.bundle import WEIGHTS_NAME, _verify_weights
+
+    handed_over = {"kept.weight": torch.ones(2, 2), "lost.weight": torch.zeros(3)}
+    save_file(written, str(tmp_path / WEIGHTS_NAME))
+
+    check = _verify_weights(tmp_path, handed_over)
+
+    assert check.ran, "a check that did not run is not a failure, and this one is"
+    assert not check.passed
+    assert expected in check.detail
+    assert "lost.weight" in check.detail
+
+
+def test_a_tokenizer_that_is_not_the_run_s_own_is_reported(
+    cli_trained_run: Any, tmp_path: Path
+) -> None:
+    """A tokenizer swap is the one export mistake that leaves everything else valid.
+
+    Every tensor matches, every config field matches, the directory loads, and the
+    text it generates has nothing to do with what the model computed -- which is why
+    `InferenceSession` refuses to *open* a run whose tokenizer does not match, and why
+    that refusal is the reason this branch cannot be reached through `export_run`. It
+    is reached by handing the check a directory holding a different tokenizer, which
+    is what a wrong copy in `_write_everything` would produce.
+
+    The comparison is on the fingerprint rather than on the file bytes, so this also
+    pins that a tokenizer trained on other text is a different tokenizer even at the
+    same vocabulary size.
+    """
+    from trainai.data.tokenizer import train_tokenizer
+    from trainai.export.bundle import _verify_tokenizer
+    from trainai.infer import InferenceSession
+
+    session = InferenceSession.open(cli_trained_run.run, device="cpu")
+    stranger = train_tokenizer(["nothing this run was ever trained on. " * 40], vocab_size=300)
+    stranger.save(tmp_path / "tokenizer.json")
+
+    check = _verify_tokenizer(session, tmp_path)
+
+    assert check.ran
+    assert not check.passed
+    assert "not the one the model was trained with" in check.detail
+    assert stranger.fingerprint() != session.tokenizer.fingerprint()
+
+
 def test_no_verify_reports_the_checks_as_not_run(cli_trained_run: Any, tmp_path: Path) -> None:
     """Skipping the checks is allowed; claiming they passed is not."""
     result = export_run(cli_trained_run.run, tmp_path / "quick", verify=False)
@@ -301,6 +435,38 @@ def test_no_verify_reports_the_checks_as_not_run(cli_trained_run: Any, tmp_path:
     assert result.checks
     assert all(not check.ran for check in result.checks)
     assert all("--no-verify" in check.detail for check in result.checks)
+
+
+def test_a_machine_without_transformers_still_exports_and_says_what_it_skipped(
+    cli_trained_run: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What most machines do, asserted from a machine that has transformers installed.
+
+    `test_every_check_runs_and_passes_on_a_real_export` covers both outcomes already,
+    but only whichever one this environment happens to produce -- so the branch that
+    matters to a user is tested on somebody else's machine or not at all, and the CI
+    matrix decides which. Blocking the import states the machine instead of asking it.
+
+    Two properties, and the first is the one that would hurt: an optional dependency
+    that is absent must not fail the export. It is a check that did not run, which is
+    not the same thing as a check that failed, and the difference is the whole of
+    `VerifyCheck.ok`. The second is that the reason is named, because "verified" that
+    silently means two of three checks ran is how a broken export ships.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    out = tmp_path / "bare"
+
+    result = export_run(cli_trained_run.run, out)
+
+    parity = next(check for check in result.checks if check.name == "logits parity")
+    assert not parity.ran
+    assert not parity.passed
+    assert parity.ok, "a skipped check must not fail the export"
+    assert "transformers is not installed" in parity.detail
+    assert "--verify" in parity.detail, "it should say how to get the check run"
+    assert (out / "model.safetensors").is_file(), "the export itself must have completed"
 
 
 @needs_transformers
@@ -371,6 +537,96 @@ def test_a_wrong_config_field_is_caught_by_the_parity_check(
 
     assert "failed verification" in str(caught.value)
     assert "logit difference" in json.dumps(caught.value.details)
+    assert not out.exists()
+
+
+@needs_transformers
+def test_the_parity_check_falls_back_to_the_older_dtype_keyword(
+    cli_trained_run: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """transformers 4.x has no ``dtype`` parameter, and this machine only has one version.
+
+    The same rename that made `test_the_config_carries_both_spellings_of_the_dtype`
+    necessary shows up a second time on the loading side: v5 takes ``dtype``, v4 took
+    ``torch_dtype``, and the exporter tries the new spelling and falls back. Whichever
+    version is installed, one of those two lines never runs -- so the fallback is
+    untested wherever the check itself can run, which is the only place it matters.
+
+    A stand-in on the module attribute rather than a version check, because the
+    interesting assertion is the *order*: the new spelling has to be tried first, or a
+    future v6 that drops ``torch_dtype`` starts reporting a parity check as failed on
+    a correct export. `tried` records what each call was given.
+    """
+    import transformers
+
+    real = transformers.LlamaForCausalLM
+    tried: list[str] = []
+
+    class OnlyTheOldKeyword:
+        """A loader with transformers 4.x's signature."""
+
+        @staticmethod
+        def from_pretrained(path: str, **kwargs: Any) -> Any:
+            tried.append(next(iter(kwargs)))
+            if "dtype" in kwargs:
+                raise TypeError("from_pretrained() got an unexpected keyword argument 'dtype'")
+            return real.from_pretrained(path, dtype=kwargs["torch_dtype"])
+
+    monkeypatch.setattr(transformers, "LlamaForCausalLM", OnlyTheOldKeyword)
+
+    result = export_run(cli_trained_run.run, tmp_path / "old")
+
+    parity = next(check for check in result.checks if check.name == "logits parity")
+    assert tried == ["dtype", "torch_dtype"], "the new spelling has to be the one tried first"
+    assert parity.ran
+    assert parity.passed, parity.detail
+
+
+@needs_transformers
+def test_logits_of_a_different_shape_are_a_named_failure_and_not_a_comparison(
+    cli_trained_run: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard that stops the parity check from reporting a number it made up.
+
+    A single position is kept from our side, so the two tensors are (1, 1, vocab) and
+    (1, 16, vocab). Those *broadcast*: without the shape guard the subtraction succeeds
+    and the check compares position 0 against all sixteen, which measured here reports
+    "max logit difference 1.10e+00 over 16 positions" -- a refusal, so the export is
+    still not written, but one that sends whoever reads it looking for a rotary or
+    rope_theta mistake that is not there. The number and the count are both wrong and
+    neither looks it.
+
+    `test_a_wrong_config_field_is_caught_by_the_parity_check` above is the control for
+    a wrong *value*; this is the control for a wrong *shape*, and the assertion that
+    "logit difference" is absent is the one that separates them.
+
+    Reached by shortening our own side, which is where a real shape disagreement would
+    come from: a change to what `GPT.forward` returns, or a config field that reaches
+    the export but not the reference copy.
+    """
+    from trainai.export import bundle
+
+    real_reference = bundle._reference_model
+
+    def one_position_only(*args: Any, **kwargs: Any) -> Any:
+        reference = real_reference(*args, **kwargs)
+
+        def clipped(ids: torch.Tensor) -> Any:
+            ours, loss, caches = reference(ids)
+            return ours[:, :1, :], loss, caches
+
+        return clipped
+
+    monkeypatch.setattr(bundle, "_reference_model", one_position_only)
+    out = tmp_path / "mismatched"
+
+    with pytest.raises(ExportError) as caught:
+        export_run(cli_trained_run.run, out)
+
+    assert "shape mismatch" in str(caught.value)
+    assert "logit difference" not in str(caught.value), (
+        "it must not report a number it cannot compute"
+    )
     assert not out.exists()
 
 

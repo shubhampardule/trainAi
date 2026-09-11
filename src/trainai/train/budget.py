@@ -36,7 +36,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["EPOCHS_BEFORE_MEMORISING", "TOKENS_PER_PARAMETER_TARGET", "DataBudget"]
+__all__ = [
+    "EPOCHS_BEFORE_MEMORISING",
+    "EPOCHS_FOR_A_FULL_PASS",
+    "TOKENS_PER_PARAMETER_TARGET",
+    "DataBudget",
+]
 
 #: Roughly the compute-optimal tokens-per-parameter ratio for from-scratch
 #: training, from Hoffmann et al. 2022 ("Training Compute-Optimal Large Language
@@ -51,6 +56,17 @@ TOKENS_PER_PARAMETER_TARGET = 20.0
 #: module docstring, where validation loss turned at epoch 8 and was clearly worse
 #: by epoch 16 -- so the warning fires with room to spare.
 EPOCHS_BEFORE_MEMORISING = 4.0
+
+#: Below this many passes, part of the training split is never read at all. Exactly
+#: one pass, because the threshold is arithmetic rather than a judgement: at 0.99
+#: epochs some prepared tokens do not reach the model, and at 1.0 they all do. The
+#: note it triggers reports that fact and does not call it a mistake -- under one
+#: pass is normal and correct for a corpus large relative to the compute. It exists
+#: because the opposite case is a silent surprise: the derived default step count is
+#: capped (see ``MAX_DERIVED_STEPS`` in :mod:`trainai.cli.train`), so on a large
+#: corpus a user who asked for nothing gets a fraction of a pass, and nothing else
+#: in the report would say so.
+EPOCHS_FOR_A_FULL_PASS = 1.0
 
 #: Below this, the run is data-starved enough to say so plainly.
 LOW_TOKENS_PER_PARAMETER = 5.0
@@ -70,6 +86,13 @@ class DataBudget:
     non_embedding_parameters: int
     tokens_per_step: int
     steps: int
+    #: True when the run starts from an existing model's weights rather than from
+    #: noise. Only the *advice* changes, never the arithmetic: a fine-tune corpus is
+    #: small relative to the parameter count almost by definition, so the
+    #: tokens-per-parameter note would fire on every fine-tune and its remedy --
+    #: "a smaller model would generalise better" -- is not available to a user whose
+    #: model shape is fixed by the checkpoint they are tuning.
+    finetune: bool = False
 
     @property
     def tokens_processed(self) -> int:
@@ -105,6 +128,22 @@ class DataBudget:
         return self.tokens_per_parameter < LOW_TOKENS_PER_PARAMETER
 
     @property
+    def tokens_never_read(self) -> int:
+        """Training tokens the run does not reach. Zero once it makes a full pass.
+
+        No ``train_tokens <= 0`` guard, unlike the ratios above: those divide and
+        would raise, this subtracts and ``max`` already floors it. An empty split
+        gives ``max(0, 0 - processed)``, which is 0 for any run that processes a
+        non-negative number of tokens -- and ``steps`` and ``tokens_per_step``
+        both come from a ``TrainConfig`` that refuses zero or less.
+        """
+        return max(0, self.train_tokens - self.tokens_processed)
+
+    @property
+    def leaves_corpus_unread(self) -> bool:
+        return self.train_tokens > 0 and self.epochs < EPOCHS_FOR_A_FULL_PASS
+
+    @property
     def will_memorise(self) -> bool:
         return self.epochs > EPOCHS_BEFORE_MEMORISING
 
@@ -128,15 +167,37 @@ class DataBudget:
                 "not the last one. Use fewer --steps, or more text."
             )
         if self.is_data_limited:
+            if self.finetune:
+                notes.append(
+                    f"{self.tokens_per_parameter:.2f} training tokens per parameter "
+                    f"({self.train_tokens:,} tokens, {self.parameters:,} parameters). "
+                    "That is expected when fine-tuning and is not the same problem it "
+                    "would be from scratch: the weights already encode the base "
+                    "corpus, and this run is adjusting them rather than filling them "
+                    "in. What it does mean is that the result is only as good as the "
+                    "base model at anything this corpus does not cover, and that a "
+                    "lower --lr preserves more of it."
+                )
+            else:
+                notes.append(
+                    f"{self.tokens_per_parameter:.2f} training tokens per parameter "
+                    f"({self.train_tokens:,} tokens, "
+                    f"{self.parameters:,} parameters). From-scratch training usually "
+                    f"wants roughly {TOKENS_PER_PARAMETER_TARGET:.0f}, which for this "
+                    f"model size would be about {self.compute_optimal_tokens:,} tokens. "
+                    "Expect fluent-looking text in the shape of your corpus, and facts "
+                    "that are wrong. A smaller model would generalise better on this "
+                    "much data."
+                )
+        if self.leaves_corpus_unread:
             notes.append(
-                f"{self.tokens_per_parameter:.2f} training tokens per parameter "
-                f"({self.train_tokens:,} tokens, "
-                f"{self.parameters:,} parameters). From-scratch training usually "
-                f"wants roughly {TOKENS_PER_PARAMETER_TARGET:.0f}, which for this "
-                f"model size would be about {self.compute_optimal_tokens:,} tokens. "
-                "Expect fluent-looking text in the shape of your corpus, and facts "
-                "that are wrong. A smaller model would generalise better on this "
-                "much data."
+                f"This run makes {self.epochs:.2f} passes over the training split, so "
+                f"{self.tokens_never_read:,} of its {self.train_tokens:,} tokens are "
+                "never read. That is normal when the corpus is large for the compute, "
+                "and it is worth checking you meant it: if you did not pass --steps, "
+                "the derived default is capped, and the cap is what decided this rather "
+                f"than the corpus. Reaching one full pass here needs "
+                f"--steps {max(1, int(self.steps_per_epoch)):,}."
             )
         if self.val_tokens == 0:
             notes.append(
@@ -159,6 +220,8 @@ class DataBudget:
             "compute_optimal_tokens": self.compute_optimal_tokens,
             "data_limited": self.is_data_limited,
             "will_memorise": self.will_memorise,
+            "tokens_never_read": self.tokens_never_read,
+            "leaves_corpus_unread": self.leaves_corpus_unread,
         }
 
     def describe(self) -> str:

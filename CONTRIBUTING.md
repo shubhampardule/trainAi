@@ -166,6 +166,38 @@ just *what*. In the PR, include:
 Small, reviewable PRs get merged. A 2,000-line PR touching six subsystems will
 sit.
 
+## Cutting a release
+
+A tag is the one artifact here that cannot be quietly corrected: it is what
+`pip install git+https://...@v0.1.0` resolves, so moving one somebody has already
+fetched breaks their checkout instead of fixing it. Everything checkable is
+therefore checked *before* the tag exists.
+
+1. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [x.y.z] - YYYY-MM-DD` and
+   open a fresh empty `## [Unreleased]` above it.
+2. Set `version` in `pyproject.toml` to the same `x.y.z`.
+3. Run the check, which compares all three and refuses if they disagree:
+
+   ```bash
+   python tools/release_check.py --tag vx.y.z
+   ```
+
+   It needs Python 3.11+ for `tomllib`; the version in `pyproject.toml` is worth
+   parsing properly rather than approximating with a regex. On 3.10 it refuses and
+   names an interpreter that works, and the tests that exercise it skip — so a green
+   suite on 3.10 has not checked the release path. Cut a release from 3.11 or newer.
+4. Tag and push. `.github/workflows/release.yml` runs the same check on the tag,
+   builds the sdist and wheel, runs `twine check --strict`, installs the **wheel**
+   and runs the suite from the **unpacked sdist** — the two failures an editable
+   install cannot see are a module missing from the wheel and a file the tests read
+   missing from the sdist — and then creates a **draft** release with the artifacts
+   attached and the changelog section as its notes.
+5. Read the draft and press publish. That is the last reversible moment.
+
+Nothing publishes to PyPI. No TrainAI artifact has ever been uploaded to an index
+and no token is configured, so that step goes in with the commit that actually
+claims the name rather than sitting there having never run.
+
 ## Where to start
 
 Good first contributions:
@@ -183,10 +215,12 @@ UI, multi-GPU) so we can agree on the shape first.
 ## Scope
 
 TrainAI v0.1 is deliberately narrow: **training small language models from
-scratch on your own text, on consumer hardware.** Fine-tuning, LoRA, multi-GPU,
-quantization, and non-text modalities are out of scope for now — not because
-they're bad ideas, but because the from-scratch path has to be genuinely reliable
-first. See the roadmap in the [README](README.md).
+scratch on your own text, on consumer hardware.** `trainai finetune` extends that
+to continuing one of *your own* checkpoints on a second corpus, and no further:
+LoRA and adapters of any kind, importing pretrained weights from elsewhere,
+multi-GPU, quantization, and non-text modalities are out of scope for now — not
+because they're bad ideas, but because the from-scratch path has to be genuinely
+reliable first. See the roadmap in the [README](README.md).
 
 ## Code of conduct
 

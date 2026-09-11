@@ -4,7 +4,7 @@
 specifies what is in them and what TrainAI promises about them, because a
 checkpoint is the only thing standing between a long run and losing it.
 
-Current version: **`trainai-checkpoint` v1**.
+Current version: **`trainai-checkpoint` v2**.
 
 ```
 runs/my-run/
@@ -55,24 +55,84 @@ testing for it.
 
 A single `torch.save` payload. Not safetensors: it holds RNG state and
 configuration dicts, not only tensors. `load_checkpoint` reads it with
-`weights_only=False`, which means **a checkpoint from an untrusted source should
-not be loaded** — it is a pickle. TrainAI only ever loads files it wrote, in a
-directory the user owns. For sharing, `trainai export` writes safetensors; see
+**`weights_only=True`**, so a checkpoint is data on the way in — nothing in the file
+names code for the loader to import and run. That was not free, and it is the whole
+reason there is a version 2; see [below](#loading-a-checkpoint-does-not-run-it).
+
+The honest boundary: `weights_only=True` is torch's restricted unpickler, so the
+guarantee is torch's rather than TrainAI's, and a bypass in it would be a torch
+vulnerability that TrainAI ships the fix for by raising its floor. What TrainAI
+promises is narrower and checkable — it does not ask for the unrestricted loader,
+anywhere, and a test fails if that changes. For *sharing* a model the answer is
+still `trainai export`, which writes safetensors and carries no pickle at all; see
 [export-format.md](export-format.md).
 
 | Key | Contents |
 |---|---|
-| `format`, `format_version` | `"trainai-checkpoint"`, `1`. A newer version is refused with an upgrade instruction. |
+| `format`, `format_version` | `"trainai-checkpoint"`, `2`. A newer version is refused with an upgrade instruction. |
 | `step` | Optimizer steps completed. Training resumes *at* this number. |
 | `model` | The full `ModelConfig`, with `n_kv_head` and `d_ff` resolved to concrete values. |
 | `train` | The full `TrainConfig`, so the schedule cannot drift on resume. |
 | `model_state` | Weights. The tied output projection is stored **once**; see below. |
 | `optimizer_state` | AdamW's `exp_avg` and `exp_avg_sq` per parameter, plus step counts. |
 | `scaler_state` | fp16 gradient-scaler state, or `null`. |
-| `rng` | torch CPU, torch CUDA (per device), numpy, and python random state. |
+| `rng` | torch CPU, torch CUDA (per device), numpy, and python random state — every one as tensors and plain numbers, which is what changed in v2. |
 | `metrics` | Best validation loss and the step it was at. |
-| `dataset` | Tokenizer fingerprint, content hash, vocabulary, token counts, path. |
+| `dataset` | Tokenizer fingerprint, content hash, vocabulary, token counts, path, and the chat layout the shards were rendered in. |
 | `created_with` | `trainai <version>`. |
+
+### Loading a checkpoint does not run it
+
+A checkpoint is the artifact people copy between machines, attach to issues and hand
+to `trainai finetune --from`, whose path comes off the command line. Reading one used
+to mean `weights_only=False` — the unpickler that imports and calls whatever the file
+names.
+
+The only thing standing in the way of `True` was **one NumPy array**: 624 `uint32`
+words of MT19937 state, which the restricted unpickler will not build. Measured on a
+real checkpoint by allowlisting its refusals one at a time, that array accounts for
+all four of them — `numpy._core.multiarray._reconstruct`, `numpy.ndarray`,
+`numpy.dtype`, `numpy.dtypes.UInt32DType` — and with those four allowed the rest of
+the file loaded untouched. The optimizer moments, the config dicts, the metrics and
+Python's own RNG tuple never needed it.
+
+So v2 stores the same 624 words as a tensor, which is what the rest of the file is
+made of anyway, and the load is restricted. A **v1 file is refused by name**, not
+migrated: reading its random state would require the loader this change exists to
+stop using. The refusal says so, and says the remedy — exact resume is the only thing
+that state was for, so a fresh run loses nothing else.
+
+What is *not* done here is a fallback to `weights_only=False` for old files. It reads
+as a kindness and is a hole: the fallback triggers on any file the strict load
+refuses, which is every hostile one. `torch.serialization.safe_globals` would be the
+bounded version of it, and it needs torch ≥ 2.5 against this project's `torch>=2.2`
+floor, with NumPy global names that move between NumPy versions
+(`numpy._core` vs `numpy.core`) — a permanently fragile branch, for a format whose
+installed base is zero.
+
+### How a refusal still says what the file is
+
+Pointing `--resume` at `torch.save(model, path)` output is the most common mistake
+there is, and it used to produce a good message — *the file holds a `Linear`* —
+because the unrestricted load succeeded and the object could be inspected. Under
+`weights_only=True` that load fails first, and the naive result is "could not be
+read" for every cause at once.
+
+Instead the diagnosis comes from **reading the pickle without executing it**:
+`torch.save` writes a zip whose `data.pkl` member is the pickle, and
+`pickletools.genops` walks its opcodes, so every global the file *would* have
+imported can be listed while importing none of them. Pure stdlib, no torch version to
+depend on. Three shapes are told apart — a saved `nn.Module` (something under
+`torch.nn.`), a v1 checkpoint (imports that are a subset of what its random state
+needs), and damage (anything else, with the imports named so a reader can tell which
+it was).
+
+Both `GLOBAL` and `STACK_GLOBAL` are read, because which opcode a pickle uses is a
+property of the protocol it was written at rather than of its contents: torch writes
+protocol 2 today, and a checkpoint-shaped file from another tool may arrive at 4 or
+later. Protocol 2 also still spells a builtin the Python 2 way, so the same `dict`
+reads as `__builtin__.dict` there and `builtins.dict` at protocol 5 — which is why
+the check matches on a `torch.nn.` prefix rather than a table of exact names.
 
 ### The tied output projection is stored once
 
@@ -128,6 +188,44 @@ The cos/sin table is a `persistent=False` buffer: a pure function of
 `(seq_len, head_dim, rope_theta)`, all three of which the checkpoint records.
 Storing it would make checkpoints larger and add a way for a checkpoint to
 disagree with itself.
+
+### The chat layout is copied in, not looked up
+
+`dataset.chat` holds whatever the dataset's
+[`manifest.json` recorded](dataset-format.md#chat) — the template version, the role
+labels, and which roles were trained on — or `{}` for a corpus of plain prose:
+
+```json
+"dataset": {
+  "tokenizer_fingerprint": "9f2c…",
+  "content_hash": "15f8dd01…",
+  "chat": {"version": 1, "labels": {"system": "System", "user": "User", "assistant": "Assistant"}, "trained_roles": ["assistant"]}
+}
+```
+
+Copied rather than resolved from `root` later, for the same reason the tokenizer is
+copied into the run directory: **a run has to stay usable after its dataset is
+deleted**, and datasets are the large thing people delete once training is done.
+Without it, a model trained on `User: …` / `Assistant: ` and later handed a bare
+question continues the question instead of answering it — which reads as a bad
+model rather than as a format mismatch, and there would be nothing left on disk to
+say otherwise.
+
+It is **not** part of the resume check. `_check_dataset` compares the tokenizer
+fingerprint and the content hash and nothing else, so a checkpoint written before
+this key existed resumes unchanged, and adding it did not move `format_version` —
+a key a reader ignores is not an incompatibility, which is the first half of the
+[compatibility promise](#compatibility-promise). Read back
+through `InferenceSession.chat_template`, which reports `{}` for all three of *this
+was prose*, *this is an older checkpoint*, and *this block is not an object* — a
+caller that has to tell them apart can read `checkpoint.dataset` itself.
+
+`trainai chat` reads it. A run whose dataset was rendered as conversations is
+prompted in that layout by default and its replies are cut where the model starts
+writing the next turn; a run that records `{}` is prompted with exactly what you
+type. A recorded `version` this TrainAI does not render is **refused rather than
+approximated** — prompting a model in a layout it was not trained in makes it answer
+worse without failing, and `--chat` or `--raw` is there to say which you meant.
 
 ## Retention
 
@@ -208,6 +306,16 @@ always refused rather than parsed on a guess, and the refusal names the only rou
 that works: use the TrainAI that wrote it. There is no converter, and unlike a
 dataset a checkpoint cannot be re-created — it is the output of the training run
 that produced it.
+
+**v1 is the one case that clause has had, and it went the refusing way.** The
+migration is not withheld out of strictness: a v1 file's random state cannot be read
+without the loader that [reading it under `weights_only=True`](#loading-a-checkpoint-does-not-run-it)
+exists to stop using, so a converter would have to reintroduce the exposure for every
+file it touched in order to recover the one field. Every other section of a v1 file
+reads fine, and there is a real cost being accepted here rather than argued away:
+somebody with a half-finished run from a pre-v2 build cannot continue it. What tips it
+is that v1 shipped in no release — `0.1.0` is the first — so the installed base of
+files this refuses is whatever a contributor has in a working directory.
 
 That promise has two halves, and they pull in opposite directions:
 

@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from conftest import flat
+from conftest import flat, unwrapped
 from trainai.cli.main import main
 from trainai.errors import ExitCode
 
@@ -129,6 +129,64 @@ def test_a_damaged_manifest_says_the_check_could_not_be_made(
     assert report["dataset_matches_run"] is False
 
 
+def test_the_same_corpus_resplit_is_named_as_not_this_runs_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_trained_run: Any,
+    tmp_path: Path,
+) -> None:
+    """The dangerous case, and the one nothing else here can produce.
+
+    The same corpus prepared again through the same tokenizer with a different ``--seed``
+    is a dataset whose tokenizer fingerprint matches -- so the loading checks are all
+    happy -- and whose train/val boundary has moved. Its ``val`` split now holds
+    documents this model was trained on, so the perplexity comes out lower and reads as a
+    better model. The content hash covers the seed, which is what makes the difference
+    visible at all.
+
+    ``--tokenizer`` rather than a fresh one on purpose: a fresh tokenizer would be
+    refused outright by the fingerprint check, which is a different, already-tested
+    failure. This one has to get all the way to a number, and be told what the number is.
+
+    The test above pins the "cannot tell" wording and asserts this phrase absent; this is
+    the case that has to produce it. Both the row and the note are checked, because they
+    are two separate statements about the same finding -- the row labels the dataset, the
+    note explains what it does to the measurement.
+    """
+    resplit = tmp_path / "resplit"
+    assert (
+        cli(
+            monkeypatch,
+            "data",
+            "prepare",
+            str(cli_trained_run.corpus),
+            "--out",
+            str(resplit),
+            "--tokenizer",
+            str(cli_trained_run.data / "tokenizer.json"),
+            "--seed",
+            "999",
+        )
+        == ExitCode.OK
+    )
+    capsys.readouterr()
+
+    args = ("eval", str(cli_trained_run.run), "--data", str(resplit), "--device", "cpu")
+    assert cli(monkeypatch, *args) == ExitCode.OK
+    out = flat(capsys.readouterr().out)
+
+    assert "not the one this run trained on" in out, "the dataset row did not label it"
+    assert "not necessarily held out from this model" in out
+    assert "prepared again with a different --seed" in out
+    assert "not as a generalisation measurement" in out
+    assert "cannot tell" not in out, "the hash was present on both sides; nothing was unknown"
+
+    assert cli(monkeypatch, *args, "--json") == ExitCode.OK
+    report = json.loads(capsys.readouterr().out)
+    assert report["dataset_check"] == "mismatch"
+    assert report["dataset_matches_run"] is False
+
+
 def test_max_batches_reaches_the_library_and_is_reported(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], cli_trained_run: Any
 ) -> None:
@@ -201,7 +259,7 @@ def test_an_unknown_split_is_refused_before_the_model_is_loaded(
 
     assert cli(monkeypatch, "eval", str(run), "--split", "sideways") == ExitCode.USAGE
 
-    assert "--split must be one of" in capsys.readouterr().err
+    assert "Unknown --split" in capsys.readouterr().err
 
 
 def test_a_run_that_does_not_exist_is_a_usage_error(
@@ -243,6 +301,86 @@ def test_a_dataset_that_moved_says_so_instead_of_crashing(
     err = flat(capsys.readouterr().err)
     assert "no longer at" in err
     assert "--data" in err
+
+
+def test_a_checkpoint_that_records_no_dataset_asks_for_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_trained_run: Any,
+) -> None:
+    """``eval <run>`` with nothing else works because the checkpoint remembers the dataset.
+
+    When it does not, the command has nothing to score against and the answer is the flag
+    to pass -- not a ``KeyError`` on a dict key, and not the "no longer at" message, which
+    is about a recorded path that has gone away and would name the empty string as the
+    place to look. Two different states, two different sentences.
+
+    Reached by blanking the recorded root, since every checkpoint this project writes
+    records one. ``--data`` on the same run is asserted to still work, which is what says
+    the refusal is about the default and not about the dataset being unusable.
+    """
+    from dataclasses import replace
+
+    from trainai.train.checkpoint import load_checkpoint as real_load
+
+    def forgetful(path: Any, **kw: Any) -> Any:
+        loaded = real_load(path, **kw)
+        return replace(loaded, dataset={**loaded.dataset, "root": ""})
+
+    monkeypatch.setattr("trainai.infer.session.load_checkpoint", forgetful)
+    run = cli_trained_run.run
+
+    assert cli(monkeypatch, "eval", str(run), "--device", "cpu") == ExitCode.USAGE
+
+    err = flat(capsys.readouterr().err)
+    assert "does not record which dataset it was trained on" in err
+    assert "--data path/to/prepared-dataset" in err
+    assert "no longer at" not in err, "the wrong one of the two messages"
+
+    args = ("eval", str(run), "--data", str(cli_trained_run.data), "--device", "cpu")
+    assert cli(monkeypatch, *args) == ExitCode.OK, capsys.readouterr().err
+    assert "Perplexity" in flat(capsys.readouterr().out)
+
+
+def test_the_report_names_a_tokenizer_that_did_not_come_from_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cli_trained_run: Any,
+    tmp_path: Path,
+) -> None:
+    """Two conditional rows, on a run whose own ``tokenizer.json`` is not there.
+
+    A run carries its own copy so it stays readable after its dataset is deleted. Without
+    that copy the session falls back to the dataset the checkpoint names, and the report
+    says where the tokenizer came from -- because the fallback is a *different file* that
+    happens to match, and a reader comparing two runs' numbers should know which of them
+    was decoded with a borrowed one.
+
+    The Note row comes along on the same run: with the pointer file gone, ``--which
+    best`` answers from the filenames instead, which is a good checkpoint but not the one
+    asked for. Both rows are absent from a normal run, which is the second half here --
+    every other test in this file exercises exactly that, so the silence is what all of
+    them would keep proving if these rows were unconditional.
+    """
+    assert cli(monkeypatch, "eval", str(cli_trained_run.run), "--device", "cpu") == ExitCode.OK
+    intact = flat(capsys.readouterr().out)
+
+    assert "Tokenizer" not in intact, "a run reading its own tokenizer says nothing about it"
+    assert "Note" not in intact
+
+    borrowed = tmp_path / "borrowed"
+    shutil.copytree(cli_trained_run.run, borrowed)
+    (borrowed / "tokenizer.json").unlink()
+    (borrowed / "checkpoints" / "checkpoints.json").unlink()
+
+    assert cli(monkeypatch, "eval", str(borrowed), "--device", "cpu") == ExitCode.OK
+    out = flat(capsys.readouterr().out)
+
+    assert "Tokenizer" in out
+    assert "from the dataset at" in out
+    assert "tokenizer.json" in unwrapped(out), "the path is one long token; flat cannot rejoin it"
+    assert "Note" in out
+    assert "is the last checkpoint, not the one with the lowest validation loss" in out
 
 
 def test_a_data_path_that_is_not_a_prepared_dataset_is_a_dataset_error(

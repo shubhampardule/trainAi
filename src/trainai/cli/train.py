@@ -1,10 +1,16 @@
-"""``trainai train`` -- build a model, train it, and record what happened.
+"""``trainai train`` and ``trainai finetune`` -- build a model, train it, record it.
 
 This module is deliberately thin. Its job is to turn flags into three objects
 (:class:`ModelConfig`, :class:`TrainConfig`, and a run directory), report what it is
 about to do, and hand off to :class:`~trainai.train.loop.Trainer`. Anything that
 looks like a training decision belongs in the library, because the web interface
 (M5) has to make the same decisions without going through argument parsing.
+
+``finetune`` shares almost all of that and differs in one structural way: it has no
+model flags at all. The shape is read from the checkpoint, because
+:meth:`~trainai.train.checkpoint.Checkpoint.apply_to` requires an exact match -- a
+fine-tune that could choose its own width would have nothing to load the weights
+into.
 
 Two behaviours worth knowing about before reading the code:
 
@@ -46,20 +52,28 @@ from trainai.console import (
 from trainai.data.binarize import DatasetManifest, verify_dataset
 from trainai.errors import ConfigError, UsageError, json_type_name
 from trainai.hardware.planner import PLAN_FILENAME, PLAN_VERSION
-from trainai.model.config import PRESETS, ModelConfig, preset
+from trainai.model.config import ModelConfig, preset
 from trainai.train.budget import DataBudget
-from trainai.train.checkpoint import find_checkpoint, list_checkpoints
+from trainai.train.checkpoint import Checkpoint, find_checkpoint, list_checkpoints, load_checkpoint
 from trainai.train.config import TrainConfig
 from trainai.train.loop import (
     Trainer,
     TrainResult,
     check_configs_agree,
+    check_finetune_compatible,
     resolve_device,
     resolve_precision,
 )
 from trainai.train.metrics import format_perplexity
 
-__all__ = ["run_train"]
+__all__ = [
+    "DERIVED_EPOCHS",
+    "FINETUNE_LR",
+    "MAX_DERIVED_STEPS",
+    "MIN_DERIVED_STEPS",
+    "run_finetune",
+    "run_train",
+]
 
 #: Default model shape. The smallest preset, on purpose: it fits on every GPU this
 #: project targets and finishes a first run in minutes. It is not a recommendation
@@ -68,6 +82,28 @@ __all__ = ["run_train"]
 #: table would be exactly the formula-instead-of-measurement mistake this project
 #: exists to avoid.
 DEFAULT_PRESET = "tiny"
+
+#: Ceiling on the *derived* step count, when the user does not pass ``--steps``.
+#: Three passes over a large corpus is an enormous run: on this project's own
+#: largest prepared corpus -- 633,422,803 train tokens -- at the default 2,048
+#: tokens per step it is 927,865 steps, which nobody asked for by typing nothing.
+#: (An earlier version of this comment said 774,641,791 tokens and "over a million
+#: steps". Neither figure matches any manifest in this repository; the number came
+#: from a scratch script's estimate rather than from a prepared dataset, and the
+#: same wrong figure reached the changelog from here.) The cap bounds the
+#: surprise in that direction, and the consequence in the other direction -- that
+#: the run then reads only part of the corpus -- is reported by
+#: :meth:`DataBudget.warnings`, because a cap that silently changes what the run
+#: does is the same class of invisible decision as a formula pretending to be a
+#: measurement. An explicit ``--steps`` is never capped: the user said the number.
+MAX_DERIVED_STEPS = 20_000
+
+#: Floor on the derived step count, for the opposite reason: three passes over a
+#: 1 MB corpus is a handful of steps, and a five-step run teaches nothing.
+MIN_DERIVED_STEPS = 50
+
+#: Passes over the training split the derived default aims for.
+DERIVED_EPOCHS = 3.0
 
 
 def run_train(
@@ -108,6 +144,7 @@ def run_train(
     keep_checkpoints: int | None = None,
     log_every: int | None = None,
     seed: int | None = None,
+    loss_mask: bool | None = None,
     precision: str | None = None,
     device: str | None = None,
 ) -> TrainResult | dict[str, Any]:
@@ -144,6 +181,7 @@ def run_train(
         "keep_checkpoints": keep_checkpoints,
         "log_every": log_every,
         "seed": seed,
+        "loss_mask": loss_mask,
         "precision": precision,
         "device": device,
     }
@@ -189,12 +227,12 @@ def run_train(
         quiet=quiet,
     )
     if resume:
-        trainer.resume(_resolve_resume_path(resume))
+        trainer.resume(_resolve_checkpoint_path(resume, flag="--resume"))
 
     if not quiet:
         rule("Training")
         print_kv("Run", _run_rows(data, dataset, run_dir, trainer))
-        _print_budget(trainer.budget)
+        _print_budget(trainer.budget, notes=False)
 
     result = trainer.run()
 
@@ -203,6 +241,172 @@ def run_train(
     else:
         _print_result(result, trainer)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# finetune
+# --------------------------------------------------------------------------- #
+#: Default peak learning rate for a fine-tune, one tenth of :class:`TrainConfig`'s
+#: pretraining default. Measured rather than assumed, because the first two sweeps
+#: that went looking for this number could not see the thing it buys: they scored
+#: each learning rate only on the corpus being tuned *onto*, where the highest rate
+#: wins every time. Scoring both validation splits shows the actual trade.
+#:
+#: A 2-layer, 128-wide model (vocab 600, ctx 128) trained 1,500 steps on a
+#: 270,501-token corpus to val 2.9384, then fine-tuned 200 steps on a separate
+#: 437,931-token corpus prepared with the same tokenizer. Val loss on the tune
+#: corpus started at 4.6463; from scratch on it, 200 steps reach 4.5586.
+#:
+#:      peak lr   val tune   val base (base model: 2.9384)
+#:        3e-04     3.4153     3.6599
+#:        1e-04     3.6714     3.3798
+#:        3e-05     3.9089     3.1883
+#:        1e-05     4.1907     3.0558
+#:
+#: Monotone in both directions and no dominant point: the choice is a preference,
+#: not a measurement. This default takes the conservative end because a user who
+#: typed `finetune` rather than `train` has said the base model matters -- at 3e-05
+#: the run gains 0.74 nats on the new corpus and gives up 0.25 on the old, where
+#: 3e-04 gains 1.23 and gives up 0.72. One measurement, one model size, two similar
+#: prose corpora; ``--lr`` overrides it and the result panel names the value used.
+FINETUNE_LR = 3e-5
+
+
+def run_finetune(
+    data: str,
+    *,
+    base: str,
+    out: str | None = None,
+    name: str | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    json_output: bool = False,
+    verify: bool = False,
+    # training
+    steps: int | None = None,
+    batch_size: int | None = None,
+    grad_accum: int | None = None,
+    seq_len: int | None = None,
+    lr: float | None = None,
+    min_lr_ratio: float | None = None,
+    warmup_steps: int | None = None,
+    schedule: str | None = None,
+    weight_decay: float | None = None,
+    grad_clip: float | None = None,
+    eval_every: int | None = None,
+    eval_batches: int | None = None,
+    checkpoint_every: int | None = None,
+    keep_checkpoints: int | None = None,
+    log_every: int | None = None,
+    seed: int | None = None,
+    loss_mask: bool | None = None,
+    precision: str | None = None,
+    device: str | None = None,
+) -> TrainResult | dict[str, Any]:
+    """Continue training an existing checkpoint on a different dataset.
+
+    There are no model flags. The shape comes from the checkpoint, because
+    :meth:`Checkpoint.apply_to` requires an exact match and there is no useful sense
+    in which a fine-tune chooses its own layer count -- a run that could pick a
+    different width would have nothing to load the weights into.
+
+    Returns the :class:`TrainResult`, or the dry-run report when ``dry_run`` is set.
+    """
+    quiet = json_output
+    dataset = verify_dataset(data, deep=verify) if verify else DatasetManifest.load(data)
+    checkpoint = load_checkpoint(
+        _resolve_checkpoint_path(base, flag="--from"),
+        map_location="cpu",
+        expect_dataset=None,
+    )
+
+    # Before the dry-run branch, not after it, and before the model is built.
+    # ``Trainer.initialise_from`` checks this too, but it is reached only by a real
+    # run -- so leaving it there alone means `finetune --dry-run` against a dataset
+    # with the wrong tokenizer prints a plan and exits 0, while the same command
+    # without --dry-run exits 5. A dry run exists to tell the user what the real run
+    # would do; refusing is part of that.
+    check_finetune_compatible(dataset, checkpoint)
+
+    model_config = checkpoint.model_config
+    train_config = _build_train_config(
+        dataset,
+        model_config,
+        steps=steps,
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+        seq_len=seq_len,
+        lr=FINETUNE_LR if lr is None else lr,
+        min_lr_ratio=min_lr_ratio,
+        warmup_steps=warmup_steps,
+        schedule=schedule,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        eval_every=eval_every,
+        eval_batches=eval_batches,
+        checkpoint_every=checkpoint_every,
+        keep_checkpoints=keep_checkpoints,
+        log_every=log_every,
+        seed=seed,
+        loss_mask=loss_mask,
+        precision=precision,
+        device=device,
+    )
+    check_configs_agree(dataset, model_config, train_config)
+    run_dir = _resolve_run_dir(out, name, data, resume=None, force=force)
+    if dry_run:
+        return _report_dry_run(
+            dataset,
+            model_config,
+            train_config,
+            run_dir,
+            quiet=quiet,
+            data=data,
+            base=checkpoint,
+        )
+
+    trainer = Trainer(
+        dataset=dataset,
+        model_config=model_config,
+        train_config=train_config,
+        run_dir=run_dir,
+        quiet=quiet,
+        finetune=True,
+    )
+    trainer.initialise_from(checkpoint)
+
+    if not quiet:
+        rule("Fine-tuning")
+        print_kv("Run", _run_rows(data, dataset, run_dir, trainer) + _base_rows(checkpoint))
+        _print_budget(trainer.budget, notes=False)
+
+    result = trainer.run()
+
+    if quiet:
+        emit_json(result.to_dict())
+    else:
+        _print_result(result, trainer)
+    return result
+
+
+def _base_rows(checkpoint: Checkpoint) -> list[tuple[str, str]]:
+    """The base model's identity, for the run panel.
+
+    Its validation loss is here because it is the number the fine-tune's own result
+    has to be read against: a tuned model's loss on a different corpus is not
+    comparable to the base model's loss on the base corpus, and printing them in one
+    panel without saying which is which invites exactly that comparison.
+    """
+    val = checkpoint.metrics.get("best_val_loss")
+    rows = [
+        (
+            "Base model",
+            f"{Path(str(checkpoint.path)).as_posix()}  [dim]step {fmt_int(checkpoint.step)}[/]",
+        )
+    ]
+    if isinstance(val, int | float):
+        rows.append(("Base val loss", f"{val:.4f}  [dim]on its own corpus, not this one[/]"))
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -446,7 +650,10 @@ def _build_train_config(
         # for both a 1 MB and a 1 GB dataset.
         tokens_per_step = batch_size * grad_accum * seq_len
         train_tokens = max(1, dataset.tokens("train"))
-        steps = max(50, min(20_000, int(3.0 * train_tokens / tokens_per_step)))
+        steps = max(
+            MIN_DERIVED_STEPS,
+            min(MAX_DERIVED_STEPS, int(DERIVED_EPOCHS * train_tokens / tokens_per_step)),
+        )
 
     return TrainConfig(
         steps=steps,
@@ -487,9 +694,14 @@ def _resolve_run_dir(
     return run_dir
 
 
-def _resolve_resume_path(resume: str) -> Path:
-    """Accept a run directory, its checkpoints directory, or a checkpoint file."""
-    path = Path(resume)
+def _resolve_checkpoint_path(given: str, *, flag: str = "--resume") -> Path:
+    """Accept a run directory, its checkpoints directory, or a checkpoint file.
+
+    ``flag`` names the option in the error, because ``--resume`` and ``--from`` reach
+    this by the same route and a message that names the wrong one sends the user to
+    edit a flag they did not type.
+    """
+    path = Path(given)
     if path.is_file():
         return path
     for candidate in (path, path / "checkpoints"):
@@ -497,12 +709,12 @@ def _resolve_resume_path(resume: str) -> Path:
         if found is not None:
             return found
     raise UsageError(
-        f"No checkpoint found at {resume}.",
+        f"No checkpoint found at {given}.",
         hint=(
-            "Point --resume at a run directory, its checkpoints directory, or a "
+            f"Point {flag} at a run directory, its checkpoints directory, or a "
             "single step-*.pt file."
         ),
-        details={"path": str(path)},
+        details={"path": str(path), "flag": flag},
     )
 
 
@@ -517,6 +729,7 @@ def _report_dry_run(
     *,
     quiet: bool,
     data: str,
+    base: Checkpoint | None = None,
 ) -> dict[str, Any]:
     """Describe the run without starting it.
 
@@ -531,6 +744,7 @@ def _report_dry_run(
         non_embedding_parameters=model_config.non_embedding_parameter_count,
         tokens_per_step=train_config.tokens_per_step,
         steps=train_config.steps,
+        finetune=base is not None,
     )
     device = resolve_device(train_config.device)
     _, _, precision_note = resolve_precision(train_config.precision, device)
@@ -545,13 +759,22 @@ def _report_dry_run(
         "precision": precision_note,
         "warnings": budget.warnings(),
     }
+    if base is not None:
+        # Named ``base`` and not ``resume``: the shape in ``model`` above was read
+        # from this file rather than chosen, so a reader who wants to know why the
+        # plan says what it says needs to know which file decided it.
+        payload["base"] = {"path": str(base.path), "step": base.step}
     if quiet:
         emit_json(payload)
         return payload
 
     rule("Plan")
     print_kv("Dataset", _dataset_rows(data, dataset))
-    print_kv("Model", _model_rows(model_config))
+    print_kv(
+        "Model",
+        _model_rows(model_config)
+        + ([("From", f"[dim]{Path(str(base.path)).as_posix()}[/]")] if base else []),
+    )
     print_kv("Training", _training_rows(train_config, device, precision_note, run_dir))
     _print_budget(budget)
     console.print(
@@ -653,7 +876,33 @@ def _run_rows(
     ]
 
 
-def _print_budget(budget: DataBudget) -> None:
+def _print_budget(budget: DataBudget, *, notes: bool = True) -> None:
+    """The two ratios, and optionally the advice that goes with them.
+
+    ``notes=False`` on the paths that go on to build a :class:`Trainer`, because the
+    trainer logs ``budget.warnings()`` itself when it starts, and printing them here
+    too meant every real run said each one twice -- once as a panel bullet and again
+    as a ``note:`` line a few lines below. The trainer is the copy that stays: it is
+    the layer a caller cannot skip, and a corpus quietly being memorised is the exact
+    failure :mod:`trainai.train.budget` exists to announce, so the announcement cannot
+    depend on going through this module. A dry run never builds a trainer, so it keeps
+    the bullets -- along with the "nothing to flag" line, which is worth having in the
+    one command whose whole purpose is answering whether the run is sensible.
+    """
+    # The reference ratio is a from-scratch one, and saying so beside a fine-tune's
+    # number contradicted the note printed immediately below it: the panel read
+    # "from-scratch training usually wants around 20" and then explained that 0.87 is
+    # expected here. Same measurement either way; only the comparison changes.
+    if budget.finetune:
+        ratio_note = (
+            "[dim](the usual reference point of 20 is a from-scratch figure and does "
+            "not apply: these tokens are adjusting weights, not filling them in)[/]"
+        )
+    else:
+        ratio_note = (
+            f"[dim](from-scratch training usually wants around 20; this model "
+            f"size would want {fmt_count(budget.compute_optimal_tokens)} tokens)[/]"
+        )
     print_kv(
         "Data budget",
         [
@@ -662,19 +911,15 @@ def _print_budget(budget: DataBudget) -> None:
                 f"[bold]{budget.epochs:.1f}[/] passes over the training split  "
                 f"[dim]({budget.steps_per_epoch:.0f} steps per epoch)[/]",
             ),
-            (
-                "Tokens/parameter",
-                f"[bold]{budget.tokens_per_parameter:.2f}[/]  "
-                f"[dim](from-scratch training usually wants around 20; this model "
-                f"size would want {fmt_count(budget.compute_optimal_tokens)} tokens)[/]",
-            ),
+            ("Tokens/parameter", f"[bold]{budget.tokens_per_parameter:.2f}[/]  {ratio_note}"),
         ],
     )
-    print_bullets(
-        "What to expect",
-        budget.warnings(),
-        empty="[green]Nothing to flag.[/] The data and the model size are in proportion.",
-    )
+    if notes:
+        print_bullets(
+            "What to expect",
+            budget.warnings(),
+            empty="[green]Nothing to flag.[/] The data and the model size are in proportion.",
+        )
 
 
 def _print_result(result: TrainResult, trainer: Trainer) -> None:
@@ -711,6 +956,31 @@ def _print_result(result: TrainResult, trainer: Trainer) -> None:
         rows.append(("Validation", f"[yellow]not measured[/]  [dim]({detail})[/]"))
         if skipped is not None and skipped.hint:
             rows.append(("", f"[dim]{skipped.hint}[/]"))
+    if result.loss_mask:
+        # The share, not just the fact. A masked loss is a different number from an
+        # unmasked one -- comparing the two as though they measured the same thing is
+        # the mistake this row exists to prevent -- and the denominator is what says
+        # how different: 41% of the positions means the reported loss is over the
+        # replies and nothing else.
+        seen = result.steps_completed * trainer.train_config.tokens_per_step
+        share = result.scored_tokens / seen if seen else 0.0
+        rows.append(
+            (
+                "Loss mask",
+                f"scored {fmt_int(result.scored_tokens)} of {fmt_int(seen)} predicted "
+                f"positions ({share:.0%})  [dim]{DASH} the losses above are over the "
+                "dataset's targets, not every token[/]",
+            )
+        )
+        if result.unscored_steps:
+            rows.append(
+                (
+                    "",
+                    f"[yellow]{fmt_int(result.unscored_steps)} step(s) scored no tokens[/] "
+                    f"[dim]{DASH} their windows held no target; recorded as `unscored` "
+                    "in metrics.jsonl and skipped, not counted as loss 0[/]",
+                )
+            )
     rows.extend(
         [
             (
@@ -742,8 +1012,3 @@ def _print_result(result: TrainResult, trainer: Trainer) -> None:
     console.print("[dim]Next: score it on held-out text, or try it out:[/]")
     print_command(f"trainai eval {result.run_dir.as_posix()}", style="dim bold")
     print_command(f"trainai chat {result.run_dir.as_posix()}", style="dim bold")
-
-
-def describe_presets() -> str:
-    """One line per preset, for ``--help``."""
-    return "  ".join(f"{p.name} (L{p.n_layer} d{p.d_model})" for p in PRESETS)

@@ -16,7 +16,7 @@ Then the two commands that exist today:
 
 ```bash
 trainai data inspect data/corpus
-trainai data prepare data/corpus --out data/shakespeare
+trainai data prepare data/corpus --out data/shake
 ```
 
 ## What that produces

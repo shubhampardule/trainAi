@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from test_hardware_portability import ALL_MACHINES, gpu, machine
+from trainai.console import fmt_bytes
 from trainai.data.binarize import DatasetManifest, ShardInfo
 from trainai.data.loader import open_split
 from trainai.errors import CapacityError, DatasetError, UsageError
@@ -36,6 +37,8 @@ from trainai.hardware.benchmark import (
 )
 from trainai.hardware.planner import (
     EFFICIENCY_COLLAPSE_RATIO,
+    MAX_STEPS,
+    MIN_EFFECTIVE_BATCH,
     MIN_STEPS,
     PLAN_VERSION,
     REGIME_BLOCKED,
@@ -52,14 +55,17 @@ from trainai.hardware.planner import (
     Candidate,
     TrainingPlan,
     _cadence,
+    _data_derived_steps,
     _largest_divisor_at_most,
     _micro_batch_ladder,
     _preset_ladder,
     max_windows_for,
     parse_duration,
+    parse_vram,
     plan_training,
     recommended_lr,
 )
+from trainai.hardware.probe import DEFAULT_VRAM_SAFETY_FRACTION
 from trainai.model.config import PRESETS, ModelConfig
 from trainai.train.config import TrainConfig
 
@@ -214,6 +220,66 @@ def test_parse_duration_refuses_what_it_cannot_read(text: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Sizes
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("6", 6 * GIB),  # bare means gigabytes, as a bare --time means minutes
+        ("6GB", 6 * GIB),
+        ("6gib", 6 * GIB),
+        ("6.5GiB", int(6.5 * GIB)),
+        ("512MB", 512 * 1024**2),
+        ("2048MiB", 2048 * 1024**2),
+        ("8g", 8 * GIB),
+        ("1T", 1024**4),
+        ("4096k", 4096 * 1024),
+        ("500b", 500),
+        ("6 gb", 6 * GIB),  # a space where a person would put one
+        ("1,024mb", 1024 * 1024**2),  # and a thousands separator
+    ],
+)
+def test_parse_vram_reads_what_a_person_would_type(text: str, expected: int) -> None:
+    assert parse_vram(text) == expected
+
+
+def test_parse_vram_reads_gb_as_the_unit_every_gpu_tool_prints() -> None:
+    """``GB`` is a synonym for ``GiB``, deliberately, and this is where that is pinned.
+
+    nvidia-smi, Task Manager and this project's own :func:`fmt_bytes` all report binary
+    units, and a card sold as "8 GB" holds 8 GiB. Reading ``--max-vram 8GB`` as 8e9 would
+    round-trip back to the user as "7.45 GiB" and look like TrainAI had shaved it -- so the
+    assertion goes through the formatter, which is what the user actually reads.
+    """
+    assert parse_vram("8GB") == parse_vram("8GiB") == 8 * GIB
+    assert fmt_bytes(parse_vram("8GB")) == "8.00 GiB"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "   ",
+        "abc",
+        "lots",
+        "2 hours",
+        "0",
+        "0gb",
+        "-4",
+        "-4gb",
+        "1g512m",  # a sum is how a duration is written, not a size
+        "6xb",
+        "gb",
+        "6.5.5",
+    ],
+)
+def test_parse_vram_refuses_what_it_cannot_read(text: str) -> None:
+    """Refusing beats guessing: a cap misread low rejects every configuration there is."""
+    with pytest.raises(UsageError):
+        parse_vram(text)
+
+
+# --------------------------------------------------------------------------- #
 # Window arithmetic: the planner has to agree with the loader exactly
 # --------------------------------------------------------------------------- #
 def test_max_windows_for_matches_the_loader_on_a_real_dataset(prepared_dataset: Any) -> None:
@@ -276,6 +342,31 @@ def test_largest_divisor_keeps_the_effective_batch_exact() -> None:
         assert chosen <= max(1, cap)
 
 
+def test_data_derived_steps_stays_between_the_floor_and_the_ceiling() -> None:
+    """The two limits, and the guard for a step that consumes no tokens.
+
+    Called with ``candidate.tokens_per_step``, which the search never builds as zero -- a
+    rung is sized before it is measured, and an unsized rung is rejected on the data cap
+    rather than costed. So the guard is unreachable from either caller today and is
+    checked here directly, the way ``_cadence`` and ``_largest_divisor_at_most`` above
+    are: dividing by it is the next line, and a helper that returns a step count is a
+    worse place to raise ZeroDivisionError than a helper that returns the floor.
+    """
+    # A corpus far larger than the model needs: the parameter target binds.
+    by_size = _data_derived_steps(10**12, 10_000_000, 16_384)
+    # The same model with a corpus that cannot feed it: the epoch limit binds instead.
+    by_epochs = _data_derived_steps(1_000_000, 10_000_000, 16_384)
+    assert by_epochs < by_size
+    assert by_epochs >= MIN_STEPS and by_size <= MAX_STEPS
+
+    assert _data_derived_steps(10**15, 10**12, 16_384) == MAX_STEPS
+    assert _data_derived_steps(1, 1, 16_384) == MIN_STEPS
+    # Negative counts are floored rather than producing a negative step count.
+    assert _data_derived_steps(-1, -1, 16_384) == MIN_STEPS
+    assert _data_derived_steps(10**12, 10_000_000, 0) == MIN_STEPS
+    assert _data_derived_steps(10**12, 10_000_000, -512) == MIN_STEPS
+
+
 def test_cadence_has_a_floor_and_still_fires_once() -> None:
     """A short run must not evaluate every three steps, and must leave a checkpoint."""
     assert _cadence(1000, target_count=20, floor=5, ceiling=250) == 50
@@ -305,6 +396,100 @@ def test_a_generous_machine_and_corpus_climbs_the_whole_ladder() -> None:
     assert plan.preset_name == PRESETS[-1].name
     assert plan.regime == REGIME_UNCONSTRAINED
     assert plan.measurement.ok
+
+
+def test_nothing_rejected_is_the_only_case_that_says_nothing_was_rejected() -> None:
+    """The negative control for the two tests below, and the case the wording assumed.
+
+    On a card this large every candidate fits at the first micro-batch tried, so
+    ``unconstrained`` is the whole truth and the detail is allowed to say so.
+    """
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=80,
+        time_budget_seconds=10_000 * 3600,
+    )
+
+    assert plan.rejected == [], "the test is vacuous if anything was rejected here"
+    assert plan.train_config.grad_accum == 1
+    assert "fitted first time" in plan.regime_detail
+    assert "rejected" not in plan.regime_detail
+
+
+@pytest.mark.parametrize(("total_gib", "expected"), [(6.0, "one candidate was"), (3.0, "3 candid")])
+def test_a_ladder_that_ran_out_does_not_claim_every_candidate_fitted(
+    total_gib: float, expected: str
+) -> None:
+    """The defect this replaces, in the words it shipped in.
+
+    A rung is accepted as soon as *some* micro-batch on it fits, so the ladder can reach
+    its top rung while larger batches on that rung were measured and refused. The regime is
+    still ``unconstrained`` -- the ladder running out is what ended the search, which is
+    what the word is documented to mean -- but the detail used to read "Every rung fitted,
+    had the data behind it, and finished inside the time horizon", which on this card is
+    false three times over and contradicts the plan's own accumulation note two rows below
+    it in the same report.
+
+    Both cards are parametrized because the count is written into the sentence: three
+    rejections and one rejection are different sentences, and "1 candidate(s) were" is the
+    kind of wording that gets shipped when only the plural case is tested.
+    """
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=total_gib,
+        time_budget_seconds=10_000 * 3600,
+    )
+
+    assert plan.regime == REGIME_UNCONSTRAINED
+    assert plan.preset_name == PRESETS[-1].name, "the ladder has to have run out, not been cut"
+    assert plan.train_config.grad_accum > 1, "the test is vacuous without accumulation"
+    assert plan.rejected, "and vacuous if nothing was rejected"
+
+    detail = plan.regime_detail
+    assert "fitted first time" not in detail, f"this claim is false here: {detail}"
+    assert expected in detail, f"the rejections are not counted in: {detail}"
+    assert "(s)" not in detail, f"a count is known, so it can be written out: {detail}"
+    assert plan.rejected[-1].candidate.describe() in detail, (
+        f"the last thing that was refused is what the user would try next: {detail}"
+    )
+
+    # Asserted against the tail of the sentence rather than against the whole of it: the
+    # effective batch here is 16, and so is the micro-batch of the rejected candidate the
+    # sentence already quotes, so `"16" in detail` passes whether or not the accumulation
+    # was ever mentioned. Found by the mutation that deleted this clause and stayed green.
+    marker = "Memory shaped the batch"
+    assert marker in detail, f"the accumulation the fit cost is not named: {detail}"
+    shaped = detail.split(marker, 1)[1]
+    assert str(plan.train_config.effective_batch_size) in shaped, (
+        f"the effective batch is what memory cost, and what the lr was chosen for: {detail}"
+    )
+    assert f"{plan.train_config.grad_accum} times per step" in shaped, (
+        f"the accumulation factor itself is what the user would change: {detail}"
+    )
+
+
+def test_the_regime_detail_never_contradicts_the_accumulation_note() -> None:
+    """One report, one story. This is the cross-check, from the other side.
+
+    The plan already noted accumulation as "what made this shape fit" while the row above
+    it said nothing was constrained. Asserting the two against each other means neither can
+    drift back without a test failing, whichever one is edited.
+    """
+    for total_gib in (3.0, 4.0, 6.0, 8.0, 24.0):
+        plan = plan_for(
+            dataset(4_000_000_000, 40_000_000),
+            total_gib=total_gib,
+            time_budget_seconds=10_000 * 3600,
+        )
+        accumulating = [note for note in plan.notes if "Gradient accumulation is in use" in note]
+        assert bool(accumulating) == (plan.train_config.grad_accum > 1), (
+            f"on a {total_gib:g} GiB card the note and the config disagree"
+        )
+        if accumulating:
+            assert "fitted first time" not in plan.regime_detail, (
+                f"on a {total_gib:g} GiB card the report says both that memory shaped the "
+                f"batch and that nothing was rejected: {plan.regime_detail}"
+            )
 
 
 def test_a_small_corpus_is_data_limited_and_says_which_rung_it_refused() -> None:
@@ -436,11 +621,72 @@ def test_a_time_budget_cuts_the_step_count_and_warns_that_it_did() -> None:
     assert any("time budget" in note for note in limited.notes)
 
 
-def test_a_time_budget_too_small_for_a_real_run_says_that_too() -> None:
-    plan = plan_for(dataset(400_000_000, 4_000_000), total_gib=80, time_budget_seconds=60.0)
+def test_a_corpus_with_too_few_windows_snaps_the_batch_down_to_a_divisor() -> None:
+    """The other way a micro-batch gets capped, and the reason it is snapped not clamped.
 
-    if plan.train_config.steps < MIN_STEPS:
-        assert any(str(MIN_STEPS) in note for note in plan.notes)
+    ``TokenBatcher`` refuses a batch it cannot fill, so ``_start_micro_batch`` caps the
+    first micro-batch at the training window count. Clamping to the count itself would
+    keep the batch openable and break the effective batch: 12,000 tokens at seq 256
+    leave 45 windows against a target of 64, and 45 with two accumulation passes holds
+    90 sequences rather than 64. Snapping to 32 -- the largest divisor of 64 at most 45
+    -- holds exactly 64 in the same two passes.
+
+    ``test_largest_divisor_keeps_the_effective_batch_exact`` pins the arithmetic and
+    ``test_an_effective_batch_that_could_not_be_hit_exactly_says_so_and_by_how_much``
+    covers the case where no divisor survives. This is the path from a corpus to that
+    call, which is the part a change to the cap would break silently -- the plan stays
+    valid, it just stops holding the tokens per step the whole module is calibrated on.
+    """
+    windows = max_windows_for(12_000, 256)
+    wanted = max(MIN_EFFECTIVE_BATCH, TARGET_TOKENS_PER_STEP // 256)
+    assert windows == 45 and wanted == 64, "the premise: fewer windows than the target batch"
+
+    plan = plan_for(
+        dataset(12_000, 1_200),
+        total_gib=80,
+        seq_len=256,
+        max_preset="tiny",
+        time_budget_seconds=10_000 * 3600,
+    )
+
+    config = plan.train_config
+    assert config.batch_size <= windows, "the batch has to be one the loader can fill"
+    assert config.batch_size == 32, "snapped to a divisor, not clamped to the window count"
+    assert config.effective_batch_size == wanted
+    assert config.effective_batch_size * config.seq_len == TARGET_TOKENS_PER_STEP
+    # Exactly on target, so the note about missing it must not appear.
+    assert not [n for n in plan.notes if "aimed for" in n]
+
+
+def test_a_time_budget_too_small_for_a_real_run_says_that_too() -> None:
+    """A machine slow enough that the cut lands under the floor, so the note has to fire.
+
+    ``device_flops`` and ``max_preset`` are both load-bearing. On the default 4e12 card
+    this same budget still affords hundreds of steps, so the ``if`` below was never
+    entered and the test asserted nothing -- it is written against a machine that
+    reaches the floor rather than one that might. And ``max_preset='tiny'`` keeps the
+    ladder from being what ends the search: without it the horizon rejects a larger rung
+    and the regime is already ``compute-limited`` before the cut, which is the case
+    ``test_a_slow_machine_is_compute_limited_by_the_default_horizon_and_says_so``
+    covers. Here nothing is rejected at all -- the cut is the only limit.
+    """
+    plan = plan_for(
+        dataset(400_000_000, 4_000_000),
+        total_gib=80,
+        max_preset="tiny",
+        time_budget_seconds=60.0,
+        measure=fake_measure(total_vram=80 * GIB, device_flops=6.0e10),
+    )
+
+    assert plan.train_config.steps < MIN_STEPS
+    assert any(str(MIN_STEPS) in note for note in plan.notes)
+    # The horizon cut an otherwise-unconstrained plan, so it -- not the ladder -- is the
+    # constraint the report has to name. Nothing was rejected, so the unconstrained
+    # wording would otherwise have survived into a plan the clock had shortened.
+    assert not plan.rejected
+    assert plan.regime == REGIME_COMPUTE_LIMITED
+    assert "time horizon" in plan.regime_detail
+    assert "cut the step count" in plan.regime_detail
 
 
 def test_every_candidate_holds_the_target_tokens_per_step() -> None:
@@ -469,6 +715,222 @@ def test_gradient_accumulation_preserves_the_effective_batch_when_memory_bites()
     assert config.grad_accum > 1, "a 2 GiB card should have needed accumulation"
     assert config.effective_batch_size * config.seq_len == TARGET_TOKENS_PER_STEP
     assert any("accumulation" in note for note in plan.notes)
+
+
+def test_an_effective_batch_that_could_not_be_hit_exactly_says_so_and_by_how_much() -> None:
+    """The other half of the test above: a target the surviving micro-batch cannot divide.
+
+    ``_largest_divisor_at_most`` keeps the effective batch exact whenever a divisor of
+    the target survives, which is the ordinary case and the one
+    ``test_gradient_accumulation_preserves_the_effective_batch_when_memory_bites``
+    pins -- there the effective batch times the sequence length is still exactly
+    ``TARGET_TOKENS_PER_STEP``. It cannot always: a sequence length that does not divide
+    16,384 gives a target with few divisors, and the halving ladder can land below all of
+    them. At seq 910 the target is 18, the ladder is 18, 9, 4, 2, 1, and a card this
+    small only fits 4 -- so 5 accumulation passes hold 20 sequences rather than 18.
+
+    Overshooting is the right answer (the alternative is a batch below the floor the
+    ladder exists to defend), but a plan whose printed tokens-per-step does not match the
+    number this module says it aims for has to account for the difference itself.
+    """
+    plan = plan_for(
+        dataset(400_000_000, 4_000_000),
+        total_gib=0.2,
+        free_gib=0.2,
+        seq_len=910,
+        max_preset="tiny",
+        time_budget_seconds=10_000 * 3600,
+    )
+
+    config = plan.train_config
+    assert (config.batch_size, config.grad_accum) == (4, 5)
+    assert config.effective_batch_size == 20
+    wanted = max(MIN_EFFECTIVE_BATCH, TARGET_TOKENS_PER_STEP // 910)
+    assert wanted == 18
+    assert config.effective_batch_size != wanted
+    note = [n for n in plan.notes if "rather than the" in n and "aimed for" in n]
+    assert len(note) == 1, plan.notes
+    assert "20" in note[0]
+    assert "18" in note[0]
+    # The reason, not just the numbers: 18 is not a multiple of the 4 that fitted.
+    assert "4" in note[0]
+
+
+# --------------------------------------------------------------------------- #
+# --max-vram: a budget the user asked for rather than the one the card allows
+# --------------------------------------------------------------------------- #
+#: Enough corpus and enough hours that memory is the only thing left to bind the search.
+UNCONSTRAINED_BUT_FOR_MEMORY = {
+    "time_budget_seconds": 10_000 * 3600,
+}
+
+
+def test_a_cap_below_the_device_budget_is_what_every_peak_is_measured_against() -> None:
+    """The cap is not a label on the plan: it is the number the search compares to.
+
+    Asserted against every candidate's own ``budget_bytes`` rather than only against the
+    plan's field, because a cap recorded and not applied is the failure mode -- it would
+    read as respected in the report and OOM thousands of steps into the run.
+    """
+    cap = 2 * GIB
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=24,
+        max_vram_bytes=cap,
+        **UNCONSTRAINED_BUT_FOR_MEMORY,
+    )
+
+    assert plan.vram_cap_bytes == cap
+    assert plan.vram_budget_bytes == cap
+    assert plan.measurement.peak_bytes <= cap
+    measured = [r for r in plan.candidates if r.result.steps_measured > 0]
+    assert measured, "the test is vacuous if nothing was measured"
+    for record in measured:
+        assert record.result.budget_bytes == cap, (
+            f"{record.candidate.describe()} was measured against "
+            f"{record.result.budget_bytes} rather than the cap"
+        )
+
+
+def test_a_cap_actually_costs_a_model_the_card_would_have_afforded() -> None:
+    """The same machine and corpus, planned twice: the cap has to change the answer.
+
+    Without this, every other test here would pass on an implementation that recorded the
+    cap and sized against free VRAM anyway. Two caps, because a cap bites in two places:
+    a shallow one only costs the micro-batch, which accumulation absorbs at the same
+    effective batch, and a deeper one costs a whole rung of the ladder.
+    """
+    corpus = dataset(4_000_000_000, 40_000_000)
+    generous = plan_for(corpus, total_gib=24, **UNCONSTRAINED_BUT_FOR_MEMORY)
+    assert generous.measurement.peak_bytes > 2 * GIB, "the caps below have to bite"
+
+    shallow = plan_for(corpus, total_gib=24, max_vram_bytes=2 * GIB, **UNCONSTRAINED_BUT_FOR_MEMORY)
+    assert shallow.measurement.peak_bytes <= 2 * GIB
+    assert shallow.train_config.batch_size < generous.train_config.batch_size
+    assert shallow.preset_name == generous.preset_name
+    assert (
+        shallow.train_config.effective_batch_size == generous.train_config.effective_batch_size
+    ), "accumulation exists so that a memory cap costs memory and not the training recipe"
+
+    deep = plan_for(
+        corpus, total_gib=24, max_vram_bytes=int(1.4 * GIB), **UNCONSTRAINED_BUT_FOR_MEMORY
+    )
+    assert deep.measurement.peak_bytes <= 1.4 * GIB
+    assert deep.model_config.parameter_count < generous.model_config.parameter_count
+    assert deep.regime == REGIME_VRAM_LIMITED
+    assert generous.preset_name in deep.regime_detail, (
+        "the rung the cap cost has to be named, with the measurement that ruled it out"
+    )
+
+
+def test_a_cap_that_bound_says_a_bigger_model_may_fit_without_it() -> None:
+    """A smaller plan than the card allows is only honest if the reason is stated."""
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=24,
+        max_vram_bytes=2 * GIB,
+        **UNCONSTRAINED_BUT_FOR_MEMORY,
+    )
+
+    notes = " ".join(plan.notes)
+    assert "--max-vram" in notes
+    assert "2.00 GiB" in notes, "the note has to name the cap in the units the report prints"
+    assert "raise or drop the cap" in notes
+
+
+def test_a_cap_above_what_is_free_changes_nothing_and_reports_that_it_did_not() -> None:
+    """Not obeyed, and not refused either.
+
+    Obeying it would size the plan against memory the card does not have, so the search
+    would measure candidates it cannot hold -- the OOM this check exists to prevent.
+    Refusing it would break the case the flag is for: the same ``--max-vram 12GB`` in a
+    shared script is right on one machine and generous on another.
+    """
+    plan = plan_for(dataset(400_000_000, 4_000_000), total_gib=8, max_vram_bytes=64 * GIB)
+
+    device_budget = plan.hardware.vram_budget_bytes(DEFAULT_VRAM_SAFETY_FRACTION)
+    assert device_budget > 0
+    assert plan.vram_budget_bytes == device_budget, "a cap must never raise the budget"
+    assert plan.vram_cap_bytes == 64 * GIB, "what was asked for is still recorded"
+    notes = " ".join(plan.notes)
+    assert "64.0 GiB" in notes
+    assert "changed nothing" in notes
+    assert "85%" in notes, "the note has to say what the real limit is a fraction of"
+
+
+def test_a_cap_on_a_machine_with_no_vram_budget_says_it_had_no_effect() -> None:
+    """On a CPU there is no budget to cap, and silence would read as the cap applying."""
+    plan = plan_training(
+        dataset(400_000_000, 4_000_000),
+        hardware=ALL_MACHINES["cpu_only"](),
+        device="cpu",
+        dataset_path="data/synthetic",
+        max_vram_bytes=4 * GIB,
+        measure=fake_measure(total_vram=0, memory_measured=False),
+        time_budget_seconds=None,
+    )
+
+    assert plan.vram_budget_bytes == 0
+    assert plan.vram_cap_bytes == 4 * GIB
+    notes = " ".join(plan.notes)
+    assert "had no effect" in notes
+    assert "no GPU budget to cap" in notes
+
+
+def test_no_cap_produces_no_note_about_one() -> None:
+    """The negative control: a guard inverted here would warn on every ordinary plan."""
+    plan = plan_for(dataset(400_000_000, 4_000_000), total_gib=8)
+
+    assert plan.vram_cap_bytes == 0
+    assert "--max-vram" not in " ".join(plan.notes)
+    assert plan.to_dict()["vram_cap_bytes"] is None
+
+
+def test_the_cap_is_recorded_beside_the_budget_rather_than_inside_the_measurements() -> None:
+    """``provenance.measured`` is for numbers a counter reported. This one was typed.
+
+    Both fields matter, and they are different claims: ``vram_budget_bytes`` is what the
+    search compared against, ``vram_cap_bytes`` is what the user asked for. Comparing them
+    is how a reader tells a small plan on a small card from a small plan that was asked for.
+    """
+    cap = 2 * GIB
+    payload = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=24,
+        max_vram_bytes=cap,
+        **UNCONSTRAINED_BUT_FOR_MEMORY,
+    ).to_dict()
+
+    assert payload["vram_cap_bytes"] == cap
+    assert payload["provenance"]["measured"]["vram_budget_bytes"] == cap
+    assert "vram_cap_bytes" not in payload["provenance"]["measured"], (
+        "a number the user typed must not be filed under what was measured"
+    )
+
+
+def test_a_cap_that_fits_nothing_names_the_flag_rather_than_blaming_the_card() -> None:
+    """Told the machine is too small when the number came from their own flag, a user
+    goes looking at their card."""
+    cap = 8 * 1024**2
+    with pytest.raises(CapacityError) as excinfo:
+        plan_for(dataset(4_000_000_000, 40_000_000), total_gib=24, max_vram_bytes=cap)
+
+    error = excinfo.value
+    assert "--max-vram" in (error.hint or "")
+    assert "Raise it or drop it" in (error.hint or "")
+    assert error.details["vram_budget_bytes"] == cap
+    assert error.details["vram_cap_bytes"] == cap
+
+
+def test_a_card_that_fits_nothing_does_not_blame_a_flag_that_was_not_passed() -> None:
+    """The mirror of the test above, and the one that catches the guard inverted."""
+    with pytest.raises(CapacityError) as excinfo:
+        plan_for(dataset(4_000_000_000, 40_000_000), total_gib=0.05, free_gib=0.04)
+
+    error = excinfo.value
+    assert "--max-vram" not in (error.hint or "")
+    assert "Close other GPU applications" in (error.hint or "")
+    assert error.details["vram_cap_bytes"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -520,6 +982,72 @@ def test_an_unexpected_failure_is_reported_as_blocked_rather_than_as_a_memory_li
 
     assert plan.regime == REGIME_BLOCKED
     assert "driver fell over" in plan.regime_detail
+
+
+def test_a_failure_on_the_very_first_candidate_quotes_it_rather_than_guessing_a_cause() -> None:
+    """The refusal path for a fault that is not a capacity limit at all.
+
+    The test above lets the first candidate succeed, so the search has something to
+    recommend and the fault only shapes the regime. Here every measurement fails, so
+    nothing is accepted and the CapacityError's hint is all the user gets. The hint is
+    otherwise written for the three limits this planner reasons about -- corpus size,
+    memory budget, time -- and none of them apply: quoting the verdict and the detail
+    verbatim is the only honest answer, and the alternative (falling through to the
+    memory wording, as ``test_a_cap_that_fits_nothing_names_the_flag_rather_than_blaming_the_card``
+    expects for a real memory refusal) would send the user to look at a card that is fine.
+    """
+
+    def broken(model: ModelConfig, **kwargs: Any) -> BenchmarkResult:
+        return BenchmarkResult(
+            ok=False,
+            verdict="error",
+            detail="RuntimeError: the driver fell over",
+            budget_bytes=kwargs.get("budget_bytes", 0),
+        )
+
+    with pytest.raises(CapacityError) as caught:
+        plan_for(dataset(4_000_000_000, 40_000_000), total_gib=80, measure=broken)
+
+    hint = caught.value.hint
+    assert "'error'" in hint
+    assert "the driver fell over" in hint
+    # Not the memory advice: no measurement said anything about memory.
+    assert "--max-vram" not in hint
+    assert "--seq-len" not in hint
+
+
+def test_a_machine_too_slow_for_everything_is_told_to_raise_the_budget_not_free_memory() -> None:
+    """The time branch of the capacity hint, which the search itself cannot reach.
+
+    The smallest rung is exempt from the time cap on purpose -- see ``plan_training``'s
+    docstring -- so a real search always has one measured candidate that was not refused
+    for being slow, and ``test_a_slow_machine_is_compute_limited_by_the_default_horizon_and_says_so``
+    is what that looks like: a plan, not a refusal. The branch stays because the exemption
+    is a decision in one function and this hint is in another, and a hint that told a user
+    to close other GPU applications when the clock was the problem would send them after
+    the wrong thing. Reached here by measuring every candidate as too slow.
+    """
+
+    def sluggish(model: ModelConfig, **kwargs: Any) -> BenchmarkResult:
+        return BenchmarkResult(
+            ok=False,
+            verdict=VERDICT_TOO_SLOW,
+            detail="it would take a fortnight",
+            budget_bytes=kwargs.get("budget_bytes", 0),
+            step_seconds=1000.0,
+            tokens_per_second=1.0,
+            steps_measured=3,
+        )
+
+    with pytest.raises(CapacityError) as caught:
+        plan_for(dataset(4_000_000_000, 40_000_000), total_gib=80, measure=sluggish)
+
+    hint = caught.value.hint
+    assert "--time" in hint
+    assert "--seq-len" in hint
+    # Not the memory advice on a card that had 80 GiB and never ran out of it.
+    assert "GPU applications" not in hint
+    assert "--max-vram" not in hint
 
 
 def test_seq_len_below_the_floor_is_a_usage_error() -> None:
@@ -826,6 +1354,66 @@ def test_a_bigger_card_never_recommends_a_smaller_model(label: str) -> None:
     order = [spec.name for spec in PRESETS]
     small, large = sized(2.0), sized(80.0)
     assert order.index(large.preset_name) >= order.index(small.preset_name)
+
+
+def test_the_accepted_record_is_the_one_the_recommendation_came_from() -> None:
+    """``TrainingPlan.accepted`` has to find the winner, not the first thing that fitted.
+
+    The record list is the audit trail: every rung tried, in order, whichever way it
+    went. Several of them pass -- a rung is accepted as soon as some micro-batch on it
+    fits, and the ladder then climbs to the next -- so "the accepted candidate" is the
+    *last* passing record rather than the first. On a 2 GiB card the passing indices are
+    0, 1 and 3 of nine records: the first is ``tiny`` and the recommendation is
+    ``medium``. Searching forwards would name a model the plan does not recommend, and
+    :attr:`~TrainingPlan.rejected` beside it makes that easy to get wrong, because for
+    that list the direction genuinely does not matter.
+    """
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=2.0,
+        free_gib=1.6,
+        time_budget_seconds=10_000 * 3600,
+    )
+
+    passing = [record for record in plan.candidates if record.ok]
+    assert len(passing) > 1, "a card where only one rung fitted cannot show the order"
+    assert passing[0].candidate.name != plan.preset_name
+
+    accepted = plan.accepted
+    assert accepted is not None
+    assert accepted is passing[-1]
+    # The identity that makes this the accepted record rather than merely a passing one:
+    # it is the measurement the plan reports, and the shape the plan recommends.
+    assert accepted.result is plan.measurement
+    assert accepted.candidate.name == plan.preset_name
+    assert accepted not in plan.rejected
+
+
+def test_accepted_is_none_rather_than_a_guess_when_no_record_passed() -> None:
+    """The empty case, which a plan never reaches but a caller reading a record can.
+
+    ``plan_training`` raises :class:`~trainai.errors.CapacityError` rather than returning
+    a plan when nothing fitted, so every real plan has a passing record. The property is
+    still asked for by anything holding a candidate list -- a report rendering a refusal,
+    say -- and returning ``None`` says "no winner" where the alternatives are raising or,
+    worse, handing back the last rejected candidate as though it had been chosen. Both
+    halves matter, so this drops the passing records from a card that rejected several
+    and then empties the list: a card where nothing was rejected would only ever exercise
+    the empty branch.
+    """
+    plan = plan_for(
+        dataset(4_000_000_000, 40_000_000),
+        total_gib=2.0,
+        free_gib=1.6,
+        time_budget_seconds=10_000 * 3600,
+    )
+    assert plan.accepted is not None
+
+    plan.candidates = [record for record in plan.candidates if not record.ok]
+    assert plan.candidates, "a card that rejected nothing cannot show this"
+    assert plan.accepted is None
+    plan.candidates = []
+    assert plan.accepted is None
 
 
 def test_candidate_describe_does_not_print_a_batch_of_zero() -> None:

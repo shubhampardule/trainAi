@@ -32,6 +32,13 @@ number means. And when the check cannot run, that is reported too: the compariso
 a content hash on both sides, and "could not check" is a third answer rather than a
 quiet pass.
 
+**It scores what the run optimised.** A dataset prepared from a chat corpus carries a
+loss mask, and a run that trained on it minimised cross-entropy over the assistant's
+replies alone. Averaging over every token instead would report a different quantity
+under the same name -- one that cannot be compared to the training curve or to another
+checkpoint of the same run. So the mask is applied when the run's recorded training
+config says it was, and the report says how many of the predicted positions that left.
+
 Evaluation is also not free of the precision question: under bf16 the loss differs
 from fp32 in the third decimal, so the resolved precision is part of the result rather
 than a footnote.
@@ -88,6 +95,13 @@ class SplitResult:
     ``seq_len + 1`` tokens yields only ``seq_len`` of them -- the first token is
     context and is never predicted. Dividing scored positions by split tokens would
     therefore report under 100% on a split that was covered completely.
+
+    ``loss_mask`` says whether only the positions a masked dataset marks as targets
+    were scored, in which case ``tokens_scored`` is smaller than ``positions_seen``
+    -- the target positions the scored windows contained. Both are reported because
+    the two together are what make a masked perplexity interpretable: a number over
+    41% of the positions is a different measurement from one over all of them, and
+    nothing else in the result would say which it is.
     """
 
     split: str
@@ -100,6 +114,8 @@ class SplitResult:
     seq_len: int
     batch_size: int
     stopped_early: bool = False
+    loss_mask: bool = False
+    positions_seen: int = 0
 
     @property
     def perplexity(self) -> float:
@@ -144,6 +160,8 @@ class SplitResult:
             "seq_len": self.seq_len,
             "batch_size": self.batch_size,
             "stopped_early": self.stopped_early,
+            "loss_mask": self.loss_mask,
+            "positions_seen": self.positions_seen,
         }
 
 
@@ -234,6 +252,11 @@ def evaluate_split(
         on_batch: Called with ``(batches_done, tokens_scored)`` after each batch, for
             a progress display.
 
+    The dataset's loss mask is applied when the run's recorded ``TrainConfig.loss_mask``
+    is not ``False``, which is the trainer's own rule -- so the number this returns is
+    the same quantity the training curve reported. There is no flag to override it,
+    deliberately: the two numbers being comparable is the reason to have this function.
+
     Raises:
         UsageError: The split does not exist, or is too small for one window.
     """
@@ -282,13 +305,25 @@ def evaluate_split(
     # message about the split being too small for one sequence is the right one.
     rows = max(1, min(batch_size, windows_available(dataset, split, seq_len=context)))
 
+    # Whether to apply the dataset's loss mask is not this function's decision: it is
+    # the run's, recorded in the checkpoint's training config. `trainai eval` exists to
+    # produce a number comparable to the training curve, and a curve optimised over
+    # assistant replies alone is not comparable to a perplexity over every token --
+    # measured on data/chat-mask, the masked and unmasked losses of the same checkpoint
+    # differ in the first decimal, not the third. So a run trained with --no-loss-mask
+    # is scored on every token and a run trained with the mask is scored on the mask.
+    # ``loss_mask is not False`` matches the trainer's own rule, and a checkpoint
+    # written before masks existed resumes as None, which means "apply if present".
+    use_mask = session.train_config.loss_mask is not False
+
     try:
-        batcher, stream = open_split(
+        batcher, _stream = open_split(
             dataset,
             split,
             seq_len=context,
             batch_size=rows,
             seed=0,
+            loss_mask=use_mask,
         )
     except DatasetError as error:
         # The hint is the loader's, not a restatement. This used to say the split
@@ -308,8 +343,10 @@ def evaluate_split(
             details={"split": split, "seq_len": context, "dataset": str(dataset.root)},
         ) from error
 
+    masked = batcher.has_loss_mask
     weighted = 0.0
     scored = 0
+    positions = 0
     windows = 0
     batches = 0
     try:
@@ -317,26 +354,55 @@ def evaluate_split(
             for batch in batcher.sequential_batches(max_batches=max_batches):
                 inputs = torch.from_numpy(batch.inputs).to(session.device).long()
                 targets = torch.from_numpy(batch.targets).to(session.device).long()
-                with session.autocast():
-                    _, loss, _ = session.model(inputs, targets)
-                assert loss is not None
-                # The model's loss is a plain mean over every target position, so the
-                # weight is the number of positions -- which differs on the last batch.
-                positions = int(targets.numel())
-                weighted += float(loss) * positions
-                scored += positions
+                mask = (
+                    None
+                    if batch.loss_mask is None
+                    else torch.from_numpy(batch.loss_mask).to(session.device)
+                )
+                # Counted before the skip below, so the denominator of the scored share
+                # covers every window walked rather than only the ones that scored.
+                positions += int(targets.numel())
                 windows += int(targets.shape[0])
                 batches += 1
+                # The weight is the number of positions the loss averaged over, which
+                # differs on the last batch -- and, under a mask, on every batch. A
+                # batch holding no target at all is skipped rather than added with
+                # weight 0: the model returns 0.0 for it by a clamped denominator, and
+                # multiplying that by 0 is right but relies on the clamp to not be a NaN.
+                count = batch.trained_tokens
+                if count:
+                    with session.autocast():
+                        _, loss, _ = session.model(inputs, targets, loss_mask=mask)
+                    assert loss is not None
+                    weighted += float(loss) * count
+                    scored += count
                 if on_batch is not None:
                     on_batch(batches, scored)
     finally:
-        stream.close()
+        batcher.close()
 
     if scored == 0:
-        # Not reachable through `evaluate_split`: `open_split` refuses a split with no
-        # windows, and `sequential_batches` always yields at least one batch when there
-        # is one. It guards the division below against a future change to either, and a
-        # test drives it with an empty batcher rather than leaving it unexercised.
+        # Reachable two ways. Without a mask it is not: `open_split` refuses a split
+        # with no windows and `sequential_batches` yields at least one batch when there
+        # is one. With a mask it is real -- a --max-batches cut short over a stretch of
+        # prompts can walk windows that hold no assistant token -- so the message says
+        # which case the user is in rather than reporting the small-split one for both.
+        if masked:
+            raise UsageError(
+                f"None of the {windows:,} sequences scored in the {split} split contains "
+                "a token the loss mask marks as a target.",
+                hint=(
+                    "Raise --max-batches to reach more of the split, or pass a run "
+                    "trained with --no-loss-mask to score every token."
+                ),
+                details={
+                    "split": split,
+                    "seq_len": context,
+                    "windows_scored": windows,
+                    "positions_seen": positions,
+                    "loss_mask": True,
+                },
+            )
         raise UsageError(
             f"The {split} split produced no batches to score.",
             hint=f"At a context of {context} it needs at least {2 * context + 1} tokens.",
@@ -354,6 +420,8 @@ def evaluate_split(
         seq_len=context,
         batch_size=rows,
         stopped_early=windows < batcher.windows,
+        loss_mask=masked,
+        positions_seen=positions,
     )
 
 
@@ -415,6 +483,17 @@ def evaluate(
         f"Perplexity is per token of this run's {session.tokenizer.vocab_size}-token "
         "vocabulary, so it is not comparable to a model with a different tokenizer.",
     )
+    for result in results:
+        if not result.loss_mask:
+            continue
+        share = result.tokens_scored / result.positions_seen if result.positions_seen else 0.0
+        notes.append(
+            f"Scored {result.tokens_scored:,} of the {result.split} split's "
+            f"{result.positions_seen:,} predicted positions ({share * 100:.1f}%): this "
+            "dataset carries a loss mask and this run trained on it, so the number is "
+            "perplexity over the assistant's replies, not over the prompts as well. "
+            "Train with --no-loss-mask to get a number over every token."
+        )
     trained_context = min(session.train_config.seq_len, session.model_config.seq_len)
     beyond = sorted({result.seq_len for result in results if result.seq_len > trained_context})
     if beyond:

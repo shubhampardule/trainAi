@@ -10,8 +10,13 @@ may change between releases. Breaking changes will be listed here explicitly.
 
 ## [Unreleased]
 
-Work toward the first release. See the roadmap in the [README](README.md) for
-which milestones are done and which are not.
+Nothing yet.
+
+## [0.1.0] - 2026-09-10
+
+The first release, and the first tag: everything below is what M0 through M4
+amounted to, and there is no earlier version for it to be a diff against. See the
+roadmap in the [README](README.md) for which milestones are done and which are not.
 
 ### Added
 
@@ -41,6 +46,85 @@ which milestones are done and which are not.
   PyTorch in your environment — at 0%, which no global `--cov-fail-under` can
   detect. Exemptions live in the script with a written reason, and an exemption
   naming a module that no longer exists fails the gate.
+- One net over every CLI option whose valid values are a closed set
+  (`tests/test_cli_choices.py`), because `--precision fp64` was not a
+  `--precision`-shaped bug: Typer validates an `Enum` and a `bool` and nothing else, so
+  every option declared `TEXT` whose values live in its help text is the same bug
+  waiting. Of roughly 120 options, exactly one is a `Choice` the parser can check;
+  61 arrive as unchecked strings. Three claims are enforced over all of them. Every
+  free-text option is classified — a closed set, keyed to the constant that enforces
+  it, or free-form with a written reason — so a new option lands in neither list and
+  fails the gate, which asks "is this a closed set?" at the only moment anyone knows.
+  Every closed set's values appear in the `--help` text that is the only place most
+  people will read them; that check found `plan --max-preset` describing itself as
+  "Do not measure anything larger than this preset" and naming none of the four, now
+  fixed. And every command refuses a value outside its set end to end, by exit code
+  and by a message that lists the real values — the claim being not that a validator
+  exists but that the value a user types reaches it, which is what `--precision` had
+  looked like all along. An entry naming a flag no command accepts fails too, so the
+  lists cannot rot as flags are renamed.
+- `SECURITY.md` — the reporting route (GitHub's private advisory flow, not an email
+  address nobody reads) and, more usefully, an honest scope. The attack surface is the
+  corpus: `data prepare` parses plain text, JSON Lines, JSON, CSV, TSV, `.docx`, SQLite,
+  four compression codecs and zip/tar archives, and every one of those is a parser reading
+  bytes it did not write. A crafted corpus that crashes, hangs or grows without bound is in
+  scope; so is one that makes the *report* lie, because a corpus quietly changing is
+  invisible in the trained model. Out of scope, and said so rather than left to be
+  discovered: loading a `.pt` checkpoint from a stranger is running their pickle, which is
+  why `trainai export` writes safetensors. The hardening that is deliberately absent is
+  listed too — pickled checkpoints, no per-member compression-ratio ceiling (real
+  repetitive JSON reaches 269:1 under gzip, so any threshold that catches a bomb also
+  refuses real corpora; the member count and declared total are bounded instead), and no
+  sandbox — so nobody has to read the source to find out what is not defended.
+- GitHub issue forms and a pull-request template. The forms ask for the three things that
+  decide whether a report is actionable — the version, `trainai doctor`, and the exact
+  command — before it is filed rather than in a reply, and blank issues are off so they
+  cannot be skipped. One of the three is a hardware report, which is the single most
+  valuable thing an outside contributor can send: TrainAI has only ever *run* on NVIDIA
+  CUDA and CPU, on one 4 GiB card. The PR template is the three questions
+  `CONTRIBUTING.md` already asks, in the file that actually gets filled in.
+- A net over the links out of `.github/` (`tests/test_conventions.py`). Issue forms are
+  YAML, so a relative path in one resolves against nothing and every link is an absolute
+  URL with a hard-coded repository name, branch and path — the one place in this
+  repository where renaming a file breaks a link no Markdown tooling will ever look at,
+  and a bad `#fragment` is not an error to a browser. It caught the first draft of these
+  templates pointing at `README.md#roadmap`, on a README whose heading says "Status". The
+  repository name is read from `pyproject.toml`, and a link shape the check cannot resolve
+  is reported rather than skipped: the pattern's first draft read the advisory URL as the
+  bare repository and cheerfully validated it against the README.
+- A release path that stops at a draft: `.github/workflows/release.yml` plus
+  `tools/release_check.py`, which compares the tag, `pyproject.toml`'s version and the
+  `CHANGELOG.md` section and refuses if any two disagree. A tag is the one artifact here
+  that cannot be quietly corrected — it is what `pip install git+…@v0.1.0` resolves, so
+  moving one somebody has already fetched breaks their checkout instead of fixing it. So
+  the same command is meant to be run *before* the tag exists, and the workflow runs it
+  again on the tag push, which is what makes it a gate rather than a note in
+  `CONTRIBUTING.md`. Its three refusals are the three cheap mistakes: a tag naming a
+  version the package does not build, a tag without the `v` that the workflow's
+  `tags: ["v*"]` filter ignores entirely — that one produces no release *at all* rather
+  than a failed one, so it looks exactly like success until somebody goes looking for the
+  artifacts — and a release whose own notes still sit under `## [Unreleased]`.
+
+  What the release workflow does that CI cannot is test the artifact instead of the
+  checkout. CI installs with `pip install -e .`, so it never exercises the files anybody
+  would actually download; the release job installs the **wheel** as a wheel and runs the
+  suite from the **unpacked sdist**, which are the only conditions under which a module
+  missing from the wheel, or a file the tests read missing from the sdist, is visible at
+  all. `pyproject.toml` recorded that pair as verified once by hand, and a check performed
+  once is a claim with a date on it. Running it for real immediately found one: the
+  `.github/` link net above reads a directory the sdist deliberately does not ship, and
+  `rglob` on a missing directory returns nothing rather than raising, so the check had
+  quietly become vacuous there — it now skips with a stated reason, and a separate floor
+  makes zero templates a failure in a checkout.
+
+  The release notes are the changelog section itself rather than a second copy typed by
+  hand, and they are written only after every check has passed, so a refusal cannot leave
+  notes behind for a later step to publish. Nothing here uploads to an index: no TrainAI
+  artifact has ever been published, no token or trusted publisher is configured, and a
+  publish step that has never once succeeded is worse than no step — it turns the first
+  real release into a debugging session and makes the repository look as though
+  `pip install trainai` works. The draft is where it stops, because reading the rendered
+  notes and pressing publish is the last reversible moment.
 
 #### Data pipeline (M1)
 
@@ -77,6 +161,14 @@ which milestones are done and which are not.
   Refuses to overwrite an existing dataset without `--force`, refuses to write
   inside the corpus directory, and re-checks that both passes saw the same corpus
   before writing the manifest. `--json` emits the manifest and nothing else.
+  `--tokenizer PATH` reuses an existing `tokenizer.json` — a file, or the dataset
+  directory holding one — instead of training a fresh one. Without it, every
+  dataset gets its own vocabulary, and a token id means something different in
+  each; a second dataset prepared that way can never be fine-tuned from a
+  checkpoint trained on the first, because the ids are row indices into an
+  embedding matrix. `--vocab-size` alongside it is refused rather than ignored:
+  the loaded file's vocabulary is a fact about the file, and a flag silently
+  dropped is how a dataset ends up not being the one that was asked for.
 - `trainai data inspect` — reports on either a raw corpus or a prepared dataset,
   writing nothing. `--verify` re-hashes every shard, `--layout` explains the files,
   `--sample N` shows the start of the first document. Exits 3 when a corpus cannot
@@ -113,6 +205,349 @@ which milestones are done and which are not.
   seconds without touching the GPU. Refuses to train into an existing run directory
   unless `--resume` or `--force` says otherwise.
 - `docs/checkpoint-format.md` — the checkpoint format and its compatibility promise.
+- `trainai finetune` — continues an existing checkpoint on a different dataset. It is
+  not `--resume`: the weights are inherited, and the optimizer moments, the RNG state
+  and the step counter deliberately are not, because they belong to the schedule of the
+  run that produced them and a fine-tune is a new schedule over different text.
+  It has **no model flags at all** — `--layers`, `--width` and the rest do not exist on
+  it, because `Checkpoint.apply_to` requires an exact shape match, so a flag that parsed
+  could only ever produce a load error phrased as a mismatch the user did not cause.
+  A dataset prepared with a different tokenizer is **refused** (exit 5), before the plan
+  is printed and before the model is built, and so is `--dry-run` on the same pair: a
+  token id is a row index into the embedding matrix, so the same id read through another
+  tokenizer selects a vector trained for different text, and nothing about the resulting
+  loss curve looks wrong. Prepare the second dataset with
+  `data prepare --tokenizer <the base run's dataset>`. The run record carries
+  `finetuned_from` and a `parent` block naming the base checkpoint, its step and its
+  dataset identity, so a tuned run directory can say what it came from.
+  The default `--lr` is `3e-5`, a tenth of the pretraining default, and it is measured
+  rather than assumed — see [docs/finetuning.md](docs/finetuning.md) for the sweep, the
+  trade it shows, and why the conservative end was taken. The data-budget report changes
+  wording for a fine-tune: `20 tokens per parameter` is a from-scratch reference and its
+  remedy ("use a smaller model") is not available when the shape is fixed by the
+  checkpoint.
+- `docs/finetuning.md` — what fine-tuning inherits, what it refuses, and the learning-rate
+  measurement behind the default.
+- `trainai.data.chat` and `--jsonl-messages-field NAME` — a corpus record may hold a
+  **typed conversation**, a list of `{"role", "content"}` objects, instead of a flat
+  string. It is rendered with one fixed, versioned template — the same layout the
+  `chat.jsonl` this project ships already uses, verified byte-identical on 20,000 of
+  20,000 records — and the character spans covering the assistant replies are computed
+  and counted. `data prepare` and `data inspect` report how much of the corpus is
+  replies; the roles are `system`, `user` and `assistant`, and an unknown role is an
+  error listing those three rather than a guess. Works for `.jsonl` and `.json`, and
+  cannot be combined with `--jsonl-field`, which means the opposite thing.
+
+  There is one template, and it is versioned, for the same reason the tokenizer
+  fingerprint is checked: a model trained with one chat layout and prompted with
+  another degrades with no error at all. The input is typed rather than sniffed for the
+  same reason a table needs its column named — finding the replies by searching
+  flattened text for `"Assistant:"` mis-masks any reply containing that string, and a
+  model discussing itself produces many.
+
+  **The loss mask is applied by `trainai train`.** See the entry below for the flag
+  and what the loss does with it; the report says on its own `Loss mask` line whether
+  the mask was written, so the reply share is never left to be misread.
+
+- The loss mask on disk. For a corpus read with `--jsonl-messages-field`,
+  `data prepare` now writes `train_00000.mask.bin` beside `train_00000.bin` -- one
+  `uint8` per token, `1` for a training target and `0` for context. The character
+  spans covering the assistant replies become token ranges at binarize time, using
+  the tokenizer's own per-token offsets rather than a second pass over the text.
+  `--no-loss-mask` opts out; `--loss-mask` on a corpus with no typed conversations is
+  a usage error rather than a mask of all ones.
+
+  `mask_name`, `mask_bytes` and `mask_sha256` live in the same `shards[]` entry as
+  the tokens they describe, so a mask paired with the wrong shard is unrepresentable
+  rather than merely checked -- a misaligned mask has no symptom at all: it trains, it
+  converges, it is slightly wrong forever. They are present or absent as a group, a
+  dataset with a mask on only some shards is refused, and `data inspect --verify`
+  re-hashes every mask alongside every shard.
+
+  A token is selected by **intersecting** a span, not by being contained in one: the
+  tokenizer reports a token beginning with a space as covering only its text, so
+  containment either way would drop or add a token at every boundary. Tokens covering
+  both sides of a span edge are counted (`straddling_tokens`) rather than assumed
+  away; measured on this repo's 20,000-conversation corpus the count is **zero**, and
+  that is by construction -- a span ends on a newline run, which the byte-level
+  pre-tokenizer never merges with the word after it.
+
+  A document with no spans is trained on in full: empty spans mean "no opinion", not
+  "train on nothing", so a `.txt` file beside a `chat.jsonl` is unaffected. The
+  end-of-text token is always a target, because a model never scored on the token that
+  ends a document never learns to stop.
+
+  A dataset prepared **without** a mask writes none of the new keys and none of the
+  new totals, so its manifest -- and its `content_hash` -- are byte-identical to the
+  previous release's. A masked dataset has a different hash from an unmasked one built
+  from the same corpus, which is correct: the mask is part of what was prepared.
+
+  `IngestOptions.to_dict()` gained `jsonl_messages_field`, so a dataset prepared with
+  this release has a different `content_hash` from one prepared with the previous one,
+  even from an identical corpus — the same one-off change the CSV column option caused.
+  Nothing on disk is invalidated: a manifest's recorded hash is what is compared, and
+  existing datasets keep theirs.
+
+- The loss mask reaches the loss. `trainai train` and `trainai finetune` score only
+  the tokens a masked dataset marks as targets, with no flag needed; `--loss-mask`
+  requires a masked dataset rather than training on everything quietly, and
+  `--no-loss-mask` scores every token deliberately. The choice is recorded in
+  `TrainConfig`, so a resume continues the same measurement and `trainai eval` reports
+  the same quantity the training curve did.
+
+  The loss is a **weighted mean** over the selected positions, not `ignore_index=-100`.
+  A window landing entirely inside a prompt selects nothing, and cross-entropy over
+  nothing is `0/0` -- a NaN that reaches every parameter through the backward pass. A
+  clamped denominator makes such a window contribute loss 0 and gradient exactly 0.
+
+  Gradient accumulation weights each micro-batch by **its own scored count**, not by
+  `1/--grad-accum`: micro-batches of a masked dataset score different numbers of
+  tokens, so the fixed factor would make the step's gradient a mean of means. The whole
+  step's batches are read first and each is scaled by its share. On an unmasked dataset
+  this reduces to `1/--grad-accum` exactly, so no existing run changes.
+
+  A step that scores nothing is written to `metrics.jsonl` as an `unscored` event with
+  a null loss, and counted in the result -- not logged as 0.0, which would be a fake
+  minimum in the curve, and not as a NaN, which the divergence check would read as a
+  diverged run. `trainai eval` applies the mask when the run recorded it and reports
+  the scored share, because a perplexity over 41% of the positions is a different
+  measurement from one over all of them.
+
+  `TrainConfig.loss_mask` is optional in a recorded config, so a checkpoint or
+  `plan.json` written before this release resumes as "apply if the dataset has one".
+  No `content_hash` changes: this is a training flag, not an ingest option.
+
+- The dataset records the chat template it was rendered in. `manifest.json` gained a
+  `chat` block -- the template `version`, the role `labels`, and `trained_roles` --
+  present for a corpus read with `--jsonl-messages-field` and empty for prose.
+  `data inspect` shows it as its own `Chat template` row, and `--json` carries it.
+
+  The text in a chat dataset's shards is a **layout**, not just text: a model trained
+  on `User: ...\n\nAssistant: ` and then handed a bare question continues the question
+  instead of answering it, which reads as a bad model rather than as a format
+  mismatch. Recording the layout is what lets anything downstream reproduce it, and
+  what `trainai chat` reads to prompt such a run in it (below).
+
+  Recorded off the *rendering*, not off the mask: `--no-loss-mask` removes the mask
+  and leaves the role labels in the shards, so such a dataset still records its
+  template. One rendered conversation among prose records it too -- the model saw the
+  layout, so it can be prompted in it.
+
+  `version` is the contract, so `labels` holds the bare role names and the colon, the
+  space and the blank line between turns come from `trainai.data.chat` at that
+  version. Recording the punctuation but not the separators would invite a reader to
+  treat the summary as the format and still get the turn separator wrong.
+
+  **No `content_hash` changes.** `chat` is excluded from the reproducible subset: the
+  rendered text is already in the shards and every shard's sha256 is already in the
+  hash, so including the description would only make a dataset prepared before this
+  release hash differently from the same corpus prepared today. It is also the one
+  manifest key that is **optional on read** -- absent means "no chat template", which
+  is what every existing dataset meant by not having it -- and that exception is now
+  written down in [docs/dataset-format.md](docs/dataset-format.md). A `chat` that is
+  present but not an object is still refused by name.
+
+- The checkpoint carries the chat template. Every checkpoint's `dataset` block gained a
+  `chat` key holding what the dataset's manifest recorded, and
+  `InferenceSession.chat_template` reads it back -- surfaced in the session report and
+  in `--json` as `chat_template`.
+
+  Copied in rather than resolved from the dataset path later, because **a run has to
+  stay usable after its dataset is deleted**, which is the same reason the tokenizer is
+  copied into the run directory, and datasets are the large thing people delete once
+  training is done. A model trained on `User: ...` / `Assistant: ` with nothing on disk
+  saying so is a model that answers badly for a reason nobody can look up.
+
+  Recorded from the dataset, not from the run's `--loss-mask` setting: an unmasked run
+  on a chat dataset still saw the role labels, so the layout it has to be prompted in is
+  the same one.
+
+  **No format-version bump and no resume refusal.** `_check_dataset` compares the
+  tokenizer fingerprint and the content hash and nothing else, so a checkpoint written
+  before this release resumes unchanged; `chat_template` reports `{}` for it, for a
+  prose run, and for a `chat` block that is not an object, without distinguishing them.
+  This is what `trainai chat` reads to choose how to prompt a run.
+
+- `trainai.data.chat` gained the two things a generation harness needs from the
+  template: `render_prompt(messages)`, which renders the turns so far and then the
+  `Assistant:` label for the model to complete, and `TURN_BOUNDARIES`, the strings
+  that mark a model having stopped replying and started writing somebody else's turn.
+  Both are what `trainai chat` calls, so the layout has one definition (below).
+
+  `render_prompt` is **derived** from `render_conversation`, not assembled again: it
+  renders one throwaway reply and cuts the text at the span that marks it. A prompt
+  built from its own copy of the label, the colon and the blank-line rule is a prompt
+  that can drift from what the shards hold, and the drift is invisible -- the model
+  answers, a little worse, for a reason no error names.
+
+  **It stops at the colon, not after the space the shards put there**, and a text prefix
+  is not enough to get that right. A byte-level BPE keeps a space with the word after it,
+  so the shards hold `Assistant:` and then one `" Hey"` token and never a lone space
+  token; a prompt ending in the space asks the model to continue from a token sequence
+  that occurs nowhere in its training data, and what comes back is noise rather than a
+  slightly worse reply. Measured on the 4,000-conversation corpus in `data/chat-typed`
+  with the tokenizer trained on it: every prompt is a *text* prefix of the rendered
+  conversation either way, but 4,000 of 4,000 are a *token* prefix when the prompt ends
+  at the colon against 0 of 4,000 when it ends after the space. The model writes the
+  space itself, as part of its first word.
+
+  A conversation with no reply in it renders as a prompt but is still refused as a
+  *corpus record*, which is the one place the two callers legitimately differ: a record
+  whose every token is masked out of every step is worth refusing, and a prompt is
+  exactly that record. A conversation that already ends with a reply is refused with
+  the way to continue it instead.
+
+  `TURN_BOUNDARIES` holds the single-newline form (`\nUser:`) rather than the blank
+  line the corpus separates turns with, because a sampling model writes the label after
+  one newline too; the shorter form matches both, leaving one trailing newline for the
+  caller to strip. Also verified on the real corpus: cutting at the earliest boundary
+  recovers exactly the first reply in 4,000 of 4,000 multi-turn conversations.
+
+- `InferenceSession.complete`, `.stream` and `.stream_pieces` gained `stop`, a sequence
+  of strings generation ends at. The match is cut out of the result, not left on the end
+  of it. This is the other half of the pair above: the strings come from
+  `trainai.data.chat`, next to the renderer that put the labels in the shards, because a
+  sampler with its own copy of `"\nUser:"` is a second place the layout is written down.
+
+  **Matched on the decoded text, not on token ids.** How `"\nUser:"` tokenizes depends
+  on what precedes it, so a token-id comparison would have to enumerate every
+  tokenization of it and would quietly miss the ones it did not think of. Verified
+  against a real tokenizer on `runs/m4`: 8 stop strings each straddling one of that
+  tokenizer's own token boundaries -- so none of them is a token -- all cut the
+  continuation at exactly the character the string starts at, and three label-shaped
+  strings the model genuinely writes (`\nKING RICHARD III:` and friends) cut at 110, 147
+  and 196 characters, with all three passed together cutting at the earliest, 110.
+
+  **A partial match is held back rather than emitted.** The longest suffix of the
+  continuation that is the beginning of a stop string is not yielded until the next token
+  says whether it completes one, because text already on somebody's terminal cannot be
+  taken back. It is flushed if generation ends without completing the match -- a stream
+  that drops it truncates the reply at whatever happened to resemble a label, which loses
+  text the model wrote and is worse than the bug the hold-back fixes.
+
+  **The tokens that spell a stop string are counted**, unlike the end-of-text token,
+  which is a boundary rather than content. They were computed and they took time, so a
+  reported tokens/s that leaves them out is a wrong number about the machine; it is only
+  the text that is discarded. Generation stops on the token that completes the match and
+  does not walk the model again. An empty stop string is refused before anything is
+  generated: it matches at position zero, so honouring it would end every generation with
+  nothing, and dropping it silently would hide the mistake that computed it.
+
+- `trainai chat` prompts a chat-trained run in the template it was trained in. **The
+  checkpoint decides**: a run whose dataset was rendered with `--jsonl-messages-field`
+  records the template, so what you type becomes the `user` message, the model generates
+  after `Assistant:`, and generation stops where it starts writing somebody else's turn.
+  A run that records nothing is prompted with exactly what you type, as before. The mode
+  is on the banner and in `--json` (`mode`, `reason`, `stop`, `chat_template`, and
+  `model_prompt` beside `prompt`), because a default nobody can see is a default nobody
+  can correct.
+
+  **Nothing is sniffed.** Not the prompt -- a question mark is not consent to wrap it --
+  and not the corpus. Two flags override the record, for the two things a checkpoint
+  cannot know: `--raw`, because a chat model is still a base model worth probing, and
+  `--chat`, for a corpus you flattened into `User:`/`Assistant:` text by hand, which
+  trains a chat model and records nothing. `/chat` and `/raw` switch mid-session without
+  reloading the model, and keep the sampling they were switched with.
+
+  **A recorded template from another version is refused, not applied.** Only `version` is
+  compared, which is the documented contract; prompting a model in a layout it was not
+  trained in makes it answer worse *without failing*, so the refusal names both versions
+  and offers `--chat` or `--raw` to say which you meant. Neither the stop strings nor the
+  rendering are written down a second time here -- both come from `trainai.data.chat`,
+  next to the renderer that put the labels in the shards.
+
+  `/more` continues the reply rather than the turn after it: generation stops *at* the
+  newline that began the next label, so in chat mode the trailing newlines come off before
+  the text goes back to the model. Continuing from after that newline asks the model to
+  write the label it was just cut at, which stops immediately and produces nothing. In raw
+  mode every character is kept, because a trailing newline in prose is a paragraph break
+  the model chose. A continuation is passed through unrendered -- it is already model
+  text, and wrapping it in a fresh `User:` would ask the model to answer its own reply.
+
+  The context check counts the prompt the model is given, labels included. Counting what
+  was typed undercounts a chat prompt by whatever the template costs, and that gap is
+  exactly the window where the warning is the only thing between the user and a silent
+  truncation; `prompt_truncated_from` reports the rendered count for the same reason.
+
+  No `content_hash` changes and no new checkpoint keys: this reads what the previous four
+  releases in this section wrote.
+
+- `trainai chat` keeps the conversation in chat mode, so a follow-up question is a
+  follow-up. The corpus this template renders is conversations rather than question/answer
+  pairs -- the typed corpus in `data/chat-typed` is 4,000 of 4,000
+  `user`/`assistant`/`user`/`assistant` -- so a second question asked with the exchange
+  before it in front of it is the layout the model was trained on, and one asked alone is
+  the layout that is not. `/new` forgets it and says how much it forgot. `/chat` and
+  `/raw` keep it across the switch: probing the model unwrapped and switching back is what
+  the pair is for, and losing the conversation to it would make that a one-way door. Raw
+  mode accumulates nothing, because prose has no turns.
+
+  **A conversation too long for the context loses whole messages, oldest first, and says
+  so.** The sampler truncates by token count, keeping the last `seq_len`, which for a
+  conversation cuts wherever the count lands: mid-word, inside a message, leaving a prompt
+  whose first label is half a label -- a layout no corpus contains, which still produces a
+  reply, so nothing about it looks wrong. Messages come off in pairs where they have to,
+  since a corpus conversation begins with a question. The message just typed is never
+  dropped; if it alone does not fit, it is truncated and reported as such. Nothing is
+  reserved for the answer: a prompt that fills the context leaves the sampler sliding its
+  window, which is better than the cut this replaces, and what to reserve is a policy that
+  needs measuring rather than guessing.
+
+- `trainai.data.chat` gained `reply_content(generated, *, continuing=False)` -- the
+  inverse of rendering, and the reason it is in that module rather than in the harness that
+  needs it. Two characters of what a sampler returns belong to the layout: the gap after
+  the label, which the model writes itself because the prompt stops at the colon, and the
+  separator before the next label, which is where generation stops. Store either and
+  rendering the conversation again writes a second one, so the next prompt holds
+  `Assistant:  ` or a triple newline -- invisible in the reply on screen, wrong only in
+  what the model is given next time, which is the failure that module exists to prevent.
+  Exactly one gap comes off rather than an `lstrip`, so a reply that begins with deliberate
+  whitespace is not reformatted, and `continuing=True` takes none off at all: a `/more`
+  continuation was generated from inside the content, where a leading space is one the
+  model meant.
+
+- A generation says **why it ended**, so a reply that finished and a reply that ran out of
+  budget stop being the same thing. Both are text that stops, and only one is worth
+  continuing; guessing from the token count is wrong in both directions, since a model that
+  finishes on its last allowed token reads as cut off and so does one whose stop string
+  matched there. `InferenceSession.stream_pieces` now ends with one extra `StreamPiece`
+  carrying a `Finish`: `"end-of-text"`, `"stop"` with the string that matched, or
+  `"length"`.
+
+  **A piece of its own, not a field on the last real one.** Which token is the last one is
+  known only a token later, so attaching the answer to the piece it describes would mean
+  holding every piece back by a token -- delaying each character to say something about it
+  afterwards, when the point of streaming is that it does not. The extra piece carries no
+  new token, repeats the previous count, and flushes whatever text was still held back
+  behind a partial stop match.
+
+  **An abandoned stream has no reason at all.** Ctrl-C means the caller stopped asking;
+  nothing ended the generation, so `finish` is `None` rather than a reason invented for it.
+  In `chat --json` that pair is the whole point: `interrupted` true with `finish` null is
+  an abandoned generation, `interrupted` false with a `"length"` finish is one the budget
+  cut off, and both are short text that a script could not otherwise tell apart. `Finish`
+  is nested under `"finish"` rather than flattened, because `"stop"` at the top level is
+  already the list of stop strings that were *configured* and one key cannot be both.
+
+  `trainai chat` prints one yellow line, and only for the token limit: *the model was still
+  writing at the N-token limit, so this reply is unfinished*, with `--tokens` named in a
+  one-shot run and `/more` and `/tokens` in the interactive one. A reply that ended at
+  end-of-text or at somebody else's label is a reply that finished, and a line saying so
+  would sit under every well-formed reply this project trains for, which is the same noise
+  as no line at all. Nothing is said for a Ctrl-C, which already printed *Stopped.*
+  Whether a reason means the reply was cut is `Finish.cut`, a property on the type, so no
+  caller compares reason strings and there is no second copy of `"length"` to drift.
+
+  Where two stop strings match at the same position -- `"\nUser"` and `"\nUser:"` both
+  begin at the same newline -- the cut is identical and the one *reported* is the one that
+  came first in the list the caller passed, rather than whatever a loop happened to reach
+  first. No new flags, no new checkpoint keys, and no `content_hash` change.
+
+Measured on the development machine: a 2-layer, 128-wide model (vocab 600, ctx 128)
+pretrained 1,500 steps on a 270,501-token corpus to validation 2.9384, then fine-tuned
+200 steps on a separate 437,931-token corpus prepared with the same tokenizer. Starting
+from the checkpoint, the first training loss was 5.6994 against 6.2837 from scratch, and
+validation 5.5632 against 6.0593.
 
 Measured on the development machine (RTX 2050, 4 GiB, Windows 11), 1.1 MB corpus:
 a 5.3M-parameter model trained at 54,296 tokens/s with a 400 MiB peak, validation
@@ -171,9 +606,10 @@ each is biased by roughly 0.01 nats.)
   from your data** (arithmetic over counted tokens), **rules of thumb** (the learning
   rate, labelled because nothing tested it). It lists what it rejected and why, prints
   the equivalent `trainai train` command in full, and writes `plan.json`. `--time`,
-  `--max-preset`, `--seq-len`, `--precision` and `--device` pin whatever you would
-  rather decide yourself; `--json` emits the plan and nothing else. When nothing fits,
-  the failure carries a real measurement of the smallest shape that was tried.
+  `--max-vram`, `--max-preset`, `--seq-len`, `--precision` and `--device` pin whatever
+  you would rather decide yourself; `--json` emits the plan and nothing else. When
+  nothing fits, the failure carries a real measurement of the smallest shape that was
+  tried.
 - `trainai train --plan plan.json` — applies a plan without retyping it. Explicit flags
   still win, so `--plan plan.json --steps 500` works. A plan from an incompatible
   version, or one whose vocabulary size does not match the dataset it is being applied
@@ -525,7 +961,348 @@ dependencies: everything here is stdlib.
   real outcome — the dataset and the plan are kept, and the one command that resumes
   from there is printed.
 
+#### A memory budget you can set
+
+- **`trainai plan --max-vram 4GB`** — plan against the memory you are willing to spend
+  rather than against everything that happens to be free. The budget was `85% of free
+  VRAM`, computed inside the library and exposed on no command, so the one case it
+  cannot handle had no answer: planning on an idle GPU and then opening a browser, a
+  game, or a second job. The plan stays valid-looking and the run OOMs — or on Windows
+  pages silently — thousands of steps in. The cap takes `6GB`, `6.5GiB`, `512MB`,
+  `2048MiB` or a bare number of gigabytes.
+- **`GB` means `GiB`, deliberately.** Every tool a user reads VRAM from — nvidia-smi,
+  Task Manager, this project's own `fmt_bytes` — reports binary units, and a card sold
+  as "8 GB" holds 8 GiB. Reading `--max-vram 8GB` as 8×10⁹ would report it straight back
+  as "7.45 GiB" and look like TrainAI had quietly shaved it. A bare number means
+  gigabytes for the same reason a bare `--time` means minutes: it is the unit the
+  quantity gets discussed in, and reading `--max-vram 6` as six bytes would reject every
+  configuration there is and call it a memory limit. Unlike `--time` it takes one
+  quantity rather than a sum — `1h30m` is a natural way to say a duration, `1g512m` is
+  not a natural way to say a size.
+- **It only ever lowers the budget.** Raising it would size a plan against memory the
+  device does not have, which means the search measures candidates it cannot hold — the
+  OOM the measurement pass exists to prevent. So a cap above what is free is neither
+  obeyed nor refused: it is reported in the plan's notes as having changed nothing,
+  because the same `--max-vram 12GB` in a shared script is right on one machine and
+  generous on another. A cap on a machine with no VRAM budget at all says that too,
+  rather than being silently ignored.
+- **The plan records what was asked and what applied, separately.** `vram_cap_bytes` is
+  the number the user typed; `provenance.measured.vram_budget_bytes` is what every
+  measured peak was compared against. Comparing them is how a reader tells a small plan
+  on a small card from a small plan that was asked for. The cap sits at the top level
+  rather than under `provenance.measured`, since that block is for numbers a counter
+  reported — filing a typed number there is the category error the three-way split
+  exists to prevent.
+- When a cap fits nothing at all, the capacity failure names the flag — "did not fit the
+  2.00 GiB you allowed with `--max-vram`" — instead of telling the user their machine is
+  too small for a limit they set themselves, which sends them looking at their card.
+
 ### Fixed
+
+- **`trainai plan` said nothing was rejected in the same report that said memory
+  shaped the batch.** The `unconstrained` regime's detail read "Every rung fitted, had
+  the data behind it, and finished inside the time horizon", and it was printed whenever
+  the ladder ran to its end — which is not the same as nothing having been refused. A
+  rung is accepted as soon as *some* micro-batch on it fits, so the top preset can be
+  reached only by halving the batch and accumulating: measured on synthetic cards over a
+  4 B-token corpus, that is 3 rejections at 3 GiB, 2 at 4 GiB and 1 at 6 GiB, each of
+  which printed the sentence claiming otherwise. Two rows below it the same report
+  already said "Gradient accumulation is in use: 32 sequence(s) at a time, 2 times per
+  step … That is what made this shape fit", so the plan contradicted itself, and the
+  contradiction pointed the wrong way: "nothing was rejected" is the one reading that
+  means a bigger card would change nothing.
+
+  The regime set is unchanged — `unconstrained` is the right name for a ladder that ran
+  out, and it is a documented, machine-readable value that `plan.json` consumers key on.
+  What was false was the prose, so `regime_detail` is now built from the record rather
+  than assumed: it reports the rejections it counted and names the last of them, since
+  that is the shape a user would try next, and when the accepted candidate accumulates it
+  says memory shaped the batch rather than the model, with the effective batch and the
+  factor. "Every candidate fitted first time" is kept for the case it was written for and
+  is now reachable only when nothing was refused at all. `docs/plan-format.md` carries the
+  matching caution, and `train.grad_accum` above 1 is the same fact as a number.
+
+- **`chat` lost the start of the conversation mid-reply without saying so, and the
+  reserve that was supposed to fix it is measurably the wrong fix.** `--tokens` defaults
+  to 200 while `tiny`'s context is 256 and a measurement model's is 128, so a reply that
+  runs to the limit is the ordinary case rather than a corner one. Past the context the
+  sampler's window holds nothing but the model's own output: the question is gone, the
+  text still looks fluent, and nothing on screen distinguished that from a reply the
+  model simply chose to write.
+
+  `_fit` recorded the open question in its docstring — what to reserve for the answer
+  when `--tokens` is larger than the whole context, "a policy that needs measuring, so it
+  is not guessed at here". It has now been measured, and the answer is to reserve
+  nothing, for a reason that is arithmetic rather than empirical. Reserving `r` means
+  fitting the prompt to `seq_len - r`, and the window slides anyway once the reply
+  outgrows `r`; with a prompt of `P` in a context of `C`, the window holds `P` tokens of
+  conversation until generated token `C - P` and `C - i` from then on, and a larger
+  budget never keeps fewer whole messages, so `P` is largest at `r = 0`. Counted over
+  216 held-out sessions built from `data/chat-typed`'s validation split, against
+  `--tokens 200` on a 128-token context: **0 of 172,800 positions** where any reserve of
+  8, 16, 32 or 64 showed the model more of the conversation than reserving nothing. The
+  mean fitted prompt falls from 114.0 tokens to 53.0 across that range — the reserve
+  spends the context sooner, it does not save it.
+
+  What a reserve does buy is a window whose front is still a message boundary, which is
+  the property `_fit` exists for. Teacher-forced against the same 216 held-out replies on
+  a 128-context model (`runs/_ctx`, best val loss 0.1169), simulating the slide exactly —
+  `slide_caches` re-anchors rotary keys to zero and matches a fresh forward pass over the
+  same window to 2.98e-08, so a forward over the last `seq_len` tokens is what generation
+  computes: the slide put the window's front mid-message for **11.0%** of generated
+  positions at no reserve and **0.0%** from a reserve of 16 up, while the loss moved from
+  **0.0058 to 0.0055 nats/token** — perplexity 1.006 against 1.005. That corpus is
+  memorised at those numbers, and it is the only chat corpus here, so the honest reading
+  is that the alignment is worth an amount this repository cannot measure, against a
+  context cost that is certain. Those replies average 11.8 tokens, which is also why the
+  loss sweep never reaches the eviction: it takes 128 generated tokens, and the counting
+  above is what covers that case.
+
+  So no reserve was added. Instead the slide is reported, after the reply rather than
+  before it: once generation ends, `chat` says how many of the reply's tokens had the whole
+  prompt in the window and how many were written without its start. Predicting it from
+  `--tokens` instead would have printed a warning on every turn of a small model, since the
+  budget is an upper bound most replies never reach — a note on every generation is a note
+  nobody reads. `--json` carries the same figure as `window_slides_after`, alongside the
+  existing `prompt_truncated_from`; the two are mutually exclusive, because a prompt that
+  never fitted had its front cut before generation started and describing that loss twice
+  is two yellow lines about one thing. Aligning the *slide* to message boundaries would buy
+  the layout without the context cost, and wants a corpus where old turns are load-bearing
+  before it earns the layering it would take — `data/chat-typed` answers "what is 2 + 2?"
+  the same with or without the turns in front of it.
+
+- **CI was red on Python 3.10 from the commit that added the release check.** Both 3.10
+  jobs — ubuntu and windows — failed four tests in `tests/test_release_check.py`, while
+  3.11, 3.12 and 3.13 passed on both platforms and the local suite was green. One cause:
+  `tools/release_check.py` reads `project.version` with `tomllib`, which is stdlib only
+  from 3.11, and this project supports 3.10.
+
+  The script's refusal below 3.11 is deliberate and stays. Its own docstring gives the
+  reason — a regex is the worse trade for a script whose entire job is catching a version
+  that is a near-miss — and the release workflow pins 3.12, so the path that matters is
+  never the one that refuses. What was wrong was the tests: they called it on 3.10 and
+  asserted the answer they get on 3.12.
+
+  The six tests that parse a real `pyproject.toml` now skip below 3.11, spelling the
+  boundary the way the script spells it, which is the guard `tests/test_conventions.py`
+  already applies to its four `tomllib` readers. Two of those six were not failing — they
+  assert exit 1, and the interpreter refusal is also exit 1, so on 3.10 they passed
+  without going near the tag or the notes file they exist to check. Skipping them is what
+  makes them honest; leaving them would have been the more comfortable kind of green.
+
+  A skip on two of six matrix jobs is a hole of its own, so one new test asserts something
+  on every interpreter instead: below 3.11 the refusal has to name both the interpreter it
+  found and one that works — the alternative a contributor gets is `ModuleNotFoundError:
+  No module named 'tomllib'` and a guess — and from 3.11 the same call has to return the
+  version. One test with two branches rather than two tests each skipped somewhere, so
+  neither branch can rot on the interpreter that does not run it.
+
+  Only 3.13 is installed on the development machine, which is how this reached `main`
+  twice: the local suite cannot run the failing path at all. The sub-3.11 branch was
+  proved by forcing `sys.version_info` below the floor, which reproduces the refusal
+  verbatim (`... needs Python 3.11 or newer for tomllib, and this is 3.10`) and confirms
+  `main` turns it into exit 1 with a tag that is otherwise correct — the vacuous pass,
+  demonstrated rather than argued. The 3.10 jobs are the real gate.
+
+  Two conventions tests now hold the interpreter list itself, because `requires-python`,
+  the PyPI classifiers and the CI matrix are three hand-edited copies of one fact and
+  nothing compared them. The floor has to equal the oldest version in the matrix — pip
+  enforces the floor, and a job running there is the only thing that makes it true — and
+  every version the classifiers advertise has to be one CI runs, since that list is what
+  PyPI's sidebar shows to people who will never read `pyproject.toml`. Both fail when
+  they should: raising the floor to `>=3.11` without pruning the matrix fails the first,
+  and dropping `3.10` from the matrix fails both. The floor is compared and the ceiling is
+  not, deliberately: classifiers lagging a brand-new Python is a normal few weeks, while
+  an advertised version with no job behind it is a claim.
+
+- **Four of the five commands that read a checkpoint told the user to fix it with a flag
+  they had not typed.** "Point `--resume` at a file written by `trainai train`" is the
+  hint for a file that is not a checkpoint, and it is correct only for `train --resume`.
+  `load_checkpoint` is also reached from `finetune --from`, `chat`, `eval` and `export`,
+  and it is not told which — so pointing `finetune --from` at a `torch.save(model, path)`
+  file diagnosed it precisely and then named the wrong option to correct it with. The hint
+  now names the three shapes accepted instead of a flag, which is advice every caller can
+  act on and matches what `--resume`'s own help text already said.
+
+  This is the same defect as the hints naming flags that do not exist, below, and it shows
+  the limit of the test written for those: it checks each flag a finding names against the
+  click parameters of the command that raises it, and `--resume` passes that check because
+  it is a real flag on a real command. There is no equivalent test to add here, because
+  there is no command to check against — `load_checkpoint` is one function reached from
+  five commands, and the only hint that can be right for all five is one that names no
+  flag. Verified by pointing each of `finetune --from`, `chat`, `eval` and `export` at a
+  `torch.save(model, path)` file: each still exits 5 naming what the file holds, and none
+  now mentions an option its own `--help` does not list.
+
+- **The test suite had been red on every push for four commits, on a test that
+  asserted a property of the CPU rather than of the code.**
+  `test_a_mask_of_ones_gives_exactly_the_unmasked_loss` compared
+  `F.cross_entropy(reduction="mean")` against `(per_token * weights).sum() /
+  weights.sum()` with `==`. Those are the same arithmetic in two different float32
+  accumulation orders, so whether they agree bit-for-bit depends on the vector width
+  of whatever machine is running them. They agree exactly on the development machine
+  — the gap is `0.0` there, which is why it was written that way and why it could not
+  be reproduced locally — and on a hosted runner the pair came out
+  `4.196225166320801` against `4.196224689483643`: `4.77e-7` absolute, `1.14e-7`
+  relative, **1.9 float32 ulps**. The failing job set moved between runs (Ubuntu
+  3.10–3.13 in varying combinations, `windows-latest` py3.12 once) with an identical
+  `torch 2.14.0+cpu` in both the passing and the failing Ubuntu jobs, which is what
+  identifies the variable as runner hardware rather than Python version.
+
+  The assertion is now a tolerance, `rel=1e-6`, and — because a tolerance on its own
+  weakens the claim — the formula is pinned separately by an exact float64 reference
+  computed in the test rather than by the other float32 path. The tolerance itself is
+  a test subject: `test_the_loss_tolerance_admits_the_gap_a_real_runner_produced`
+  holds the measured pair as a witness and asserts it from both sides — that `1e-6`
+  admits a gap a real runner produced, that the gap is a rounding gap and not a
+  formula error (under 4 ulps), and that the tolerance stays below `1e-4` where a
+  formula error would start to hide. Tightening it back to `1e-9` and loosening it to
+  `1e-3` both fail. The two code paths in `gpt.py` were deliberately **not** merged
+  to make the difference vanish: that would replace a measured agreement between the
+  shipped hot path and the masked path with a comparison of one code path against
+  itself, which is the weaker claim wearing the stronger operator. The rest of the
+  suite was swept for the same class of assertion; the remaining exact float and
+  `torch.equal` comparisons all compare a value against itself, against a slice of
+  itself, or across a save/reload of identical weights through identical code, where
+  bit-equality is a real guarantee.
+
+- **Two documents described a repository that no longer exists.**
+  `docs/hardware-support.md` still said the repository had no remote and that therefore no
+  CI run had ever happened — a claim `tests/test_conventions.py` has had a net for since
+  the same claim went stale in the README, and which every one of that net's six phrasings
+  missed, because they are all built around "never" *following* "CI" and that sentence put
+  "no" in front of it. It now says what is and is not continuously verified: the CPU
+  suite on two platforms and four Python versions is, a GPU is not and cannot be from a
+  hosted runner. Two phrasings were added to the net, and the escaped sentence itself is
+  pinned in the test — verbatim, where a net that scans Markdown cannot trip over the
+  quotation — as the thing they have to keep catching, so an entry added by guess is
+  distinguishable from one added by a failure. `CONTRIBUTING.md`'s scope section still
+  listed fine-tuning as out of scope, three milestones after `trainai finetune`,
+  `docs/finetuning.md` and `tests/test_cli_finetune.py` shipped; it now draws the line
+  where the code does — your own checkpoints on a second corpus, and no LoRA, adapters or
+  imported weights.
+
+- **`trainai quickstart` could not run at all, on any input.** The CLI accepts
+  `--jsonl-messages-field` there and forwarded it to `run_quickstart()`, which did not
+  take that parameter, so every invocation died on a raw
+  `TypeError: run_quickstart() got an unexpected keyword argument` before doing anything.
+  The command a first-time user is pointed at first was the one command that was
+  completely broken. It was missed by 2,320
+  passing tests because every quickstart test called `run_quickstart()` directly, so the
+  argv path in `cli/main.py` had no coverage at all while `main.py`'s ten other commands
+  kept the module comfortably above its per-module coverage floor. The flag is now
+  threaded through all four places it has to reach — the signature, the `_Reading` record,
+  the `data prepare` call, and the reader that takes the sample prompt from the corpus's
+  own opening — and the copyable command printed above step 1 shows it, which it did not
+  before. Two nets close it: a static one that resolves every `run_*(...)` call in
+  `cli/main.py` against the signature it actually calls, in both directions, so a
+  forwarded flag no implementation accepts and a required argument no command passes both
+  fail; and a registry over `_Reading`'s own fields, so a sixth reading flag cannot arrive
+  without a test that it reaches both steps that read the corpus.
+
+- **`--precision fp64` was accepted, silently treated as `auto`, and then reported as
+  though that had been the ask.** Typer validates an `Enum` and a `bool` and nothing
+  else, so an option declared `TEXT` whose valid values live only in its help text
+  arrives as an unchecked string — and `Precision = Literal["auto", "bf16", "fp16",
+  "fp32"]` is erased at runtime, so it validated nothing either. `precision_for` had
+  branches for cpu/mps, fp32, bf16, fp16 and then a fall-through comment reading
+  `# auto`; an unknown value matched none of them and fell through. The failure is worse
+  than an ignored flag: on a card that supports bf16, `--precision bf6` — one character
+  off — got exactly what `bf16` would have given, the same dtype and the same
+  "supported by this cuda device" note, so a run asked for a precision that does not
+  exist and answered with a plausible one. A misspelt flag *name* is caught by the
+  parser; a misspelt flag *value* had nothing to catch it.
+
+- **`--device gpu` failed with a traceback listing twenty backends TrainAI cannot train
+  on.** The string went to `torch.device`, which refuses it with a bare `RuntimeError`
+  naming what torch was compiled with — `mkldnn`, `opengl`, `ideep`, `ve`, `fpga`,
+  `lazy` — and only `TrainAIError` is rendered without a traceback, so the error escaped
+  the CLI boundary raw. TrainAI has a training path for five device names, and five is
+  the list the user now gets. `--device cuda:` was a second way in: `"cuda:".partition(":")`
+  yields an empty index, which is falsy, so the index check was skipped and torch raised
+  again. Validation branches on the separator now, and `cuda:1` — the only way to choose
+  between two cards — still works.
+
+- Both are fixed by one shared `trainai.errors.check_choice`, which also replaces the
+  three hand-rolled copies of the same raise that already existed (covering `--which`,
+  `--split`, and `--format`/`--dtype`) and names a near miss when there is one. The `difflib` cutoff sits at 0.7 rather than the
+  default 0.6 deliberately: at 0.6, `--device gpu` is answered with "did you mean xpu?",
+  a confident wrong answer to someone holding an NVIDIA card. Listing the real values and
+  suggesting nothing is the better failure. Every real near miss still lands —
+  `bf6`→`bf16`, `fp64`→`fp16`, `laest`→`latest`, `safetensor`→`safetensors`. The
+  precision and device lists are now derived from their `Literal` types with `get_args`
+  instead of being written out beside them; there were three copies of the precision list
+  and five of the device list, and two `--device` help texts had already drifted, omitting
+  `xpu`. Values are checked before the checkpoint is read, so a typo does not cost a
+  multi-gigabyte load first.
+
+- **Every real training run printed each data-budget note twice.** `Trainer.run` logs
+  `budget.warnings()` when it starts, and the CLI's `Data budget` panel printed the same
+  strings as `What to expect` bullets a few lines above it, so a run whose corpus was
+  both data-limited and only partly read said four things where two were true. The
+  trainer's copy is the one that stays -- it is the layer a caller cannot skip, and a
+  corpus quietly being memorised is exactly what `trainai.train.budget` exists to
+  announce, so the announcement cannot depend on going through the CLI. `--dry-run`
+  keeps the bullets, because it never builds a trainer and would otherwise print no
+  advice at all in the one command whose whole purpose is answering whether the run is
+  sensible.
+
+- **On Apple Silicon the planner had no memory opinion at all, so an oversized model
+  was found out by the crash rather than by the plan.** `probe_hardware` returned an
+  empty `gpus` list on MPS, which made `primary_gpu` `None`, which made
+  `vram_budget_bytes()` return 0 — and the planner's over-budget check is gated on a
+  positive budget, so it never ran on any Mac. The probe now builds one `GPUInfo` from
+  `torch.mps.recommended_max_memory()`, Metal's declared working-set ceiling, minus what
+  torch already holds, capped by what the OS reports free. The cap is the point: memory
+  is unified, so the ceiling knows nothing about the other processes on the machine and
+  a 24 GiB Mac with 3 GiB free has a 3 GiB budget. Where no ceiling can be read the
+  behaviour is unchanged — no budget, chosen by measurement — but the user is now told
+  instead of getting a silent 0 that reads as "fits fine".
+
+  Peak memory is deliberately **still** reported as not measured on Apple. `torch.mps`
+  exposes no `max_memory_allocated` and no `reset_peak_memory_stats`, so there is no
+  peak to read; sampling the current allocation and calling it a peak would be a
+  fabricated number in the one field whose job is to say whether a number was measured.
+  A test asserts both halves, so the honest half cannot be quietly "fixed" later.
+
+  `doctor` labels these numbers as a ceiling and usable headroom rather than as
+  "VRAM free of total", because there is no dedicated pool to be free of. It also stops
+  printing "TF32 no" on every non-NVIDIA backend, which read as the hardware falling
+  short of something rather than the concept not applying.
+
+- **`chat` asserted that nothing in the model's training data was a dialogue, which
+  this repo itself made false.** The banner and `chat --help` both stated it as a flat
+  fact. The repo ships `data/corpus-assistant/chat.jsonl` — 651,448
+  `User:`/`Assistant:` examples — so anyone who trained on the assistant corpus was
+  told, by the tool, that their dialogue data did not exist. A checkpoint records its
+  dataset's `content_hash`, not its contents, so `chat` genuinely cannot tell prose from
+  dialogue; it now states that the answer depends on the corpus and leaves the corpus to
+  the person who chose it. The test covering the banner had pinned the false phrase, so
+  it was asserting the bug; it now asserts the dependency is named and that the old
+  claim is absent.
+
+- **`--steps` documented a default the cap did not honour, and nothing reported the
+  difference.** The help text read "Defaults to about three passes over the training
+  split" and stopped there. The derived count is capped at 20,000 steps, which on this
+  project's own 633,422,803-token prepared dataset at the default 2,048 tokens per step
+  is 0.065 of one pass — the documented default was wrong by a factor of forty-six, in
+  the direction of doing less work than promised, and a user who typed no `--steps` at
+  all had no way to find out that a cap rather than their corpus decided how much of
+  their data was used. The help text now names the cap and what it means on a large
+  corpus, the three-pass target and both bounds are named constants (`DERIVED_EPOCHS`,
+  `MAX_DERIVED_STEPS`, `MIN_DERIVED_STEPS`) instead of literals buried in one
+  expression, and `DataBudget.warnings()` gained the mirror of the existing memorising
+  warning: when a run makes under one full pass it reports how many tokens are never
+  read and what `--steps` would reach a full pass. On the dataset above that is
+  592,462,803 tokens never read, and `--steps 309,288` to reach one pass. The note
+  states the measurement and does not call it a mistake — under one epoch is normal and
+  correct when the corpus is large for the compute. `tokens_never_read` and
+  `leaves_corpus_unread` are in the budget's JSON. An explicit `--steps` is still never
+  capped.
+
+  The negative-control test for `warnings()` had to be corrected to notice this: its
+  "well proportioned" run processed 100,000 tokens of a 100,000,000-token split, which
+  it got away with because it was written to dodge only the two checks that existed.
 
 - **`trainai setup` told every Windows AMD user their GPU was unusable, which stopped
   being true.** The advice read "PyTorch has no ROCm build for Windows, so an AMD GPU
@@ -2142,7 +2919,182 @@ dependencies: everything here is stdlib.
   Where validation already worked nothing moved: the same run at `--batch-size 1`
   reports 5.7584 before and after.
 
+- **The walkthrough prepared one dataset and trained from another, so following it
+  verbatim failed at the fourth step.** [docs/walkthrough.md](docs/walkthrough.md) wrote
+  `trainai data prepare data/corpus --out data/shakespeare` and then, five steps and 110
+  lines later, `trainai plan --data data/shake` — the name the recorded transcripts use.
+  A reader who typed what the page said got `No manifest.json in data/shake`, an error
+  that reads like their own typo rather than the page's. The three commands naming
+  `data/shakespeare` now name `data/shake`, which is the spelling the transcripts below
+  them cannot be edited to match.
+
+  Neither of the two checks that guard flag and command spelling could see this: both
+  paths are real directories and both commands are real, so the mistake is only visible
+  as *dataflow*. A recipe page is now checked as a sequence — every directory a `--data`
+  or a positional run argument reads must be a directory an **earlier** `--out` on the
+  same page wrote — which catches a renamed step, a reordered one, and this. Only fenced
+  `bash` blocks count as steps, since a transcript's paths are whatever the machine that
+  recorded it used.
+
+- **Two checks read `.github/workflows/ci.yml` unguarded, so the suite failed when run
+  from an unpacked sdist.** `test_ci_runs_the_oldest_python_the_package_says_it_supports`
+  and `test_every_python_the_classifiers_advertise_is_one_ci_runs` both call
+  `matrix_versions()`, which read the workflow directly; the sdist deliberately does not
+  ship `.github`, so both raised `FileNotFoundError` there. That is the one place it
+  mattered — `.github/workflows/release.yml` runs the suite from the unpacked sdist on
+  every tag, so the first real release would have gone red on two tests that have nothing
+  to do with the release. Their siblings already skipped for exactly this reason;
+  `matrix_versions()` now does too, and deleting `ci.yml` in a checkout still fails
+  outright at `test_there_are_github_templates_to_check`, which names that path.
+
+  Found by building the wheel, cold-installing it into a clean virtualenv and running
+  the sdist's own suite against it — not by any run from a checkout, where the file is
+  always present.
+
 ### Changed
+
+- **Four tests that only asserted anything on Windows now assert it everywhere.** Three
+  archive tests in `test_data_ingest.py` and one mask-map test in `test_data_binarize.py`
+  proved a handle had been released by doing something to the file afterwards —
+  `path.unlink()` for the archives, rewriting the bytes for the mask. Both raise
+  `PermissionError` on Windows while a map or a handle is open, so both are real proofs
+  there. On Linux, unlinking and rewriting an open file are ordinary operations that
+  succeed whether the handle leaked or not, so on the four Ubuntu jobs — half the CI
+  matrix — the tests passed unconditionally. A leak reaching those jobs first would have
+  been caught by nothing.
+
+  The closed state is now read directly, which works on every platform: `ZipFile.close`
+  clears `fp`, `TarFile.close` sets `closed`, and the loader's memory maps are tracked by
+  weak reference and have to be dead after `close()`, which is the release that `close()`
+  actually claims. Each test keeps the Windows operation below the portable assertion,
+  because a lock on a file the user is about to re-prepare is the consequence they hit.
+  Both helpers refuse to pass vacuously: if nothing was opened at all, they say so rather
+  than reporting that everything opened was closed.
+
+  Recording the containers has one trap worth writing down. `tarfile.open` is a bound
+  classmethod of the real `TarFile`, captured at import, so patching `tarfile.TarFile`
+  intercepts nothing and the tar test would have gone straight back to proving nothing;
+  the wrapper goes on `tarfile.open` instead. `np.memmap` is wrapped rather than
+  subclassed, since an ndarray subclass brings `__new__` and `__array_finalize__` with it
+  and none of that is needed to note what was opened.
+
+  Nothing in `src/` changed. The lifecycle was audited first and is correct: `documents()`
+  closes the archive in a `finally`, which covers a caller that abandons the generator
+  (sampling does), `discover()` uses `with`, `_MemberStream` closes owned streams
+  innermost-first, and `TokenBatcher.close` releases the mask stream as well as the token
+  stream. Each of the four was confirmed against a deliberately broken version — the
+  `finally` removed, and the mask stream left open — and each failed on the portable
+  assertion rather than on the platform-specific line beneath it. A new third archive test
+  covers `.tar`, since `_close_archive` is shared and only `.zip` was reaching it.
+
+  Found by scanning every `test_*` function for a body containing no assertion, no
+  `raise`, and no `raises`/`warns` context — a test that cannot fail is worse than no
+  test, because it holds a coverage number and a name that says the behaviour is checked.
+
+- **Seven names nothing called are gone.** Found by asking, of every module-level
+  definition in `src/trainai`, whether the identifier appears anywhere else in the
+  repository at all — and reading the answers rather than trusting them, since a private
+  helper used only inside its own file is not dead and a name in a docstring is not a use.
+
+  Four functions were defined, exported by nothing, and called by nothing:
+  `cli/train.py`'s `describe_presets` — a preset list "for `--help`" that `--help` does
+  not use, in a format neither `--preset` nor `--max-preset` prints; `cli/eval.py`'s
+  `describe_report` and `cli/plan.py`'s `describe_plan`, each "for the web interface in
+  M5" and each a one-line alias for a `to_dict` the caller can reach itself; and
+  `probe.py`'s `python_summary`, "useful in bug reports" and absent from `doctor`,
+  `doctor --json`, and the issue templates. Three exception classes went with them:
+  `HardwareError` and its `NoAcceleratorError` and `InsufficientMemoryError` subclasses
+  were raised nowhere, caught nowhere, and shared `ExitCode.CAPACITY` with the
+  `CapacityError` that does the work. That is worse than unused — it is an invitation to
+  raise the wrong one, since a contributor reaching for `InsufficientMemoryError` on an
+  OOM would produce something indistinguishable at the exit code and unreachable by
+  anything that handles `CapacityError`. `CapacityError`'s docstring now records what
+  used to be there and why "not enough VRAM" is one error rather than two, and why "no
+  GPU" is not an error at all when `doctor` reports it, `plan` measures the CPU, and
+  `train` runs there.
+
+  `describe_plan` had a test, which is how it survived: `assert describe_plan(plan) ==
+  plan.to_dict()` against a body of `return plan.to_dict()` — true by construction, green
+  for any plan, and coverage on a line that could not fail. What it was standing in for
+  was never checked, so it is now: `--json` both prints a plan and writes one, and the
+  test compares the two documents whole.
+
+- **Reading a checkpoint no longer runs it.** `load_checkpoint` was the one place in the
+  package that called `torch.load` without `weights_only=True`, which means it imported
+  and called whatever the file named. That is not a theoretical exposure: a checkpoint is
+  the artifact people copy between machines and attach to issues, and `trainai finetune
+  --from` takes its path straight off the command line. The load is now restricted, which
+  required a format change — `trainai-checkpoint` is at **version 2**.
+
+  What stood in the way was a single NumPy array. The restricted unpickler will not build
+  one, and `np.random.get_state(legacy=True)` returns 624 `uint32` words of MT19937 state
+  inside a tuple. Measured rather than assumed, by allowlisting a real checkpoint's
+  refusals one at a time until it loaded: **four globals**, all NumPy's, all reachable
+  from that one array. With those four allowed the rest of the file loaded untouched — so
+  the optimizer moments, the config dicts, the metrics and Python's own `random` tuple
+  never needed the unsafe loader at all. Version 2 stores the same 624 words as a tensor,
+  which is what the rest of the file is made of anyway.
+
+  A **version-1 file is refused by name**, not migrated, and that costs somebody a
+  half-finished run. Reading its random state would need exactly the loader this change
+  exists to stop using, so a converter would reintroduce the exposure for every file it
+  touched in order to recover one field. Two alternatives were considered and rejected on
+  the measurements rather than on taste. Falling back to the unrestricted loader when the
+  strict one refuses reads as a kindness and is a hole: the fallback triggers on every
+  file the restriction was protecting against. `torch.serialization.safe_globals` is the
+  bounded version of that idea, and it needs torch ≥ 2.5 against this project's
+  `torch>=2.2` floor, with NumPy global names that move between NumPy versions
+  (`numpy._core` versus `numpy.core`) — a permanently fragile branch for a format whose
+  installed base is a contributor's working directory, since version 1 shipped in no
+  release. The refusal says which of those it is and what to do instead.
+
+  The restriction would have destroyed the best error message in the module. Pointing
+  `--resume` at the output of `torch.save(model, path)` is the most common mistake anyone
+  makes with PyTorch, and it used to answer *the file holds a `Linear`* — because the
+  unrestricted load succeeded and the object could be looked at. Under the restriction
+  that load fails first, and the naive result is "could not be read" for every cause at
+  once. So the diagnosis now comes from **reading the pickle without executing it**:
+  `torch.save` writes a zip whose `data.pkl` member is the pickle, and
+  `pickletools.genops` walks its opcodes, listing every global the file *would* have
+  imported while importing none of them. Pure stdlib, no torch version to depend on.
+  Three shapes are told apart — a saved `nn.Module`, a version-1 checkpoint, and damage,
+  the last with the imports named so a reader can tell which it was.
+
+  Two details of that scan are worth recording because they are invisible until they are
+  wrong. Which opcode names an import is a property of the pickle's *protocol*, not of its
+  contents, so both `GLOBAL` and `STACK_GLOBAL` are read: torch writes protocol 2 today
+  and a checkpoint-shaped file from another tool can arrive at 4 or later. And protocol 2
+  still spells a builtin the Python 2 way, so the same `dict` reads as `__builtin__.dict`
+  there and `builtins.dict` at protocol 5 — which is why the check matches on a
+  `torch.nn.` prefix rather than on a table of exact names, a table that would have to
+  carry both spellings of every entry and would silently miss whichever one it was not
+  written against.
+
+  The whole change is invisible in the happy path — the suite passed unaltered when it
+  first landed, which is the gap rather than the achievement, because it means a revert
+  would also pass. There are three ways to undo it and they are three different edits, so
+  there are three gates. Putting the argument back to `False` is caught by tests that load
+  a checkpoint carrying a reduced object and require a refusal. Having `capture_rng` hand
+  over `np.random.get_state()` unconverted — a one-line simplification that looks
+  obviously right — is caught by reading the pickle a real save produces and requiring no
+  NumPy import in it. And adding a *second* `torch.load` somewhere else in the package,
+  by someone with no reason to know why the first one is careful, is caught by a source
+  scan asserting there is exactly one and that its argument is the literal `True`.
+
+  That third one is why the argument is passed explicitly rather than left to the default.
+  The default is only `True` on a torch newer than this project's floor, and — read out of
+  torch 2.10's `serialization.py` rather than assumed — the environment variable
+  `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD` forces the unsafe loader *only* where the call site
+  did not set the argument. An explicit `True` puts the choice beyond the reach of a
+  variable somebody exported for another library.
+
+  `SECURITY.md` changed with the code, in both directions. "Checkpoints are pickles, not
+  safetensors" left the list of hardening that is deliberately absent, and *getting
+  TrainAI to load a checkpoint without the restriction* joined the list of things worth
+  reporting. What stays out of scope is a bypass of the restriction inside PyTorch, which
+  is torch's to fix and this project's to ship by raising its floor — the honest boundary
+  being that the guarantee is a dependency's, while what TrainAI promises is the narrower
+  and checkable thing: it does not ask for the unrestricted loader anywhere.
 
 - **The project has a real address, so the placeholder URLs are gone.** `[project.urls]`
   carried `https://github.com/trainai/trainai` under a comment saying so, `tokenizer.py`
@@ -2323,8 +3275,9 @@ pessimistic by 2.3x on another (step 163 predicted, step 375 actual). What it ge
 right is that the last checkpoint will not be the best one, which is what TrainAI
 acts on — the best is tracked and kept wherever it lands.
 
-One correction to the record: the commit message for `M4 (part 3)` names the
-development GPU as an "RTX 3050 Ti". It is an RTX 2050 (compute capability 8.6,
-4 GiB), as stated everywhere else here.
+One correction to the record: the commit message for `0668603` names the development
+GPU as an "RTX 3050 Ti". It is an RTX 2050 (compute capability 8.6, 4 GiB), as stated
+everywhere else here.
 
-[Unreleased]: https://github.com/shubhampardule/trainAi/commits/main
+[Unreleased]: https://github.com/shubhampardule/trainAi/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/shubhampardule/trainAi/releases/tag/v0.1.0

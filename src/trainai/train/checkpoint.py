@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import os
+import pickletools
 import random
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,7 +68,19 @@ __all__ = [
 ]
 
 CHECKPOINT_FORMAT = "trainai-checkpoint"
-CHECKPOINT_VERSION = 1
+
+#: Bumped to 2 when the random state stopped being stored as a NumPy array.
+#:
+#: ``torch.load(weights_only=True)`` will not build a NumPy array, and that single
+#: refusal is the whole reason every checkpoint used to be loaded with the unpickler
+#: that runs whatever the file says. Measured on a real checkpoint rather than
+#: reasoned about: allowlisting exactly four globals --
+#: ``numpy._core.multiarray._reconstruct``, ``numpy.ndarray``, ``numpy.dtype`` and
+#: ``numpy.dtypes.UInt32DType`` -- made the entire file load, so the optimizer
+#: moments, the config dicts, the metrics and Python's own RNG tuple never needed it.
+#: Version 2 writes the same 624 words as a tensor and keeps everything else, so the
+#: safe unpickler is enough.
+CHECKPOINT_VERSION = 2
 
 #: Name of the JSON file that points at the latest and best checkpoints. A pointer
 #: file rather than a symlink: creating symlinks on Windows needs either developer
@@ -92,12 +106,18 @@ class RngState:
     from them, because a future addition that does -- a data augmentation, a
     sampled evaluation prompt -- would otherwise break exact resume silently, and
     the cost of carrying them is a few hundred bytes.
+
+    Both are held as plain data rather than as the objects the standard library hands
+    back. ``np.random.get_state(legacy=True)`` returns a tuple whose second element is
+    a ``uint32`` array, and an array inside a pickle is what forced every checkpoint
+    load to trust the file -- see :data:`CHECKPOINT_VERSION`. The array's 624 words go
+    in as a tensor, which is what the rest of the file is made of anyway.
     """
 
     torch_cpu: torch.Tensor
     torch_cuda: list[torch.Tensor] = field(default_factory=list)
     numpy: dict[str, Any] | None = None
-    python: tuple[Any, ...] | None = None
+    python: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -112,9 +132,84 @@ class RngState:
         return cls(
             torch_cpu=raw["torch_cpu"],
             torch_cuda=list(raw.get("torch_cuda") or []),
-            numpy=raw.get("numpy"),
-            python=raw.get("python"),
+            numpy=_rng_as_plain(raw.get("numpy"), _numpy_rng_to_plain),
+            python=_rng_as_plain(raw.get("python"), _python_rng_to_plain),
         )
+
+
+def _numpy_rng_to_plain(state: tuple[Any, ...]) -> dict[str, Any]:
+    """NumPy's legacy MT19937 state with no NumPy object left in it.
+
+    The key array is 624 ``uint32`` words, so a signed 64-bit tensor holds every one
+    exactly and there is no overflow to reason about. The round trip is measured rather
+    than assumed -- see the test that draws, restores and draws again.
+    """
+    name, keys, position, has_gauss, cached_gaussian = state
+    return {
+        "bit_generator": str(name),
+        "keys": torch.as_tensor(np.asarray(keys, dtype=np.int64)),
+        "position": int(position),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached_gaussian),
+    }
+
+
+def _numpy_rng_from_plain(plain: dict[str, Any]) -> tuple[Any, ...]:
+    """Rebuild what ``np.random.set_state`` expects: the tuple, with a ``uint32`` array."""
+    keys = plain["keys"]
+    words = keys.cpu().numpy() if torch.is_tensor(keys) else np.asarray(keys)
+    return (
+        str(plain["bit_generator"]),
+        words.astype(np.uint32),
+        int(plain["position"]),
+        int(plain["has_gauss"]),
+        float(plain["cached_gaussian"]),
+    )
+
+
+def _python_rng_to_plain(state: tuple[Any, ...]) -> dict[str, Any]:
+    """``random.getstate()`` is already plain data; this only names its three parts.
+
+    Kept symmetrical with the NumPy pair deliberately. The bare tuple loads under
+    ``weights_only=True`` as it stands -- measured -- so converting it buys nothing on
+    its own; what it buys is a reader not having to work out why one of the two streams
+    is stored differently from the other.
+    """
+    version, internal, gauss_next = state
+    return {
+        "version": int(version),
+        "state": [int(word) for word in internal],
+        "gauss_next": None if gauss_next is None else float(gauss_next),
+    }
+
+
+def _python_rng_from_plain(plain: dict[str, Any]) -> tuple[Any, ...]:
+    """Rebuild what ``random.setstate`` expects, which insists on a tuple."""
+    return (
+        int(plain["version"]),
+        tuple(int(word) for word in plain["state"]),
+        plain["gauss_next"],
+    )
+
+
+def _rng_as_plain(
+    value: Any, to_plain: Callable[[tuple[Any, ...]], dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Accept either shape a stored random state can arrive in, and keep only one.
+
+    Version 2 writes the dict; version 1 wrote the tuple the standard library hands
+    back. A version-1 NumPy tuple does not survive ``weights_only=True`` and is refused
+    long before it reaches here -- but *whether* it survives is a property of torch's
+    allowlist, which is not TrainAI's to promise: ``add_safe_globals`` is public API and
+    global to the process, so another library in the same program can turn that refusal
+    into a load. Normalising both shapes at the one place a file becomes a
+    :class:`RngState` means the outcome is a resumed run rather than a ``TypeError``
+    raised from a converter handed the wrong kind of object, and it keeps the field
+    annotations honest about what the rest of the module will see.
+    """
+    if value is None or isinstance(value, dict):
+        return value
+    return to_plain(tuple(value))
 
 
 def capture_rng() -> RngState:
@@ -125,8 +220,8 @@ def capture_rng() -> RngState:
     return RngState(
         torch_cpu=torch.get_rng_state(),
         torch_cuda=cuda_states,
-        numpy=np.random.get_state(legacy=True),
-        python=random.getstate(),
+        numpy=_numpy_rng_to_plain(np.random.get_state(legacy=True)),
+        python=_python_rng_to_plain(random.getstate()),
     )
 
 
@@ -141,9 +236,9 @@ def restore_rng(state: RngState) -> None:
     """
     torch.set_rng_state(state.torch_cpu.to(torch.uint8).cpu())
     if state.numpy is not None:
-        np.random.set_state(state.numpy)
+        np.random.set_state(_numpy_rng_from_plain(state.numpy))
     if state.python is not None:
-        random.setstate(state.python)
+        random.setstate(_python_rng_from_plain(state.python))
     if (
         state.torch_cuda
         and torch.cuda.is_available()
@@ -349,6 +444,130 @@ def save_checkpoint(
     return path
 
 
+def _imports_wanted(path: Path) -> list[str]:
+    """Every global a torch file's pickle asks to import, importing none of them.
+
+    ``torch.save`` writes a zip archive whose ``data.pkl`` member is the pickle, and
+    :func:`pickletools.genops` walks that pickle's opcodes without executing any of
+    them. So this can say *why* a refused file was refused -- a saved ``nn.Module``, a
+    version-1 random state, something else entirely -- without performing the very load
+    the refusal exists to prevent.
+
+    Returns an empty list when there is nothing to report: a file that is not a zip
+    (truncated, or torch's pre-1.6 format), one with no ``data.pkl``, or a pickle that
+    imports nothing. All three are indistinguishable from damage here, and are reported
+    as damage by the caller.
+
+    ``STACK_GLOBAL`` is handled as well as ``GLOBAL`` because the opcode a pickle uses
+    depends on its protocol, not on its contents: torch writes protocol 2 today, and a
+    file from another tool written at protocol 4 or later names its imports the other
+    way.
+    """
+    try:
+        if not zipfile.is_zipfile(path):
+            return []
+        with zipfile.ZipFile(path) as archive:
+            member = next((n for n in archive.namelist() if n.endswith("data.pkl")), None)
+            if member is None:
+                return []
+            data = archive.read(member)
+    except (OSError, zipfile.BadZipFile):
+        return []
+
+    wanted: list[str] = []
+    strings: list[str] = []
+    try:
+        for opcode, argument, _position in pickletools.genops(data):
+            if opcode.name == "GLOBAL":
+                wanted.append(str(argument).replace(" ", "."))
+            elif opcode.name == "STACK_GLOBAL":
+                if len(strings) >= 2:
+                    wanted.append(f"{strings[-2]}.{strings[-1]}")
+            elif isinstance(argument, str):
+                strings.append(argument)
+    except Exception:
+        # A pickle this cannot even parse tells us nothing, and this function's whole
+        # job is to produce a better message than the caller already has -- so it
+        # reports what it managed to read and lets the caller fall back to "damaged".
+        return list(dict.fromkeys(wanted))
+    return list(dict.fromkeys(wanted))
+
+
+#: Advice for a file that is not a checkpoint, naming no flag on purpose. This function
+#: is reached from ``train --resume``, ``finetune --from``, ``chat``, ``eval`` and
+#: ``export``, and ``load_checkpoint`` is not told which -- so the hint said
+#: "Point --resume at ..." to four callers who had not typed ``--resume``. Naming the
+#: three shapes accepted instead is advice every caller can act on, and it matches what
+#: ``--resume``'s own help text says.
+_WRONG_FILE_HINT = (
+    "Point it at something `trainai train` wrote: a run directory, its checkpoints "
+    "directory, or a step-*.pt file inside one."
+)
+
+#: What a version-1 checkpoint's random state asks for, and nothing else. Measured by
+#: allowlisting the refusals of a real checkpoint one at a time until it loaded;
+#: ``_codecs.encode`` is how the bit-generator's name is pickled. A refused file whose
+#: imports are a subset of these is the old format rather than a hostile one, and the
+#: difference is worth a different message.
+_VERSION_1_RNG_IMPORTS = frozenset(
+    {
+        "numpy._core.multiarray._reconstruct",
+        "numpy.core.multiarray._reconstruct",
+        "numpy.ndarray",
+        "numpy.dtype",
+        "numpy.dtypes.UInt32DType",
+        "_codecs.encode",
+        "collections.OrderedDict",
+        "torch._utils._rebuild_tensor_v2",
+        "torch.ByteStorage",
+        "torch.FloatStorage",
+    }
+)
+
+
+def _refusal_for(path: Path, reason: str) -> CheckpointError:
+    """Name what the file is, when the safe unpickler would not build it.
+
+    Three shapes are worth telling apart, and all three come from reading the pickle
+    rather than running it. A saved ``nn.Module`` is the most likely mistake anybody
+    makes -- ``torch.save(model, path)`` is how most PyTorch code saves a model -- and
+    it earned a message of its own long before this check existed. A version-1
+    checkpoint is TrainAI's own and is not damaged. Everything else is reported as
+    damage with the imports named, because a file asking for something neither of those
+    is either broken or not to be run, and naming the import is what lets someone tell
+    which.
+    """
+    wanted = _imports_wanted(path)
+    module = next((name for name in wanted if name.startswith("torch.nn.")), None)
+    if module is not None:
+        held = module.rsplit(".", 1)[-1]
+        return CheckpointIncompatibleError(
+            f"{path} is not a TrainAI checkpoint (the file holds a {held}).",
+            hint=_WRONG_FILE_HINT,
+            details={"path": str(path), "format": None, "holds": held, "imports": wanted},
+        )
+    if wanted and set(wanted) <= _VERSION_1_RNG_IMPORTS:
+        return CheckpointIncompatibleError(
+            f"{path} was written before TrainAI stopped trusting checkpoint files "
+            "(checkpoint version 1).",
+            hint=(
+                "Version 1 stored its random state as a NumPy array, which cannot be "
+                "read without running code from the file. Resume from a checkpoint this "
+                "version wrote, or start the run again -- exact resume is the only thing "
+                "the old random state was for."
+            ),
+            details={"path": str(path), "imports": wanted, "reason": reason},
+        )
+    return CheckpointCorruptError(
+        f"{path} could not be read as a checkpoint.",
+        hint=(
+            "The file is truncated or damaged, most likely from an interrupted "
+            "copy. Resume from an earlier checkpoint in the same directory."
+        ),
+        details={"path": str(path), "reason": reason, "imports": wanted},
+    )
+
+
 def load_checkpoint(
     path: str | Path,
     *,
@@ -390,19 +609,16 @@ def load_checkpoint(
         )
 
     try:
-        # weights_only=False: the payload holds RNG states and config dicts, not
-        # only tensors. The file is one TrainAI wrote, in a directory the user
-        # owns; a checkpoint from an untrusted source should not be loaded here.
-        raw = torch.load(path, map_location=map_location, weights_only=False)
+        # weights_only=True, which is the point of format version 2. A checkpoint is a
+        # file people copy between machines, and `trainai finetune --from` takes its path
+        # straight from the command line, so a load that runs whatever the file says is a
+        # real exposure rather than a theoretical one. Nothing in a version-2 payload
+        # needs the unsafe unpickler -- measured, see CHECKPOINT_VERSION.
+        raw = torch.load(path, map_location=map_location, weights_only=True)
     except Exception as exc:
-        raise CheckpointCorruptError(
-            f"{path} could not be read as a checkpoint.",
-            hint=(
-                "The file is truncated or damaged, most likely from an interrupted "
-                "copy. Resume from an earlier checkpoint in the same directory."
-            ),
-            details={"path": str(path), "reason": str(exc)},
-        ) from exc
+        # Which of the three refusals this is comes from reading the file's pickle
+        # without executing it, so the message can still say "the file holds a Linear".
+        raise _refusal_for(path, str(exc)) from exc
 
     if not isinstance(raw, dict) or raw.get("format") != CHECKPOINT_FORMAT:
         # ``raw`` is deliberately not touched as a mapping here: this branch is
@@ -418,7 +634,7 @@ def load_checkpoint(
         declared = raw.get("format") if isinstance(raw, dict) else None
         raise CheckpointIncompatibleError(
             f"{path} is not a TrainAI checkpoint (the file holds a {held}).",
-            hint="Point --resume at a file written by `trainai train`.",
+            hint=_WRONG_FILE_HINT,
             details={"path": str(path), "format": declared, "holds": held},
         )
     version = int(raw.get("format_version", 0))

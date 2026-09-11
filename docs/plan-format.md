@@ -178,6 +178,26 @@ bound the answer.
 `blocked` is worth special mention when reading a plan: it means the search stopped
 for a reason that was not memory, data or time. Do not read it as "buy a bigger card".
 
+`unconstrained` is worth the opposite caution: it means nothing rejected the largest
+preset on the ladder, not necessarily that nothing was rejected. A rung is accepted as
+soon as *some* micro-batch on it fits, so a plan can be `unconstrained` and still have
+had its batch halved several times to get there. `regime_detail` says which happened,
+and `train.grad_accum` above 1 is the same fact in a number.
+
+### `vram_cap_bytes`
+
+What `--max-vram` asked for, or `null` when it was not given. It sits at the top level
+rather than inside `provenance.measured` beside the budget it bounded, because it is a
+number the user typed and that block is for numbers a counter reported.
+
+`provenance.measured.vram_budget_bytes` is the budget the search actually compared
+every measured peak against, which is the smaller of this cap and 85% of free VRAM. A
+cap only ever lowers it: sizing against memory the card does not have would mean
+measuring candidates it cannot hold, which is the failure the check exists to prevent.
+So a cap above what is free changes nothing and is reported in `notes` as having
+changed nothing. Comparing the two fields is how a reader tells a small plan on a small
+card from a small plan that was asked for.
+
 ### `notes`, `train_command`, `estimated_seconds`
 
 `notes` are the plain-language warnings, already rendered. `train_command` is the

@@ -16,6 +16,7 @@ stores it once. The test that pins that down is
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ import torch
 
 from trainai.errors import (
     CheckpointCorruptError,
+    CheckpointError,
     CheckpointIncompatibleError,
     CheckpointNotFoundError,
     ExitCode,
@@ -35,6 +37,8 @@ from trainai.train.checkpoint import (
     CHECKPOINT_FORMAT,
     CHECKPOINT_VERSION,
     POINTER_NAME,
+    RngState,
+    _imports_wanted,
     _prune,
     capture_rng,
     find_checkpoint,
@@ -101,6 +105,28 @@ def test_a_checkpoint_round_trips(
     assert loaded.train_config.to_dict() == TRAIN.to_dict()
     assert loaded.dataset == DATASET
     assert loaded.rng is not None
+
+
+def test_a_directory_of_checkpoints_loads_the_latest(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """What `--resume <run>/checkpoints` does, which is how the flag is documented.
+
+    `load_checkpoint` takes a directory as well as a file and picks the newest step in
+    it. The refusal for a directory with nothing in it is covered by
+    `test_an_empty_directory_is_refused_with_what_to_do`; this is the other side of that
+    branch, and it was the untested one -- every other test in this file hands over the
+    exact path `save_checkpoint` returned, so the resolution step that users actually go
+    through never ran.
+
+    Asserted by step rather than by filename so it is the checkpoint that was chosen,
+    not the name that was matched.
+    """
+    write(tmp_path, model, optimizer, step=7)
+    write(tmp_path, model, optimizer, step=41)
+
+    assert load_checkpoint(tmp_path).step == 41
+    assert load_checkpoint(tmp_path / "step-0000007.pt").step == 7
 
 
 def test_the_filename_carries_a_sortable_step(
@@ -216,6 +242,45 @@ def test_no_temporary_file_is_left_behind(
     write(tmp_path, model, optimizer)
 
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_a_save_that_runs_out_of_disk_keeps_the_previous_checkpoint(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk is the way a long run ends, and it must not cost the last checkpoint.
+
+    The save writes to a temporary and renames it, so the previous checkpoint survives
+    by construction -- but only if the failure is caught and the temporary is removed.
+    Left behind, a half-written `step-0000004.pt.tmp` sits in the run directory forever;
+    the sibling above proves it is gone after a *successful* save, and this proves it is
+    gone after a failed one, which is the case that creates it.
+
+    `torch.save` is made to fail after writing part of the file, because that is the
+    order a real disk fills up in: `os.replace` is not reached, and a test that raised
+    before the temporary existed would exercise the handler without proving it cleans
+    anything up. The message and its hint are asserted because they are what a person
+    reads at the end of a run that took hours -- "the previous checkpoint is untouched"
+    is a promise this test is the only thing holding.
+    """
+    kept = write(tmp_path, model, optimizer, step=3)
+
+    def out_of_disk(payload: Any, target: Any) -> None:
+        Path(str(target)).write_bytes(b"half a checkpoint")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(torch, "save", out_of_disk)
+
+    with pytest.raises(CheckpointError) as caught:
+        write(tmp_path, model, optimizer, step=4)
+
+    assert "step-0000004.pt" in str(caught.value)
+    assert "free disk space" in (caught.value.hint or "")
+    assert "No space left on device" in caught.value.details["reason"]
+    monkeypatch.undo()
+
+    assert list(tmp_path.glob("*.tmp")) == [], "the half-written temporary was left behind"
+    assert not (tmp_path / "step-0000004.pt").exists()
+    assert load_checkpoint(kept).step == 3, "the previous checkpoint did not survive"
 
 
 def test_a_stray_temporary_file_is_not_mistaken_for_a_checkpoint(
@@ -516,6 +581,22 @@ def test_keep_zero_keeps_everything_rather_than_nothing(
         write(tmp_path, model, optimizer, step=step, keep=0)
 
     assert len(list_checkpoints(tmp_path)) == 4
+
+
+def test_pruning_an_empty_directory_is_not_an_error(tmp_path: Path) -> None:
+    """The guard that stops "never the newest" from asking which file is newest.
+
+    Unreachable through `save_checkpoint`, which prunes one line after writing a file
+    and so always has at least one. It is reachable the moment anything else prunes --
+    a directory emptied by hand between the save and the prune, or a future caller --
+    and without the guard the next line indexes `existing[-1]` on an empty list and a
+    completed save dies with an IndexError. Pinned by calling the private function
+    directly, because that is the only way in: a test that went through
+    `save_checkpoint` would be testing the file it just wrote.
+    """
+    _prune(tmp_path, keep=3)
+
+    assert list_checkpoints(tmp_path) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1076,3 +1157,311 @@ def test_a_checkpoint_without_random_state_still_loads(
     path = write(tmp_path, model, optimizer, rng=None)
 
     assert load_checkpoint(path).rng is None
+
+
+def test_numpy_and_python_random_state_survive_the_file_too(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """The two streams that changed shape in format version 2, checked through a file.
+
+    The neighbouring test restores from an in-memory :class:`RngState`, which the
+    conversion to plain data cannot break -- ``capture_rng`` and ``restore_rng`` would
+    still agree with each other even if what they produced were unusable. Only a save
+    and a load prove the tensor of 624 words comes back as the ``uint32`` array
+    ``np.random.set_state`` insists on.
+    """
+    import random as python_random
+
+    import numpy as np
+
+    path = write(tmp_path, model, optimizer, rng=capture_rng())
+    expected = (np.random.random(3).tolist(), python_random.random())
+
+    loaded = load_checkpoint(path)
+    assert loaded.rng is not None
+    restore_rng(loaded.rng)
+
+    assert np.random.random(3).tolist() == expected[0]
+    assert python_random.random() == expected[1]
+
+
+def test_a_version_1_shaped_random_state_is_still_restorable() -> None:
+    """The tuples version 1 stored, handed to the reader that expects dicts.
+
+    Reaching this through a real file needs ``weights_only=True`` to build a NumPy array,
+    which it will not do -- so the shape is fed to ``from_payload`` directly, which is
+    the one place a file becomes an :class:`RngState`. It is not a hypothetical shape:
+    ``torch.serialization.add_safe_globals`` is public API and process-global, so a
+    program that uses TrainAI alongside a library which allowlists NumPy turns the
+    version-1 refusal into a successful load. What must not happen then is a ``TypeError``
+    out of a converter; restoring the state is both safe and the useful answer.
+    """
+    import random as python_random
+
+    import numpy as np
+
+    legacy = {
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": [],
+        "numpy": np.random.get_state(legacy=True),
+        "python": python_random.getstate(),
+    }
+    expected = (np.random.random(3).tolist(), python_random.random())
+
+    state = RngState.from_payload(legacy)
+    assert isinstance(state.numpy, dict), "the tuple should be normalised on the way in"
+    assert isinstance(state.python, dict)
+    restore_rng(state)
+
+    assert np.random.random(3).tolist() == expected[0]
+    assert python_random.random() == expected[1]
+
+
+# --------------------------------------------------------------------------- #
+# Loading a checkpoint does not run it
+# --------------------------------------------------------------------------- #
+# `torch.load` used to be called here with `weights_only=False`, which unpickles
+# whatever the file names -- and the file is not always one this machine wrote:
+# `trainai finetune --from` takes a path off the command line, `trainai chat` and
+# `trainai export` read whatever they are pointed at, and a checkpoint is precisely
+# the kind of artifact people copy between machines and post in issue threads.
+#
+# The whole reason it could not be `True` was one NumPy array in the random state.
+# Measured, by allowlisting the refusals of a real checkpoint one at a time: four
+# globals, all NumPy's, all reachable from that one array, and with those four allowed
+# the rest of the file loaded untouched. So format version 2 stores the same 624 words
+# as a tensor and the load is safe.
+#
+# The change is invisible in the happy path -- the suite passed unaltered when it landed,
+# which is why this section exists. It is written to fail from both directions, because
+# there are two ways to undo it and they are not the same edit: putting
+# `weights_only=False` back is caught by the refusal tests below, and having
+# `capture_rng` hand over `np.random.get_state()` unconverted -- a one-line
+# simplification that looks obviously right -- is caught by reading the pickle a real
+# save produces. `tests/test_conventions.py` holds the third: that the package contains
+# exactly one `torch.load`, so a second one cannot be added with the unsafe default.
+# --------------------------------------------------------------------------- #
+class Detonator:
+    """An object whose unpickling needs a global the safe unpickler will not build.
+
+    Not actually dangerous -- ``__reduce__`` returns a harmless call. The dangerous
+    version is the same shape with ``os.system`` in it, which is the point: the
+    unpickler cannot tell them apart, so it has to refuse both.
+    """
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (dict, ([("detonated", True)],))
+
+
+def test_a_checkpoint_carrying_an_arbitrary_object_is_refused(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """The property the whole section exists for, stated as a refusal.
+
+    A well-formed TrainAI checkpoint with one extra field holding a reduced object. It
+    loads happily under ``weights_only=False`` -- so under the old code this file was
+    read, and its ``__reduce__`` ran, before a single field was validated.
+    """
+    path = write(tmp_path, model, optimizer)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["metrics"] = {"note": Detonator()}
+    torch.save(payload, path)
+
+    assert isinstance(
+        torch.load(path, map_location="cpu", weights_only=False)["metrics"]["note"], dict
+    ), "the reduce did run under the unpickler this replaced, so the file is a real case"
+
+    with pytest.raises(CheckpointCorruptError) as caught:
+        load_checkpoint(path)
+
+    assert caught.value.details["imports"], "the refusal should name what the file wanted"
+
+
+def test_the_file_a_checkpoint_writes_asks_for_no_numpy(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """Read straight off the pickle, so it cannot pass by loading successfully here.
+
+    `capture_rng` returning `np.random.get_state(legacy=True)` unconverted is a
+    one-line simplification that looks obviously correct and silently reintroduces the
+    whole problem. A test that only loads the file would not notice, because this
+    machine's torch can load it either way -- what changes is whether it can be loaded
+    *safely*.
+    """
+    path = write(tmp_path, model, optimizer, rng=capture_rng())
+
+    wanted = _imports_wanted(path)
+
+    assert wanted, "a torch file imports its tensor rebuilders, so an empty list is a bug here"
+    assert [name for name in wanted if "numpy" in name] == []
+
+
+def test_a_version_1_checkpoint_is_refused_as_old_rather_than_damaged(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """The one file this change breaks, and it must not be reported as corruption.
+
+    "The file is truncated or damaged, most likely from an interrupted copy" sends
+    somebody looking for a disk problem they do not have. Nothing is wrong with a
+    version-1 checkpoint except that reading it means running it.
+    """
+    import numpy as np
+
+    path = write(tmp_path, model, optimizer, rng=capture_rng())
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["format_version"] = 1
+    payload["rng"]["numpy"] = np.random.get_state(legacy=True)
+    torch.save(payload, path)
+
+    with pytest.raises(CheckpointIncompatibleError) as caught:
+        load_checkpoint(path)
+
+    assert "version 1" in str(caught.value)
+    assert "NumPy array" in (caught.value.hint or "")
+    assert "truncated" not in (caught.value.hint or "")
+
+
+def test_a_version_1_checkpoint_with_no_random_state_still_loads(
+    tmp_path: Path, model: GPT, optimizer: torch.optim.Optimizer
+) -> None:
+    """Version 1 is not refused for being version 1. It is refused for what it holds.
+
+    ``save_checkpoint(rng=None)`` wrote a version-1 file with nothing in it the safe
+    unpickler objects to, and there is no reason to reject one -- the version gate
+    refuses files from a *newer* TrainAI, and this is the other direction.
+    """
+    path = write(tmp_path, model, optimizer, rng=None)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["format_version"] = 1
+    torch.save(payload, path)
+
+    assert load_checkpoint(path).step == 42
+
+
+def test_a_truncated_file_reports_no_imports_and_reads_as_damage(tmp_path: Path) -> None:
+    """Half a checkpoint is not a zip, so there is no pickle to read and nothing to name.
+
+    This is the branch that decides whether the section above degrades gracefully: the
+    diagnosis is best-effort, and when it comes back empty the message has to be the
+    damage one rather than a claim about what the file wanted.
+    """
+    whole = tmp_path / "whole.pt"
+    torch.save({"format": CHECKPOINT_FORMAT}, whole)
+    path = tmp_path / "step-0000001.pt"
+    path.write_bytes(whole.read_bytes()[:200])
+
+    assert _imports_wanted(path) == []
+    with pytest.raises(CheckpointCorruptError) as caught:
+        load_checkpoint(path)
+    assert "interrupted" in (caught.value.hint or "")
+
+
+def test_imports_are_found_in_a_pickle_that_names_them_the_other_way(tmp_path: Path) -> None:
+    """``STACK_GLOBAL``, which torch's own files never use and another tool's might.
+
+    Protocol 2 spells an import as one ``GLOBAL`` opcode carrying "module name"; from
+    protocol 4 the two strings are pushed and ``STACK_GLOBAL`` joins them. Which one a
+    file uses is a property of the protocol it was written at, not of what it contains,
+    so a checkpoint-shaped file from another tool can arrive either way -- and the branch
+    for it is unreachable through ``torch.save``, which is exactly why it is worth a test
+    of its own rather than trusting it to the cases above.
+
+    The two names differ, and that is not a bug in the reader: protocol 2 still writes
+    the Python 2 spelling of a builtin, so the same ``dict`` arrives as
+    ``__builtin__.dict`` at protocol 2 and ``builtins.dict`` at protocol 5. Pinned here
+    because it is the reason the diagnosis matches on a ``torch.nn.`` prefix rather than
+    on a table of exact names -- a table would have to carry both spellings of every
+    entry, and would silently miss whichever one it was not written against.
+    """
+    import pickle
+
+    for protocol, expected in ((2, "__builtin__.dict"), (5, "builtins.dict")):
+        path = tmp_path / f"proto{protocol}.pt"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("archive/data.pkl", pickle.dumps(Detonator(), protocol=protocol))
+
+        assert _imports_wanted(path) == [expected], f"protocol {protocol} was not read"
+
+
+def test_a_zip_that_holds_no_pickle_reports_no_imports_and_reads_as_damage(
+    tmp_path: Path,
+) -> None:
+    """A zip, but not a torch one: there is no pickle in it to read.
+
+    `test_a_truncated_file_reports_no_imports_and_reads_as_damage` covers the file that
+    is not a zip at all. This is the next step in: the archive opens, the member list is
+    readable, and nothing in it ends in data.pkl -- somebody's own zip renamed to .pt, or
+    a torch file whose members were repacked. The diagnosis has nothing to say and has to
+    say nothing, rather than guessing from the member names.
+    """
+    path = tmp_path / "step-0000001.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+
+    assert _imports_wanted(path) == []
+    with pytest.raises(CheckpointCorruptError) as caught:
+        load_checkpoint(path)
+
+    assert "interrupted" in (caught.value.hint or "")
+    assert caught.value.details["imports"] == []
+    assert "data.pkl" in caught.value.details["reason"]
+
+
+def test_a_member_whose_bytes_were_overwritten_is_damage_and_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """The archive is intact enough to open and the member is not intact enough to read.
+
+    A file overwritten in place -- an interrupted copy over an existing checkpoint, a
+    sync that wrote half -- keeps the central directory at its tail, so `is_zipfile`
+    says yes and the member is listed at its original size. The stored bytes no longer
+    match the recorded CRC, and `read` raises rather than returning them.
+
+    The point is that the diagnosis is *best effort*: it exists to make the refusal
+    message better, so it must never be the thing that fails. Without the handler this
+    file leaves `load_checkpoint` as a raw `zipfile.BadZipFile` from inside an exception
+    handler, which is both the wrong type for a caller to catch and a worse message than
+    the one it was already about to print.
+
+    The member is a pickle that *does* name an import, so that this test cannot pass by
+    accident: if the overwrite ever stopped landing on the payload the read would succeed
+    and the assertion below would see `["__main__.Thing"]` rather than the empty list a
+    swallowed failure gives.
+    """
+    payload = b"c__main__\nThing\n."
+    path = tmp_path / "step-0000001.pt"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("archive/data.pkl", payload)
+    raw = bytearray(path.read_bytes())
+    at = raw.find(payload)
+    raw[at : at + 8] = b"\xff" * 8
+    path.write_bytes(bytes(raw))
+
+    assert zipfile.is_zipfile(path), "the archive stopped being openable, so this proves nothing"
+    assert _imports_wanted(path) == []
+    with pytest.raises(CheckpointCorruptError):
+        load_checkpoint(path)
+
+
+def test_a_pickle_that_stops_mid_opcode_still_names_what_it_read(tmp_path: Path) -> None:
+    """Half a pickle: the imports before the break are worth reporting, and are reported.
+
+    `pickletools.genops` walks opcodes one at a time and raises when the data runs out
+    mid-argument, so a truncated pickle raises *after* yielding the opcodes it did read.
+    Returning nothing at that point would throw away the only useful thing about a
+    damaged file -- the name of what it was going to import, which is what tells someone
+    whether they have a broken checkpoint or a file that was never one.
+
+    `Thing` here is not importable and never gets imported: `genops` reads the opcode's
+    argument as text and executes nothing, which is the whole reason this diagnosis is
+    safe to run on a file that was just refused for being unsafe.
+    """
+    path = tmp_path / "step-0000001.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"c__main__\nThing\n\x80")
+
+    assert _imports_wanted(path) == ["__main__.Thing"]
+    with pytest.raises(CheckpointCorruptError) as caught:
+        load_checkpoint(path)
+
+    assert caught.value.details["imports"] == ["__main__.Thing"]

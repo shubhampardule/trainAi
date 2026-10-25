@@ -1255,7 +1255,7 @@ def test_a_checkpoint_from_before_the_layout_was_recorded_still_resumes(
     )
     whole.run()
     halfway = sorted((tmp_path / "whole" / "checkpoints").glob("step-*.pt"))[0]
-    payload = torch.load(halfway, map_location="cpu", weights_only=False)
+    payload = torch.load(halfway, map_location="cpu", weights_only=True)
     assert payload["dataset"].pop("chat")["version"] == 1
     torch.save(payload, halfway)
 
